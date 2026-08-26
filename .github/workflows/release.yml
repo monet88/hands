@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: grok-harness-macos-aarch64
+          - os: ubuntu-24.04
+            asset: grok-harness-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xai-org/grok-build
+          path: .grok-build
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+
+      - name: Inject crate
+        run: python3 scripts/inject.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.grok-build"
+
+      - name: Build
+        working-directory: .grok-build
+        run: cargo build --release -p grok-harness
+
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp .grok-build/target/release/grok-harness "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find dist -type f -name 'grok-harness-*' -exec cp {} release/ \;
+          ls -la release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

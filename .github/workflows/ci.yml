@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xai-org/grok-build
+          path: .grok-build
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+
+      - name: Inject crate
+        run: python3 scripts/inject.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.grok-build"
+
+      - name: Build
+        working-directory: .grok-build
+        run: cargo build --release -p grok-harness
+
+      - name: Smoke
+        run: |
+          bin=".grok-build/target/release/grok-harness"
+          "$bin" --version
+          "$bin" --help
+          tmp="$(mktemp -d)"
+          echo hello > "$tmp/n.txt"
+          "$bin" use "$tmp"
+          "$bin" call read_file '{"target_file":"n.txt"}' | grep -q hello
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-harness-${{ runner.os }}-${{ runner.arch }}
+          path: .grok-build/target/release/grok-harness
+          if-no-files-found: error

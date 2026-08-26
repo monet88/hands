@@ -1,0 +1,7 @@
+grok-harness
+Copyright 2026
+
+This project is a thin MCP host around the Grok Build tool runtime
+(xai-org/grok-build), which is licensed under Apache License 2.0.
+See https://github.com/xai-org/grok-build and that repository's
+LICENSE and THIRD-PARTY-NOTICES.
