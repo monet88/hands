@@ -133,7 +133,7 @@ Every gate has passed on the real Windows host:
 - Explicit `cmd.exe` terminal invocation & `native_cmd_exe()` resolution without PATH shadowing
 - Host tool PATH propagation & Orca CLI execution
 - Background task execution, output retrieval, and JobObject process-tree isolation on kill
-- Release binary builds cleanly and all 5 regression tests pass.
+- Release binary builds cleanly and the full relevant Hands regression suite passes.
 
 ## 11. Cleanup
 
