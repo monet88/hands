@@ -1,0 +1,20 @@
+crate/src/host.rs
+  h_17f2fa2b92da6a 58,61-65,69-84,86-102,105,139,146,185-194,196-202,211-215,351-356,368-369,387,401-452,470-510,515-519,525-542,548-558,565-569,620-625,664-667,677-678,690-694,712-713,731-740,744-751,754-761,763-768
+crate/src/host_env.rs
+  h_17f2fa2b92da6a 1-180
+crate/src/main.rs
+  h_17f2fa2b92da6a 4,118
+crate/src/ui.rs
+  h_17f2fa2b92da6a 89-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "537b1996c8668cf2178e2fbf6c9d555a4f098781",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
