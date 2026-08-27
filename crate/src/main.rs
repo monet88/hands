@@ -9,6 +9,7 @@
 
 mod host;
 mod mcp;
+mod service;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,6 +19,10 @@ grok-harness — local coding tools for ChatGPT Web (no model)
 
   cd /any/repo && grok-harness use     pin this folder as the workspace
   grok-harness status                  show pin + tunnel
+  grok-harness enable                  auto-start tunnel at login (KeepAlive)
+  grok-harness disable                 remove auto-start
+  grok-harness start                   start tunnel now
+  grok-harness stop                    stop tunnel now
   grok-harness                         MCP stdio (used by tunnel-client)
 
 Debug:
@@ -29,6 +34,10 @@ Debug:
 enum Cmd {
     Use { dir: PathBuf },
     Status,
+    Enable,
+    Disable,
+    Start,
+    Stop,
     McpStdio,
     McpHttp { addr: SocketAddr },
     List,
@@ -79,6 +88,10 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
                 dir: PathBuf::from(dir),
             },
             [op] if op == "status" => Cmd::Status,
+            [op] if op == "enable" => Cmd::Enable,
+            [op] if op == "disable" => Cmd::Disable,
+            [op] if op == "start" => Cmd::Start,
+            [op] if op == "stop" => Cmd::Stop,
             [op] if op == "list" => Cmd::List,
             [op, tool, json] if op == "call" => Cmd::Call {
                 tool: tool.clone(),
@@ -110,12 +123,16 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         Cmd::Use { dir } => {
             let cwd = host::pin_workspace(&dir)?;
             println!("{}", cwd.display());
-            if tunnel_ready() {
-                eprintln!("pinned. ChatGPT uses this folder on the next tool call (call workspace_info).");
-            } else {
-                eprintln!(
-                    "pinned, but tunnel is down. Start it with:\n  export CONTROL_PLANE_API_KEY=...\n  tunnel-client run --profile grok-harness"
-                );
+            match service::ensure() {
+                Ok(true) => {
+                    eprintln!("pinned. ChatGPT uses this folder on the next tool call (call workspace_info).");
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "pinned, but tunnel is down. One-time:\n  export CONTROL_PLANE_API_KEY=...\n  grok-harness enable"
+                    );
+                }
+                Err(e) => eprintln!("pinned, tunnel start failed: {e}"),
             }
             Ok(())
         }
@@ -128,16 +145,13 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                 pin.map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(none — using cwd/env)".into())
             );
-            println!(
-                "tunnel     {}",
-                if tunnel_ready() {
-                    "ready  http://127.0.0.1:18780/ui"
-                } else {
-                    "down"
-                }
-            );
+            println!("tunnel     {}", service::status_line());
             Ok(())
         }
+        Cmd::Enable => service::enable(),
+        Cmd::Disable => service::disable(),
+        Cmd::Start => service::start(),
+        Cmd::Stop => service::stop(),
         Cmd::McpStdio => mcp::McpHost::new(fallback).serve_stdio().await,
         Cmd::McpHttp { addr } => mcp::McpHost::new(fallback).serve_http(addr).await,
         Cmd::List | Cmd::Call { .. } => {
@@ -179,29 +193,4 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
     }
 }
 
-fn tunnel_ready() -> bool {
-    let Ok(resp) = ureq_get("http://127.0.0.1:18780/readyz") else {
-        return false;
-    };
-    resp == "ready"
-}
 
-fn ureq_get(url: &str) -> Result<String, ()> {
-    let mut child = std::process::Command::new("curl")
-        .args(["-fsS", "--max-time", "1", url])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| ())?;
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        let _ = out.read_to_string(&mut buf);
-    }
-    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    if ok {
-        Ok(buf.trim().to_string())
-    } else {
-        Err(())
-    }
-}

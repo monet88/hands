@@ -46,21 +46,14 @@ ChatGPT talks to that folder. Switch repo: `cd` elsewhere and `grok-harness use`
 brew install openai/tools/tunnel-client
 export CONTROL_PLANE_API_KEY="sk-..."   # runtime key, not admin key
 export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
-
-tunnel-client init \
-  --sample sample_mcp_stdio_local \
-  --profile grok-harness \
-  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
-  --mcp-command "grok-harness" \
-  --force
-
-tunnel-client doctor --profile grok-harness --explain
-tunnel-client run --profile grok-harness
+grok-harness enable
 ```
+
+`enable` writes the tunnel profile, starts it now, and installs a login service (macOS LaunchAgent / Linux systemd --user) that **restarts if the MCP child dies**.
 
 4. [chatgpt.com/plugins](https://chatgpt.com/plugins) → Developer mode → Connection **Tunnel** → paste tunnel id → Scan tools.
 
-Keep `tunnel-client run` up while you chat.
+`grok-harness use` starts the tunnel if it is down. `grok-harness disable` removes auto-start.
 
 ## Tools
 

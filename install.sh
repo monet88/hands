@@ -46,7 +46,8 @@ echo
 echo "Next:"
 echo "  cd /your/repo && grok-harness use"
 echo "  brew install openai/tools/tunnel-client   # ChatGPT Web tunnel"
-echo "  see README.md for ChatGPT plugin steps"
+echo "  export CONTROL_PLANE_API_KEY=... CONTROL_PLANE_TUNNEL_ID=tunnel_..."
+echo "  grok-harness enable                       # start now + at login"
 echo
 if ! command -v grok-harness >/dev/null 2>&1; then
   echo "Put $PREFIX/bin on PATH, e.g.:"
