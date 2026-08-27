@@ -86,7 +86,8 @@ pub fn open_browser(url: &str) {
     let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).spawn()
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
+        let cmd = crate::host::native_cmd_exe();
+        std::process::Command::new(cmd)
             .args(["/C", "start", url])
             .spawn()
     } else {

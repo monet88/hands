@@ -16,9 +16,11 @@ use crate::host;
 pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
 pub const PROFILE: &str = "hands";
+#[cfg(target_os = "macos")]
 const LABEL: &str = "dev.hands.tunnel";
 #[cfg(target_os = "macos")]
 const WATCH_LABEL: &str = "dev.hands.watch";
+#[cfg(target_os = "macos")]
 const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
 const LEGACY_PROFILE: &str = "grok-harness";
 
@@ -338,6 +340,7 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn log_dir() -> PathBuf {
     host::config_dir().join("logs")
 }
@@ -680,6 +683,7 @@ fn install_watch() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stop_unmanaged() {
     let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
         return;
@@ -738,6 +742,7 @@ fn run_ok(bin: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
