@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::computer::local::{LocalFs, LocalTerminalBackend};
-use xai_grok_tools::implementations::grok_build::{
-    BashTool, GrepTool, ListDirTool, ReadFileTool, SearchReplaceTool,
+use xai_grok_tools::implementations::codex::ApplyPatchTool;
+use xai_grok_tools::implementations::{
+    BashTool, GrepTool, KillTaskTool, ListDirTool, OpenCodeGlobTool, OpenCodeWriteTool,
+    ReadFileTool, SearchReplaceTool, TaskOutputTool, TodoWriteTool,
 };
 use xai_grok_tools::notification::ToolNotificationHandle;
 use xai_grok_tools::registry::types::{SessionContext, ToolConfig, ToolServerConfig};
@@ -67,8 +69,14 @@ fn allowlist() -> ToolServerConfig {
             ToolConfig::from(&ReadFileTool),
             ToolConfig::from(&GrepTool),
             ToolConfig::from(&ListDirTool),
+            ToolConfig::from(&OpenCodeGlobTool),
             ToolConfig::from(&SearchReplaceTool),
-            ToolConfig::from(&BashTool).with_param("enabled_background", false),
+            ToolConfig::from(&OpenCodeWriteTool),
+            ToolConfig::from(&ApplyPatchTool),
+            ToolConfig::from(&TodoWriteTool),
+            ToolConfig::from(&BashTool),
+            ToolConfig::from(&TaskOutputTool),
+            ToolConfig::from(&KillTaskTool),
         ],
         behavior_preset: None,
     }

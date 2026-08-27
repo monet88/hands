@@ -18,7 +18,14 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "grok-harness";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const READ_ONLY: &[&str] = &["workspace_info", "read_file", "grep", "list_dir"];
+const READ_ONLY: &[&str] = &[
+    "workspace_info",
+    "read_file",
+    "grep",
+    "list_dir",
+    "glob",
+    "get_task_output",
+];
 
 pub struct McpHost {
     fallback_cwd: PathBuf,
@@ -140,8 +147,9 @@ impl McpHost {
                 "Local Grok tool harness. No model. \
                  Active workspace is selected on the machine with `grok-harness use`. \
                  Call workspace_info first to see the current root (now {}). \
-                 Then read_file/grep/list_dir, search_replace to edit, \
-                 run_terminal_cmd to test. After each edit, rerun the failing check.",
+                 Then read_file/grep/glob/list_dir, write/search_replace/apply_patch to edit, \
+                 todo_write for plans, run_terminal_cmd to test (background + kill_task/get_task_output). \
+                 After each edit, rerun the failing check.",
                 self.workspace().display()
             ),
         })

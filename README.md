@@ -70,8 +70,14 @@ Keep `tunnel-client run` up while you chat.
 | `read_file` | read |
 | `grep` | search contents |
 | `list_dir` | tree |
-| `search_replace` | edit |
-| `run_terminal_cmd` | tests / git / shell |
+| `glob` | find files by name |
+| `search_replace` | edit existing |
+| `write` | create / overwrite |
+| `apply_patch` | multi-hunk patch |
+| `todo_write` | task list |
+| `run_terminal_cmd` | tests / git / shell (background ok) |
+| `get_task_output` | poll background job |
+| `kill_task` | stop background job |
 
 No Grok/Codex model tokens. Debug: `grok-harness list`, `grok-harness call read_file '{"target_file":"README.md"}'`.
 
