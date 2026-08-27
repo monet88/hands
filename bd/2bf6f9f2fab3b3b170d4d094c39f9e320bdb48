@@ -1,0 +1,14 @@
+docs/origin-windows-test-checklist.md
+  h_17f2fa2b92da6a 136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "bd2bf6f9f2fab3b3b170d4d094c39f9e320bdb48",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
