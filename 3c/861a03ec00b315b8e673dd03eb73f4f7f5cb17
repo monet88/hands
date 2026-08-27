@@ -1,0 +1,22 @@
+docs/origin-windows-test-checklist.md
+  h_17f2fa2b92da6a 1-145
+  h_17f2fa2b92da6a 146
+crate/src/host.rs
+  h_17f2fa2b92da6a 29,31-35,42,44-48,56-233,236,353-524
+  h_17f2fa2b92da6a 525-643
+crate/src/service.rs
+  h_17f2fa2b92da6a 19,23,343,686,745
+crate/src/ui.rs
+  h_17f2fa2b92da6a 89-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3c861a03ec00b315b8e673dd03eb73f4f7f5cb17",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
