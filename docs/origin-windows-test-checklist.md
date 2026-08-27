@@ -8,25 +8,26 @@ ChatGPT Web -> Secure MCP Tunnel -> tunnel-client.exe -> Hands -> filesystem/ter
 
 ## 0. Existing prerequisites
 
-- [x] Repo: `F:\CodeBase\hands`
+- [x] Repo root selected and recorded locally for the acceptance run
 - [x] Rust/cargo installed
 - [x] Python installed
 - [x] Git installed
 - [x] Runtime Key created
 - [x] Tunnel ID created
 - [x] tunnel-client downloaded and SHA-256 verified
-- [x] tunnel-client path: `F:\CodeBase\hands\.tools\tunnel-client\bin\tunnel-client.exe`
+- [x] tunnel-client executable resolved from the locally verified install
 
 Do not use `hands setup`, `hands enable`, `hands start`, `hands stop`, or `hands disable` for this origin test.
 
 ## 1. Build Hands
 
 ```powershell
-cd F:\CodeBase\hands
+$RepoRoot = (Resolve-Path ".").Path
+cd $RepoRoot
 git clone --depth 1 https://github.com/xai-org/grok-build.git .grok-build
-python .\scripts\inject.py "F:\CodeBase\hands" "F:\CodeBase\hands\.grok-build"
+python .\scripts\inject.py $RepoRoot (Join-Path $RepoRoot ".grok-build")
 cargo build --release -p hands --manifest-path .\.grok-build\Cargo.toml
-$Hands = "F:\CodeBase\hands\.grok-build\target\release\hands.exe"
+$Hands = Join-Path $RepoRoot ".grok-build\target\release\hands.exe"
 & $Hands --version
 & $Hands --help
 ```
@@ -38,8 +39,8 @@ $Hands = "F:\CodeBase\hands\.grok-build\target\release\hands.exe"
 ## 2. Local filesystem smoke
 
 ```powershell
-& $Hands --cwd "F:\CodeBase\hands" list
-& $Hands --cwd "F:\CodeBase\hands" call read_file '{"target_file":"README.md"}'
+& $Hands --cwd $RepoRoot list
+& $Hands --cwd $RepoRoot call read_file '{"target_file":"README.md"}'
 ```
 
 - [x] Tool list appears
@@ -49,7 +50,7 @@ $Hands = "F:\CodeBase\hands\.grok-build\target\release\hands.exe"
 ## 3. Start Hands HTTP MCP
 
 ```powershell
-& $Hands --cwd "F:\CodeBase\hands" --http --port 8787
+& $Hands --cwd $RepoRoot --http --port 8787
 ```
 
 Endpoint: `http://127.0.0.1:8787/mcp`
@@ -60,7 +61,7 @@ Endpoint: `http://127.0.0.1:8787/mcp`
 ## 4. Start tunnel-client in another PowerShell
 
 ```powershell
-$TunnelClient = "F:\CodeBase\hands\.tools\tunnel-client\bin\tunnel-client.exe"
+$TunnelClient = "<verified-local-tunnel-client.exe>"
 $env:CONTROL_PLANE_API_KEY="sk-..."
 $env:CONTROL_PLANE_TUNNEL_ID="tunnel_..."
 $env:MCP_SERVER_URL="http://127.0.0.1:8787/mcp"
@@ -81,13 +82,13 @@ Add a Tunnel connection in ChatGPT using the same Tunnel ID, then scan tools.
 
 ## 6. ChatGPT functional tests
 
-- [x] `workspace_info` returns `F:\CodeBase\hands`
+- [x] `workspace_info` returns the pinned repository root
 - [x] `read_file` reads `README.md`
 - [x] Search for `tunnel-client` works
 - [x] Foreground terminal: `cmd.exe /c echo HANDS_WINDOWS_OK` -> `HANDS_WINDOWS_OK` (explicit `cmd.exe` terminal invocation bypassing bare `cmd` PATH shadow)
 - [x] Direct Windows executable works: `C:\Windows\System32\cmd.exe /c echo HANDS_WINDOWS_OK` -> `HANDS_WINDOWS_OK`
 - [x] PowerShell command executes
-- [x] Terminal CWD is the pinned Workspace (`F:\CodeBase\hands`)
+- [x] Terminal CWD is the pinned Workspace
 - [x] Background task returns a task ID
 - [x] `get_task_output` returns task state/output
 - [x] `kill_task` stops the owned background task (`running` -> `cancelled`)
@@ -116,7 +117,7 @@ Fixed:
 Verified: Regression test `test_cmd_path_shadowing_regression` places shadowing `cmd.ps1` and `cmd.cmd` earlier on PATH and proves native CMD execution reaches the genuine Windows command processor; `test_native_cmd_exe_resolution` confirms deterministic resolution.
 ### 9.2 Orca is not visible in the Hands process environment (RESOLVED)
 
-Authoritative Orca path on Windows host: `C:\Users\monet\AppData\Local\Programs\orca\resources\bin\orca.exe`.
+Authoritative Orca executable was resolved from live host state with `Get-Command orca`; no machine-specific executable path is committed.
 Fixed: Hands initializes with `compose_host_path()` which queries `HKCU\Environment\Path` from Windows registry, expands environment strings, and composes host user tool directories into the process PATH dynamically without hard-coding machine-specific paths.
 Verified: `test_orca_resolution_through_hands` and direct `hands call run_terminal_cmd` for `orca --version`, `orca status --json`, and `orca repo list --json` all pass with exit code 0.
 
