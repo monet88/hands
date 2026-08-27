@@ -581,6 +581,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let descendant_pid = descendant_pid_opt.expect("descendant PID must be captured deterministically");
+        cleanup.descendant_pid = Some(descendant_pid);
         // Confirm descendant process is alive before kill_task
         assert!(
             is_process_alive_by_pid(descendant_pid),
