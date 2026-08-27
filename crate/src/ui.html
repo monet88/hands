@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hands</title>
+<style>
+  :root {
+    --bg: #14120f;
+    --fg: #ece7dc;
+    --muted: #9a9284;
+    --line: #2c2924;
+    --accent: #d4a574;
+    --ok: #8fbf8a;
+    --bad: #d08070;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.45 ui-sans-serif, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  main {
+    max-width: 34rem;
+    margin: 0 auto;
+    padding: 2.2rem 1.2rem 4rem;
+  }
+  h1 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin: 0 0 0.2rem;
+  }
+  .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.6rem; }
+  label {
+    display: block;
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 1rem 0 0.35rem;
+  }
+  input, button {
+    font: inherit;
+    color: var(--fg);
+  }
+  input {
+    width: 100%;
+    background: #1c1a16;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.55rem 0.7rem;
+  }
+  input:focus { outline: 1px solid var(--accent); }
+  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1.1rem; }
+  button {
+    background: var(--accent);
+    color: #1a1612;
+    border: 0;
+    border-radius: 6px;
+    padding: 0.5rem 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.ghost {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--line);
+  }
+  .stat {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.45rem 0;
+    border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.92rem;
+  }
+  .stat span:last-child { color: var(--muted); text-align: right; word-break: break-all; }
+  .dot { color: var(--bad); }
+  .dot.on { color: var(--ok); }
+  .msg { margin-top: 1rem; min-height: 1.3em; color: var(--accent); font-size: 0.9rem; }
+  a { color: var(--accent); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Hands</h1>
+  <p class="sub">Unofficial ChatGPT plugin. Local tools. No model.</p>
+
+  <div class="stat"><span>workspace</span><span id="workspace">…</span></div>
+  <div class="stat"><span>tunnel</span><span><span class="dot" id="dot">●</span> <span id="tunnel">…</span></span></div>
+  <div class="stat"><span>service</span><span id="service">…</span></div>
+  <div class="stat"><span>key</span><span id="key">…</span></div>
+  <div class="stat"><span>tunnel id</span><span id="tid">…</span></div>
+
+  <label for="path">Workspace folder</label>
+  <input id="path" placeholder="/path/to/repo" autocomplete="off">
+
+  <label for="api">Runtime key (stays on this machine)</label>
+  <input id="api" type="password" placeholder="sk-…" autocomplete="off">
+
+  <label for="tunnel_id">Tunnel id</label>
+  <input id="tunnel_id" placeholder="tunnel_…" autocomplete="off">
+
+  <div class="row">
+    <button id="save">Save + start</button>
+    <button class="ghost" id="pin">Pin folder</button>
+    <button class="ghost" id="stop">Stop</button>
+  </div>
+  <p class="msg" id="msg"></p>
+  <p class="sub">ChatGPT → Developer mode → Connection <b>Tunnel</b> → paste tunnel id → Scan tools.<br>
+  Keys: <a href="https://platform.openai.com/settings/organization/api-keys">runtime keys</a> ·
+  <a href="https://platform.openai.com/settings/organization/tunnels">tunnels</a> ·
+  <a href="https://chatgpt.com/plugins">plugins</a></p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+async function load() {
+  const s = await (await fetch('/api/status')).json();
+  $('workspace').textContent = s.workspace || '—';
+  $('path').placeholder = s.workspace || '/path/to/repo';
+  $('tunnel').textContent = s.tunnel_ready ? 'ready' : 'down';
+  $('dot').className = 'dot' + (s.tunnel_ready ? ' on' : '');
+  $('service').textContent = s.service;
+  $('key').textContent = s.has_key ? 'saved' : 'missing';
+  $('tid').textContent = s.tunnel_id || 'missing';
+  if (s.tunnel_id && !$('tunnel_id').value) $('tunnel_id').placeholder = s.tunnel_id;
+}
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const t = await r.text();
+  let j; try { j = JSON.parse(t); } catch { j = { error: t }; }
+  if (!r.ok) throw new Error(j.error || t || r.status);
+  return j;
+}
+$('save').onclick = async () => {
+  $('msg').textContent = 'saving…';
+  try {
+    await post('/api/connect', {
+      key: $('api').value,
+      tunnel_id: $('tunnel_id').value,
+      path: $('path').value
+    });
+    $('api').value = '';
+    $('msg').textContent = 'started';
+    await load();
+  } catch (e) { $('msg').textContent = e.message; }
+};
+$('pin').onclick = async () => {
+  try {
+    await post('/api/workspace', { path: $('path').value });
+    $('msg').textContent = 'pinned';
+    await load();
+  } catch (e) { $('msg').textContent = e.message; }
+};
+$('stop').onclick = async () => {
+  try {
+    await post('/api/stop', {});
+    $('msg').textContent = 'stopped';
+    await load();
+  } catch (e) { $('msg').textContent = e.message; }
+};
+load();
+setInterval(load, 4000);
+</script>
+</body>
+</html>

@@ -14,15 +14,15 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            asset: grok-harness-macos-aarch64
+            asset: hands-macos-aarch64
           - os: ubuntu-24.04
-            asset: grok-harness-linux-x86_64
+            asset: hands-linux-x86_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: xai-org/grok-build
           path: .grok-build
@@ -31,17 +31,21 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
 
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
       - name: Inject crate
         run: python3 scripts/inject.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.grok-build"
 
       - name: Build
         working-directory: .grok-build
-        run: cargo build --release -p grok-harness
+        run: cargo build --release -p hands
 
       - name: Pack
         run: |
           mkdir -p dist
-          cp .grok-build/target/release/grok-harness "dist/${{ matrix.asset }}"
+          cp .grok-build/target/release/hands "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
@@ -53,14 +57,14 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: dist
       - name: Flatten
         run: |
           mkdir -p release
-          find dist -type f -name 'grok-harness-*' -exec cp {} release/ \;
+          find dist -type f -name 'hands-*' -exec cp {} release/ \;
           ls -la release
       - uses: softprops/action-gh-release@v2
         with:

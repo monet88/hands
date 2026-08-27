@@ -1,38 +1,43 @@
-# grok-harness
+# Hands
 
-Local **Grok Build tools** as an MCP server for **ChatGPT Web**. No local LLM. ChatGPT is the brain; this machine is the body.
+Unofficial **ChatGPT plugin**: local coding tools over MCP. No local LLM. ChatGPT is the brain; this machine is the hands.
+
+Not affiliated with OpenAI or xAI. Tool runtime is [Grok Build](https://github.com/xai-org/grok-build) (Apache-2.0).
 
 ```text
-ChatGPT Web  →  Secure MCP Tunnel  →  grok-harness  →  your repo
+ChatGPT Web  →  Secure MCP Tunnel  →  hands  →  your repo
 ```
 
 ## Install
 
-Needs: `git`, `python3`, `rustup`, macOS or Linux.
+Needs `git`, `python3`, `rustup`. macOS or Linux. First build compiles grok-build (several minutes).
 
 ```bash
-git clone https://github.com/<you>/grok-harness.git
-cd grok-harness
+git clone https://github.com/nghyane/hands.git
+cd hands
 ./install.sh
 ```
 
-Puts `grok-harness` in `~/.local/bin`. First build compiles [xai-org/grok-build](https://github.com/xai-org/grok-build) (several minutes).
+Agents: see `AGENTS.md`. One-shot if keys are already in the environment:
 
 ```bash
-# optional
-PREFIX=/usr/local ./install.sh
-GROK_BUILD_REF=main ./install.sh
+export CONTROL_PLANE_API_KEY="sk-..."
+export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
+./install.sh
 ```
 
-## Use any workspace
+## Zero config
 
 ```bash
+brew install openai/tools/tunnel-client   # once
 cd /path/to/your/repo
-grok-harness use
-grok-harness status
+hands setup                               # TTY checklist, Keychain, no browser
 ```
 
-ChatGPT talks to that folder. Switch repo: `cd` elsewhere and `grok-harness use` again. No tunnel restart.
+Runtime key goes in the macOS Keychain (file `0600` only for the daemon). Tunnel id is copied to the clipboard. Notification if the tunnel drops.
+
+Config page (optional): `hands config --open` → http://127.0.0.1:8787/  
+Scripts: `hands status --json`.
 
 ## ChatGPT Web
 
@@ -40,20 +45,9 @@ ChatGPT talks to that folder. Switch repo: `cd` elsewhere and `grok-harness use`
    https://platform.openai.com/settings/organization/api-keys
 2. Tunnel id:  
    https://platform.openai.com/settings/organization/tunnels
-3. Install [tunnel-client](https://github.com/openai/tunnel-client):
+3. [chatgpt.com/plugins](https://chatgpt.com/plugins) → Developer mode → Connection **Tunnel** → paste tunnel id → Scan tools.
 
-```bash
-brew install openai/tools/tunnel-client
-export CONTROL_PLANE_API_KEY="sk-..."   # runtime key, not admin key
-export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
-grok-harness enable
-```
-
-`enable` writes the tunnel profile, starts it now, and installs a login service (macOS LaunchAgent / Linux systemd --user) that **restarts if the MCP child dies**.
-
-4. [chatgpt.com/plugins](https://chatgpt.com/plugins) → Developer mode → Connection **Tunnel** → paste tunnel id → Scan tools.
-
-`grok-harness use` starts the tunnel if it is down. `grok-harness disable` removes auto-start.
+Plugin name in ChatGPT: **Hands**.
 
 ## Tools
 
@@ -72,8 +66,10 @@ grok-harness enable
 | `get_task_output` | poll background job |
 | `kill_task` | stop background job |
 
-No Grok/Codex model tokens. Debug: `grok-harness list`, `grok-harness call read_file '{"target_file":"README.md"}'`.
+Debug: `hands list`, `hands call read_file '{"target_file":"README.md"}'`.
+
+On AC the Mac stays awake for the long-poll; on battery, closing the lid may sleep.
 
 ## License
 
-Apache-2.0. Tool runtime comes from Grok Build (Apache-2.0). See `NOTICE`.
+Apache-2.0. See `NOTICE`.

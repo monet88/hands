@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the grok-harness crate into a grok-build checkout and register it."""
+"""Copy the Hands crate into a grok-build checkout and register it."""
 
 from __future__ import annotations
 
@@ -7,27 +7,34 @@ import shutil
 import sys
 from pathlib import Path
 
-MEMBER = '    "crates/codegen/grok-harness",'
+MEMBER = '    "crates/codegen/hands",'
+OLD_MEMBER = '    "crates/codegen/grok-harness",'
 
 
 def main() -> int:
     if len(sys.argv) != 3:
-        print("usage: inject.py <grok-harness-repo> <grok-build-checkout>", file=sys.stderr)
+        print("usage: inject.py <hands-repo> <grok-build-checkout>", file=sys.stderr)
         return 2
     src_repo = Path(sys.argv[1]).resolve()
     grok_build = Path(sys.argv[2]).resolve()
     crate_src = src_repo / "crate"
-    dest = grok_build / "crates" / "codegen" / "grok-harness"
+    dest = grok_build / "crates" / "codegen" / "hands"
     if not (crate_src / "Cargo.toml").is_file():
         print(f"missing crate at {crate_src}", file=sys.stderr)
         return 1
+    old = grok_build / "crates" / "codegen" / "grok-harness"
+    if old.exists():
+        shutil.rmtree(old)
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(crate_src, dest)
 
     root = grok_build / "Cargo.toml"
     text = root.read_text()
-    if MEMBER.strip() not in text:
+    if OLD_MEMBER in text:
+        text = text.replace(OLD_MEMBER, MEMBER, 1)
+        root.write_text(text)
+    elif MEMBER.strip() not in text:
         needle = '    "crates/codegen/xai-grok-tools",'
         if needle not in text:
             print("could not find xai-grok-tools member in grok-build Cargo.toml", file=sys.stderr)

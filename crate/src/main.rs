@@ -1,43 +1,47 @@
-//! Global Grok harness CLI: no model, no Computer Hub.
-//!
-//! Pin any repo, then ChatGPT talks to that workspace through the tunnel:
-//!
-//! ```text
-//! cd /any/project
-//! grok-harness use
-//! ```
+//! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
 mod host;
 mod mcp;
+mod secrets;
 mod service;
+mod setup;
+mod ui;
+mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-const USAGE: &str = "\
-grok-harness — local coding tools for ChatGPT Web (no model)
+use crate::host::{APP, DISPLAY};
 
-  cd /any/repo && grok-harness use     pin this folder as the workspace
-  grok-harness status                  show pin + tunnel
-  grok-harness enable                  auto-start tunnel at login (KeepAlive)
-  grok-harness disable                 remove auto-start
-  grok-harness start                   start tunnel now
-  grok-harness stop                    stop tunnel now
-  grok-harness                         MCP stdio (used by tunnel-client)
+const USAGE: &str = "\
+Hands — unofficial ChatGPT plugin (local tools, no model)
+
+  hands setup                      first-run checklist (TTY). no browser
+  hands setup --ui                 same, then open config page
+  hands config                     serve UI at http://127.0.0.1:8787/ (no browser)
+  hands config --open              serve UI and open it
+  cd /repo && hands use            pin this folder
+  hands status [--json]
+  hands enable | disable | start | stop
+  hands                            MCP stdio (ChatGPT tunnel)
 
 Debug:
-  grok-harness list
-  grok-harness call <tool> <json>
-  grok-harness --http [--port N]
+  hands list
+  hands call <tool> <json>
+  hands watch                      notify when tunnel drops (LaunchAgent)
+  hands --http [--port N]
 ";
 
 enum Cmd {
+    Setup { open_ui: bool },
+    Config { addr: SocketAddr, open: bool },
     Use { dir: PathBuf },
-    Status,
+    Status { json: bool },
     Enable,
     Disable,
     Start,
     Stop,
+    Watch,
     McpStdio,
     McpHttp { addr: SocketAddr },
     List,
@@ -48,6 +52,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
     let mut fallback = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut http = false;
     let mut port: u16 = 8787;
+    let mut open = false;
     let mut rest = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -61,8 +66,9 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
                 let value = args.next().ok_or("--port requires a number")?;
                 port = value.parse().map_err(|_| "invalid --port")?;
             }
+            "--open" | "--ui" => open = true,
             "-V" | "--version" => {
-                println!("grok-harness {}", env!("CARGO_PKG_VERSION"));
+                println!("{APP} {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-h" | "--help" => return Err(USAGE.trim_end().to_string()),
@@ -73,21 +79,24 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             }
         }
     }
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let cmd = if http {
-        Cmd::McpHttp {
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
-        }
+        Cmd::McpHttp { addr }
     } else {
         match rest.as_slice() {
             [] => Cmd::McpStdio,
             [op] if op == "mcp" => Cmd::McpStdio,
+            [op] if op == "setup" => Cmd::Setup { open_ui: open },
+            [op] if op == "config" => Cmd::Config { addr, open },
+            [op] if op == "watch" => Cmd::Watch,
             [op] if op == "use" => Cmd::Use {
                 dir: fallback.clone(),
             },
             [op, dir] if op == "use" => Cmd::Use {
                 dir: PathBuf::from(dir),
             },
-            [op] if op == "status" => Cmd::Status,
+            [op] if op == "status" => Cmd::Status { json: false },
+            [op, flag] if op == "status" && flag == "--json" => Cmd::Status { json: true },
             [op] if op == "enable" => Cmd::Enable,
             [op] if op == "disable" => Cmd::Disable,
             [op] if op == "start" => Cmd::Start,
@@ -105,11 +114,16 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
 
 #[tokio::main]
 async fn main() {
+    host::migrate_from_legacy();
     let (fallback, cmd) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(if e.starts_with("grok-harness") { 0 } else { 2 });
+            std::process::exit(if e.starts_with(DISPLAY) || e.starts_with("Hands") {
+                0
+            } else {
+                2
+            });
         }
     };
     if let Err(e) = run(fallback, cmd).await {
@@ -120,32 +134,58 @@ async fn main() {
 
 async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
     match cmd {
+        Cmd::Setup { open_ui } => {
+            setup::run(&fallback)?;
+            if open_ui {
+                let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+                let url = format!("http://{addr}/");
+                eprintln!("{url}");
+                ui::open_browser(&url);
+                return mcp::McpHost::new(fallback).serve_http(addr).await;
+            }
+            Ok(())
+        }
+        Cmd::Config { addr, open } => {
+            let url = format!("http://{addr}/");
+            eprintln!("{url}");
+            if open {
+                ui::open_browser(&url);
+            }
+            mcp::McpHost::new(fallback).serve_http(addr).await
+        }
+        Cmd::Watch => watch::run(),
         Cmd::Use { dir } => {
             let cwd = host::pin_workspace(&dir)?;
             println!("{}", cwd.display());
             match service::ensure() {
                 Ok(true) => {
-                    eprintln!("pinned. ChatGPT uses this folder on the next tool call (call workspace_info).");
+                    eprintln!("pinned. ChatGPT uses this folder on the next tool call.");
                 }
                 Ok(false) => {
-                    eprintln!(
-                        "pinned, but tunnel is down. One-time:\n  export CONTROL_PLANE_API_KEY=...\n  grok-harness enable"
-                    );
+                    eprintln!("pinned. Run: hands setup");
                 }
                 Err(e) => eprintln!("pinned, tunnel start failed: {e}"),
             }
             Ok(())
         }
-        Cmd::Status => {
+        Cmd::Status { json } => {
             let cwd = host::resolve_workspace(&fallback);
-            let pin = host::read_pinned_workspace();
-            println!("workspace  {}", cwd.display());
-            println!(
-                "pin        {}",
-                pin.map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(none — using cwd/env)".into())
-            );
-            println!("tunnel     {}", service::status_line());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&service::status_json(&cwd))
+                        .map_err(|e| e.to_string())?
+                );
+            } else {
+                let pin = host::read_pinned_workspace();
+                println!("workspace  {}", cwd.display());
+                println!(
+                    "pin        {}",
+                    pin.map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none — using cwd/env)".into())
+                );
+                println!("tunnel     {}", service::status_line());
+            }
             Ok(())
         }
         Cmd::Enable => service::enable(),
@@ -181,7 +221,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     let params: serde_json::Value = serde_json::from_str(&args_json)
                         .map_err(|e| format!("invalid json args: {e}"))?;
                     let result = bridge
-                        .call(&tool, params, "grok-harness-1")
+                        .call(&tool, params, "hands-1")
                         .await
                         .map_err(|e| e.to_string())?;
                     println!("{}", result.prompt_text);
@@ -192,5 +232,3 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         }
     }
 }
-
-

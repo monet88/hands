@@ -14,9 +14,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: xai-org/grok-build
           path: .grok-build
@@ -25,18 +25,23 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
 
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
       - name: Inject crate
         run: python3 scripts/inject.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.grok-build"
 
       - name: Build
         working-directory: .grok-build
-        run: cargo build --release -p grok-harness
+        run: cargo build --release -p hands
 
       - name: Smoke
         run: |
-          bin=".grok-build/target/release/grok-harness"
+          bin=".grok-build/target/release/hands"
           "$bin" --version
           "$bin" --help
+          "$bin" status --json
           tmp="$(mktemp -d)"
           echo hello > "$tmp/n.txt"
           "$bin" use "$tmp"
@@ -44,6 +49,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: grok-harness-${{ runner.os }}-${{ runner.arch }}
-          path: .grok-build/target/release/grok-harness
+          name: hands-${{ runner.os }}-${{ runner.arch }}
+          path: .grok-build/target/release/hands
           if-no-files-found: error

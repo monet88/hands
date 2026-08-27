@@ -13,9 +13,10 @@ use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
 
 use crate::host;
+use crate::ui;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const SERVER_NAME: &str = "grok-harness";
+const SERVER_NAME: &str = "Hands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const READ_ONLY: &[&str] = &[
@@ -91,7 +92,8 @@ impl McpHost {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| format!("bind {addr}: {e}"))?;
-        eprintln!("MCP HTTP listening on http://{addr}/mcp");
+        eprintln!("Hands UI  http://{addr}/");
+        eprintln!("MCP       http://{addr}/mcp");
         loop {
             let (stream, _) = listener
                 .accept()
@@ -144,9 +146,9 @@ impl McpHost {
                 "version": SERVER_VERSION,
             },
             "instructions": format!(
-                "Local Grok tool harness. No model. \
-                 Active workspace is selected on the machine with `grok-harness use`. \
-                 Call workspace_info first to see the current root (now {}). \
+                "Hands: unofficial local coding tools for ChatGPT. No model. \
+                 Workspace is set on the machine with `hands use` or the config UI. \
+                 Call workspace_info first (now {}). \
                  Then read_file/grep/glob/list_dir, write/search_replace/apply_patch to edit, \
                  todo_write for plans, run_terminal_cmd to test (background + kill_task/get_task_output). \
                  After each edit, rerun the failing check.",
@@ -158,7 +160,7 @@ impl McpHost {
     async fn tools_list(&self) -> Result<Value, (i64, String, Value)> {
         let mut tools = vec![json!({
             "name": "workspace_info",
-            "description": "Return the active local workspace root. Call this before other tools if the user switched repos with grok-harness use.",
+            "description": "Return the active local workspace root. Call this before other tools if the user switched repos with hands use.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": {
                 "readOnlyHint": true,
@@ -292,22 +294,26 @@ async fn handle_http(mut stream: TcpStream, host: Arc<McpHost>) -> Result<(), St
         }
     }
 
-    if method == "GET" && (path == "/health" || path == "/healthz") {
-        return write_http(&mut writer, 200, "text/plain", b"ok").await;
-    }
-    if method != "POST" || path != "/mcp" {
-        return write_http(&mut writer, 404, "text/plain", b"not found").await;
-    }
     if content_length > 8 * 1024 * 1024 {
         return write_http(&mut writer, 413, "text/plain", b"body too large").await;
     }
-
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader
             .read_exact(&mut body)
             .await
             .map_err(|e| format!("body: {e}"))?;
+    }
+
+    let path_only = path.split('?').next().unwrap_or(path);
+    if method == "GET" && (path_only == "/health" || path_only == "/healthz") {
+        return write_http(&mut writer, 200, "text/plain", b"ok").await;
+    }
+    if let Some((status, ctype, payload)) = ui::route(method, path_only, &body) {
+        return write_http(&mut writer, status, ctype, &payload).await;
+    }
+    if method != "POST" || path_only != "/mcp" {
+        return write_http(&mut writer, 404, "text/plain", b"not found").await;
     }
     let resp = match serde_json::from_slice::<Value>(&body) {
         Ok(msg) => host
@@ -336,6 +342,7 @@ async fn write_http(
 ) -> Result<(), String> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",

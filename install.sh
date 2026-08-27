@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Install grok-harness to ~/.local/bin (or $PREFIX/bin).
+# Non-interactive install. Agents: curl -fsSL …/install.sh | bash
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
-CACHE="${GROK_HARNESS_CACHE:-$HOME/.cache/grok-harness}"
+CACHE="${HANDS_CACHE:-${GROK_HARNESS_CACHE:-$HOME/.cache/hands}}"
 GROK_BUILD_URL="${GROK_BUILD_URL:-https://github.com/xai-org/grok-build.git}"
 GROK_BUILD_REF="${GROK_BUILD_REF:-main}"
 JOBS="${JOBS:-}"
@@ -29,27 +29,30 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 
 cd "$GROK_BUILD"
-# rust-toolchain.toml in grok-build pins the compiler.
-CARGO_ARGS=(build --release -p grok-harness)
+CARGO_ARGS=(build --release -p hands)
 if [[ -n "$JOBS" ]]; then
   CARGO_ARGS+=(-j "$JOBS")
 fi
 cargo "${CARGO_ARGS[@]}"
 
-BIN="$GROK_BUILD/target/release/grok-harness"
-install -m 0755 "$BIN" "$PREFIX/bin/grok-harness"
+BIN="$GROK_BUILD/target/release/hands"
+install -m 0755 "$BIN" "$PREFIX/bin/hands"
 
 echo
-echo "installed $PREFIX/bin/grok-harness"
-"$PREFIX/bin/grok-harness" --version
+echo "installed $PREFIX/bin/hands"
+"$PREFIX/bin/hands" --version
 echo
-echo "Next:"
-echo "  cd /your/repo && grok-harness use"
-echo "  brew install openai/tools/tunnel-client   # ChatGPT Web tunnel"
-echo "  export CONTROL_PLANE_API_KEY=... CONTROL_PLANE_TUNNEL_ID=tunnel_..."
-echo "  grok-harness enable                       # start now + at login"
+
+if [[ -n "${CONTROL_PLANE_API_KEY:-}" && -n "${CONTROL_PLANE_TUNNEL_ID:-}" ]]; then
+  "$PREFIX/bin/hands" setup || true
+  echo "tunnel setup attempted (keys found in env)."
+else
+  echo "Next:"
+  echo "  brew install openai/tools/tunnel-client   # once"
+  echo "  cd /your/repo && hands setup              # TTY checklist, no browser"
+fi
 echo
-if ! command -v grok-harness >/dev/null 2>&1; then
+if ! command -v hands >/dev/null 2>&1; then
   echo "Put $PREFIX/bin on PATH, e.g.:"
   echo "  export PATH=\"$PREFIX/bin:\$PATH\""
 fi

@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,18 +15,19 @@ use crate::host;
 
 pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
-pub const PROFILE: &str = "grok-harness";
-const LABEL: &str = "ai.grok.harness.tunnel";
-
-pub fn key_file() -> PathBuf {
-    host::config_dir().join("control-plane.key")
-}
+pub const PROFILE: &str = "hands";
+const LABEL: &str = "dev.hands.tunnel";
+#[cfg(target_os = "macos")]
+const WATCH_LABEL: &str = "dev.hands.watch";
+const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
+const LEGACY_PROFILE: &str = "grok-harness";
 
 pub fn profile_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/tunnel-client")
-        .join(format!("{PROFILE}.yaml"))
+    host::tunnel_client_dir().join(format!("{PROFILE}.yaml"))
+}
+
+fn legacy_profile_file() -> PathBuf {
+    host::tunnel_client_dir().join(format!("{LEGACY_PROFILE}.yaml"))
 }
 
 pub fn ready() -> bool {
@@ -54,7 +56,7 @@ pub fn status_line() -> String {
     let svc = if installed() {
         "enabled (login + restart)"
     } else {
-        "off — grok-harness enable"
+        "off — hands setup"
     };
     format!("{health}\nservice    {svc}")
 }
@@ -78,6 +80,7 @@ pub fn ensure() -> Result<bool, String> {
 }
 
 pub fn enable() -> Result<(), String> {
+    host::migrate_from_legacy();
     let key = persist_key()?;
     let tunnel_id = resolve_tunnel_id()?;
     let harness = harness_bin()?;
@@ -85,8 +88,9 @@ pub fn enable() -> Result<(), String> {
     write_profile(&key, &harness, &tunnel_id)?;
     write_wrapper(&client)?;
     install_supervisor()?;
+    let _ = install_watch();
     if wait_ready(Duration::from_secs(15)) {
-        eprintln!("tunnel enabled. starts at login, restarts if it dies.");
+        eprintln!("tunnel on. login start + restart. config: hands config");
         eprintln!("admin  {HEALTH_BASE}/ui");
         Ok(())
     } else {
@@ -122,33 +126,67 @@ pub fn stop() -> Result<(), String> {
     Ok(())
 }
 
+pub fn has_key() -> bool {
+    host::migrate_from_legacy();
+    crate::secrets::get().is_some()
+}
+
+pub fn tunnel_id_opt() -> Option<String> {
+    resolve_tunnel_id().ok()
+}
+
+/// Save credentials from the config UI. Empty strings are ignored.
+pub fn save_connect(key: Option<&str>, tunnel_id: Option<&str>) -> Result<(), String> {
+    host::migrate_from_legacy();
+    if let Some(key) = key.map(str::trim).filter(|s| !s.is_empty()) {
+        crate::secrets::set(key)?;
+    }
+    if let Some(id) = tunnel_id.map(str::trim).filter(|s| !s.is_empty()) {
+        set_tunnel_id(id)?;
+    }
+    if can_enable() {
+        enable()?;
+    }
+    Ok(())
+}
+
+pub fn set_tunnel_id(id: &str) -> Result<(), String> {
+    let id = id.trim();
+    if !id.starts_with("tunnel_") {
+        return Err("tunnel id should look like tunnel_…".into());
+    }
+    let dir = host::config_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    write_secret(&dir.join("tunnel_id"), id)
+}
+
+pub fn status_json(workspace: &Path) -> serde_json::Value {
+    host::migrate_from_legacy();
+    let pin = host::read_pinned_workspace();
+    serde_json::json!({
+        "name": host::DISPLAY,
+        "unofficial": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "workspace": workspace.display().to_string(),
+        "pin": pin.as_ref().map(|p| p.display().to_string()),
+        "tunnel_ready": ready(),
+        "tunnel_admin": format!("{HEALTH_BASE}/ui"),
+        "service": if installed() { "enabled" } else { "off" },
+        "has_key": has_key(),
+        "tunnel_id": tunnel_id_opt(),
+        "chatgpt": "https://chatgpt.com/plugins",
+    })
+}
+
 fn can_enable() -> bool {
     persist_key().is_ok() && resolve_tunnel_id().is_ok() && tunnel_client_bin().is_ok()
 }
 
 fn persist_key() -> Result<PathBuf, String> {
-    let dest = key_file();
-    if let Ok(key) = std::env::var("CONTROL_PLANE_API_KEY") {
-        let key = key.trim();
-        if valid_runtime_key(key) {
-            write_secret(&dest, key)?;
-            return Ok(dest);
-        }
-    }
-    if dest.is_file() {
-        if let Ok(existing) = fs::read_to_string(&dest) {
-            if valid_runtime_key(existing.trim()) {
-                return Ok(dest);
-            }
-        }
-    }
-    Err(
-        "missing runtime key. export CONTROL_PLANE_API_KEY then grok-harness enable".into(),
-    )
-}
-
-fn valid_runtime_key(key: &str) -> bool {
-    key.starts_with("sk-") && key.len() >= 32 && !key.contains(char::is_whitespace)
+    let k = crate::secrets::get().ok_or_else(|| {
+        "missing runtime key. run hands setup, or export CONTROL_PLANE_API_KEY".to_string()
+    })?;
+    crate::secrets::ensure_file(&k)
 }
 
 fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
@@ -157,7 +195,10 @@ fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
     }
     fs::write(path, format!("{}\n", contents.trim()))
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -168,18 +209,26 @@ fn resolve_tunnel_id() -> Result<String, String> {
             return Ok(id.to_string());
         }
     }
-    if let Ok(text) = fs::read_to_string(profile_file()) {
-        for line in text.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix("tunnel_id:") {
-                let id = rest.trim().trim_matches('"').trim();
-                if !id.is_empty() {
-                    return Ok(id.to_string());
+    if let Ok(id) = fs::read_to_string(host::config_dir().join("tunnel_id")) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    for path in [profile_file(), legacy_profile_file()] {
+        if let Ok(text) = fs::read_to_string(path) {
+            for line in text.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("tunnel_id:") {
+                    let id = rest.trim().trim_matches('"').trim();
+                    if !id.is_empty() {
+                        return Ok(id.to_string());
+                    }
                 }
             }
         }
     }
-    Err("missing tunnel id. export CONTROL_PLANE_TUNNEL_ID or run tunnel-client init first".into())
+    Err("missing tunnel id. paste it in the config UI (hands config) or export CONTROL_PLANE_TUNNEL_ID".into())
 }
 
 fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
@@ -200,7 +249,7 @@ health:
 admin_ui:
   open_browser: false
 log:
-  level: info
+  level: warn
   format: json
 mcp:
   commands:
@@ -209,7 +258,10 @@ mcp:
 "#
     );
     fs::write(&path, yaml).map_err(|e| format!("write {}: {e}", path.display()))?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -221,15 +273,38 @@ fn write_wrapper(client: &Path) -> Result<(), String> {
     let dir = host::config_dir();
     fs::create_dir_all(dir.join("logs")).map_err(|e| format!("mkdir logs: {e}"))?;
     let path = wrapper_path();
+    let client = client.display();
+    // Long-poll is the wait-for-request. Do not busy-loop. Only block idle
+    // sleep so the radio stays up. On AC also block system sleep (clamshell).
+    // On battery, lid-close may sleep — no VPS/iPhone required.
     let body = format!(
-        "#!/bin/sh\n\
-         export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\"\n\
-         exec \"{}\" run --profile {PROFILE}\n",
-        client.display()
+        r#"#!/bin/sh
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+CLIENT="{client}"
+set -- "$CLIENT" run --profile {PROFILE} --log.level=warn --control-plane.poll-timeout=60s
+mode="${{HANDS_CAFFEINATE:-${{GROK_HARNESS_CAFFEINATE:-auto}}}}"
+if [ "$mode" = "auto" ]; then
+  if command -v pmset >/dev/null 2>&1 && pmset -g ps 2>/dev/null | grep -q "AC Power"; then
+    mode=is
+  else
+    mode=i
+  fi
+fi
+if [ -x /usr/bin/caffeinate ] && [ "$mode" != "off" ]; then
+  exec /usr/bin/caffeinate -"$mode" -- "$@"
+fi
+if command -v systemd-inhibit >/dev/null 2>&1; then
+  exec systemd-inhibit --what=idle --who=hands --why="ChatGPT MCP tunnel" --mode=block "$@"
+fi
+exec "$@"
+"#
     );
     fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -238,7 +313,7 @@ fn harness_bin() -> Result<PathBuf, String> {
     Ok(dunce::canonicalize(&exe).unwrap_or(exe))
 }
 
-fn tunnel_client_bin() -> Result<PathBuf, String> {
+pub fn tunnel_client_bin() -> Result<PathBuf, String> {
     which("tunnel-client").ok_or_else(|| {
         "tunnel-client not found. brew install openai/tools/tunnel-client".into()
     })
@@ -324,7 +399,10 @@ fn install_supervisor() -> Result<(), String> {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ThrottleInterval</key><integer>2</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LowPriorityIO</key><false/>
+  <key>Nice</key><integer>0</integer>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -337,6 +415,12 @@ fn install_supervisor() -> Result<(), String> {
     fs::write(&plist, xml).map_err(|e| format!("write {}: {e}", plist.display()))?;
     stop_unmanaged();
     let target = gui_target();
+    let _ = launchctl(&["bootout", &target, LEGACY_LABEL]);
+    let legacy_plist = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/LaunchAgents")
+        .join(format!("{LEGACY_LABEL}.plist"));
+    let _ = fs::remove_file(legacy_plist);
     let _ = launchctl(&["bootout", &target, LABEL]);
     let boot = launchctl(&["bootstrap", &target, &plist.display().to_string()]);
     if !boot.status.success() {
@@ -383,7 +467,69 @@ fn stop_supervisor() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn uninstall_supervisor() -> Result<(), String> {
     stop_supervisor()?;
+    let _ = uninstall_watch();
     let plist = plist_path();
+    if plist.exists() {
+        fs::remove_file(&plist).map_err(|e| format!("rm {}: {e}", plist.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn watch_plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/LaunchAgents")
+        .join(format!("{WATCH_LABEL}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn install_watch() -> Result<(), String> {
+    let hands = harness_bin()?;
+    let plist = watch_plist_path();
+    if let Some(parent) = plist.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let out = log_dir().join("watch.out");
+    let err = log_dir().join("watch.err");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{WATCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&hands.display().to_string()),
+        xml_escape(&out.display().to_string()),
+        xml_escape(&err.display().to_string()),
+    );
+    fs::write(&plist, xml).map_err(|e| format!("write {}: {e}", plist.display()))?;
+    let target = gui_target();
+    let _ = launchctl(&["bootout", &target, WATCH_LABEL]);
+    let _ = launchctl(&["bootstrap", &target, &plist.display().to_string()]);
+    let _ = launchctl(&["enable", &format!("{target}/{WATCH_LABEL}")]);
+    let _ = launchctl(&["kickstart", "-k", &format!("{target}/{WATCH_LABEL}")]);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_watch() -> Result<(), String> {
+    let target = gui_target();
+    let _ = launchctl(&["bootout", &target, WATCH_LABEL]);
+    let plist = watch_plist_path();
     if plist.exists() {
         fs::remove_file(&plist).map_err(|e| format!("rm {}: {e}", plist.display()))?;
     }
@@ -394,7 +540,7 @@ fn uninstall_supervisor() -> Result<(), String> {
 fn unit_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/systemd/user/grok-harness-tunnel.service")
+        .join(".config/systemd/user/hands-tunnel.service")
 }
 
 #[cfg(target_os = "linux")]
@@ -403,39 +549,90 @@ fn install_supervisor() -> Result<(), String> {
     if let Some(parent) = unit.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let wrapper = wrapper_path();
+    let wrapper_buf = wrapper_path();
+    let wrapper = wrapper_buf.display();
     let body = format!(
-        "[Unit]\n\
-         Description=Grok harness ChatGPT tunnel\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart={}\n\
-         Restart=always\n\
-         RestartSec=2\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        wrapper.display()
+        r#"[Unit]
+Description=Hands ChatGPT tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={wrapper}
+Restart=always
+RestartSec=2
+Nice=0
+
+[Install]
+WantedBy=default.target
+"#
     );
     fs::write(&unit, body).map_err(|e| format!("write {}: {e}", unit.display()))?;
     stop_unmanaged();
     run_ok("systemctl", &["--user", "daemon-reload"])?;
-    run_ok("systemctl", &["--user", "enable", "--now", "grok-harness-tunnel.service"])?;
+    run_ok("systemctl", &["--user", "enable", "--now", "hands-tunnel.service"])?;
+    let _ = install_watch();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn watch_unit_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/systemd/user/hands-watch.service")
+}
+
+#[cfg(target_os = "linux")]
+fn install_watch() -> Result<(), String> {
+    let hands = harness_bin()?;
+    let unit = watch_unit_path();
+    if let Some(parent) = unit.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let body = format!(
+        r#"[Unit]
+Description=Hands tunnel down notifier
+After=hands-tunnel.service
+
+[Service]
+Type=simple
+ExecStart={} watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"#,
+        hands.display()
+    );
+    fs::write(&unit, body).map_err(|e| format!("write {}: {e}", unit.display()))?;
+    run_ok("systemctl", &["--user", "daemon-reload"])?;
+    run_ok("systemctl", &["--user", "enable", "--now", "hands-watch.service"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_watch() -> Result<(), String> {
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "hands-watch.service"])
+        .status();
+    let unit = watch_unit_path();
+    if unit.exists() {
+        fs::remove_file(&unit).map_err(|e| format!("rm {}: {e}", unit.display()))?;
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn start_supervisor() -> Result<(), String> {
-    run_ok("systemctl", &["--user", "start", "grok-harness-tunnel.service"])
+    run_ok("systemctl", &["--user", "start", "hands-tunnel.service"])
 }
 
 #[cfg(target_os = "linux")]
 fn stop_supervisor() -> Result<(), String> {
     let _ = Command::new("systemctl")
-        .args(["--user", "stop", "grok-harness-tunnel.service"])
+        .args(["--user", "stop", "hands-tunnel.service"])
         .status();
     stop_unmanaged();
     Ok(())
@@ -444,8 +641,9 @@ fn stop_supervisor() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn uninstall_supervisor() -> Result<(), String> {
     let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", "grok-harness-tunnel.service"])
+        .args(["--user", "disable", "--now", "hands-tunnel.service"])
         .status();
+    let _ = uninstall_watch();
     stop_unmanaged();
     let unit = unit_path();
     if unit.exists() {
@@ -477,6 +675,11 @@ fn uninstall_supervisor() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn install_watch() -> Result<(), String> {
+    Ok(())
+}
+
 fn stop_unmanaged() {
     let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
         return;
@@ -487,10 +690,11 @@ fn stop_unmanaged() {
         let Some((pid, cmd)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        if !cmd.contains("tunnel-client") || !cmd.contains("run --profile grok-harness") {
+        if !cmd.contains("tunnel-client") {
             continue;
         }
-        if cmd.contains("pkill") || cmd.contains("grok-harness") {
+        let ours = cmd.contains("run --profile hands") || cmd.contains("run --profile grok-harness");
+        if !ours || cmd.contains("pkill") {
             continue;
         }
         let _ = Command::new("kill").arg(pid.trim()).status();

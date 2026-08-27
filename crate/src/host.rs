@@ -1,4 +1,4 @@
-//! Shared workspace + ToolBridge construction for the global CLI.
+//! Workspace pin + ToolBridge. Unofficial; runtime from xai-org/grok-build.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,17 +15,60 @@ use xai_grok_tools::notification::ToolNotificationHandle;
 use xai_grok_tools::registry::types::{SessionContext, ToolConfig, ToolServerConfig};
 use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 
+pub const APP: &str = "hands";
+pub const DISPLAY: &str = "Hands";
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// XDG on Unix (`~/.config/hands`). `%APPDATA%\hands` on Windows.
 pub fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/grok-harness")
+    #[cfg(windows)]
+    {
+        return dirs::config_dir()
+            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
+            .join(APP);
+    }
+    home_dir().join(".config").join(APP)
+}
+
+pub fn tunnel_client_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        return dirs::config_dir()
+            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
+            .join("tunnel-client");
+    }
+    home_dir().join(".config/tunnel-client")
 }
 
 pub fn workspace_file() -> PathBuf {
     config_dir().join("workspace")
 }
 
+/// Copy `~/.config/grok-harness` once if the new dir is empty.
+pub fn migrate_from_legacy() {
+    let dest = config_dir();
+    if dest.join("workspace").is_file() || dest.join("control-plane.key").is_file() {
+        return;
+    }
+    let src = home_dir().join(".config/grok-harness");
+    if !src.is_dir() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dest);
+    for name in ["workspace", "control-plane.key"] {
+        let from = src.join(name);
+        let to = dest.join(name);
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
 pub fn read_pinned_workspace() -> Option<PathBuf> {
+    migrate_from_legacy();
     let raw = std::fs::read_to_string(workspace_file()).ok()?;
     let path = PathBuf::from(raw.trim());
     if path.is_dir() {
@@ -36,6 +79,7 @@ pub fn read_pinned_workspace() -> Option<PathBuf> {
 }
 
 pub fn pin_workspace(dir: &Path) -> Result<PathBuf, String> {
+    migrate_from_legacy();
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
     }
@@ -49,11 +93,14 @@ pub fn pin_workspace(dir: &Path) -> Result<PathBuf, String> {
 
 /// Active workspace: env → pin file → `--cwd`/process cwd.
 pub fn resolve_workspace(fallback: &Path) -> PathBuf {
-    if let Ok(env_path) = std::env::var("GROK_HARNESS_WORKSPACE") {
-        let p = PathBuf::from(env_path);
-        if let Ok(c) = dunce::canonicalize(&p) {
-            if c.is_dir() {
-                return c;
+    migrate_from_legacy();
+    for var in ["HANDS_WORKSPACE", "GROK_HARNESS_WORKSPACE"] {
+        if let Ok(env_path) = std::env::var(var) {
+            let p = PathBuf::from(env_path);
+            if let Ok(c) = dunce::canonicalize(&p) {
+                if c.is_dir() {
+                    return c;
+                }
             }
         }
     }
@@ -83,7 +130,7 @@ fn allowlist() -> ToolServerConfig {
 }
 
 fn session_context(cwd: PathBuf) -> SessionContext {
-    let host_dir = std::env::temp_dir().join("grok-harness");
+    let host_dir = std::env::temp_dir().join(APP);
     let _ = std::fs::create_dir_all(&host_dir);
     SessionContext {
         backend: Arc::new(LocalTerminalBackend::new()),
