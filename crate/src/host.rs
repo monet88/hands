@@ -864,4 +864,89 @@ mod tests {
             fake_exe.canonicalize().ok()
         );
     }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_windows_terminal_foreground_and_bounded_output() {
+        compose_host_path();
+        let temp_ws = std::env::temp_dir().join(format!(
+            "hands_term_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let _ = std::fs::create_dir_all(&temp_ws);
+        let canonical_ws = dunce::canonicalize(&temp_ws).unwrap();
+
+        let bridge = build_bridge(canonical_ws.clone())
+            .await
+            .expect("bridge should build with canonical workspace");
+
+        // 1. Foreground command execution in the pinned workspace
+        let fg_args = serde_json::json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"(Get-Location).Path; Write-Output 'TERMINAL_FOREGROUND_OK'\"",
+            "description": "check foreground execution"
+        });
+        let fg_res = bridge
+            .call("run_terminal_cmd", fg_args, "test-term-fg")
+            .await
+            .expect("foreground terminal call should succeed");
+        assert!(
+            fg_res.prompt_text.contains("TERMINAL_FOREGROUND_OK"),
+            "foreground terminal output should contain expected marker: {}",
+            fg_res.prompt_text
+        );
+
+        // 2. Background command returning task ID and retrieving ordered output
+        let bg_args = serde_json::json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output LINE_1; Write-Output LINE_2; Start-Sleep -Milliseconds 200\"",
+            "description": "ordered output test",
+            "is_background": true
+        });
+        let bg_res = bridge
+            .call("run_terminal_cmd", bg_args, "test-term-bg")
+            .await
+            .expect("background terminal call should succeed");
+
+        let task_id = if let Some(start) = bg_res.prompt_text.find("<task-id>") {
+            let rest = &bg_res.prompt_text[start + 9..];
+            if let Some(end) = rest.find("</task-id>") {
+                rest[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            bg_res
+                .prompt_text
+                .lines()
+                .find_map(|line| {
+                    if line.contains("Task ID:") || line.contains("task_id:") {
+                        line.split(':').nth(1).map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        };
+        assert!(!task_id.is_empty(), "background task should return task ID");
+
+        // Wait for background job to emit output
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let out_args = serde_json::json!({ "task_id": &task_id });
+        let out_res = bridge
+            .call("get_task_output", out_args, "test-term-out")
+            .await
+            .expect("get_task_output should succeed");
+
+        assert!(
+            out_res.prompt_text.contains("LINE_1"),
+            "output should contain LINE_1: {}",
+            out_res.prompt_text
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_ws);
+    }
 }
