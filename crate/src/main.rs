@@ -43,6 +43,7 @@ enum Cmd {
     Start,
     Stop,
     Watch,
+    RunTunnel,
     McpStdio,
     McpHttp { addr: SocketAddr },
     List,
@@ -90,6 +91,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             [op] if op == "setup" => Cmd::Setup { open_ui: open },
             [op] if op == "config" => Cmd::Config { addr, open },
             [op] if op == "watch" => Cmd::Watch,
+            [op] if op == "run-tunnel" || op == "daemon" => Cmd::RunTunnel,
             [op] if op == "use" => Cmd::Use {
                 dir: fallback.clone(),
             },
@@ -156,6 +158,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
             mcp::McpHost::new(fallback).serve_http(addr).await
         }
         Cmd::Watch => watch::run(),
+        Cmd::RunTunnel => service::run_tunnel_daemon(),
         Cmd::Use { dir } => {
             let cwd = host::pin_workspace(&dir)?;
             println!("{}", cwd.display());

@@ -20,8 +20,10 @@ pub const PROFILE: &str = "hands";
 const LABEL: &str = "dev.hands.tunnel";
 #[cfg(target_os = "macos")]
 const WATCH_LABEL: &str = "dev.hands.watch";
-#[cfg(target_os = "macos")]
-const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
+#[cfg(windows)]
+const TASK_NAME: &str = "dev.hands.tunnel";
+#[cfg(windows)]
+const WATCH_TASK_NAME: &str = "dev.hands.watch";
 const LEGACY_PROFILE: &str = "grok-harness";
 
 pub fn profile_file() -> PathBuf {
@@ -188,7 +190,15 @@ fn persist_key() -> Result<PathBuf, String> {
     let k = crate::secrets::get().ok_or_else(|| {
         "missing runtime key. run hands setup, or export CONTROL_PLANE_API_KEY".to_string()
     })?;
-    crate::secrets::ensure_file(&k)
+    #[cfg(windows)]
+    {
+        crate::secrets::win_cred_set(&k)?;
+        Ok(crate::secrets::key_file())
+    }
+    #[cfg(not(windows))]
+    {
+        crate::secrets::ensure_file(&k)
+    }
 }
 
 fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
@@ -233,19 +243,23 @@ fn resolve_tunnel_id() -> Result<String, String> {
     Err("missing tunnel id. paste it in the config UI (hands config) or export CONTROL_PLANE_TUNNEL_ID".into())
 }
 
-fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
+fn write_profile(_key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
     let path = profile_file();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let key_path = key.display().to_string();
     let harness = harness.display().to_string();
+    #[cfg(windows)]
+    let api_key_entry = "api_key: \"env:CONTROL_PLANE_API_KEY\"".to_string();
+    #[cfg(not(windows))]
+    let api_key_entry = format!("api_key: \"file:{}\"", key.display());
+
     let yaml = format!(
         r#"config_version: 1
 control_plane:
   base_url: "https://api.openai.com"
   tunnel_id: "{tunnel_id}"
-  api_key: "file:{key_path}"
+  {api_key_entry}
 health:
   listen_addr: "{HEALTH_LISTEN}"
 admin_ui:
@@ -418,7 +432,17 @@ pub fn installed() -> bool {
     unit_path().is_file()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+pub fn installed() -> bool {
+    let out = Command::new("schtasks")
+        .args(["/query", "/tn", TASK_NAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    out.map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn installed() -> bool {
     false
 }
@@ -700,27 +724,245 @@ fn uninstall_supervisor() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn task_xml(exec_path: &Path, args: &str, description: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{description}</Description>
+    <Author>Hands</Author>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT10S</Interval>
+      <Count>10</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+      <Arguments>{}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        xml_escape(&exec_path.display().to_string()),
+        xml_escape(args),
+    )
+}
+
+#[cfg(windows)]
 fn install_supervisor() -> Result<(), String> {
-    Err("auto-start is implemented for macOS and Linux".into())
+    let hands = harness_bin()?;
+    let xml = task_xml(
+        &hands,
+        "run-tunnel",
+        "Hands ChatGPT tunnel supervisor",
+    );
+    let xml_path = host::config_dir().join("tunnel-task.xml");
+    if let Some(parent) = xml_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&xml_path, &xml).map_err(|e| format!("write {}: {e}", xml_path.display()))?;
+
+    stop_unmanaged();
+
+    let out = Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            TASK_NAME,
+            "/xml",
+            &xml_path.display().to_string(),
+            "/f",
+        ])
+        .output()
+        .map_err(|e| format!("schtasks /create: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "schtasks /create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    start_supervisor()?;
+    Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
 fn start_supervisor() -> Result<(), String> {
-    Err("auto-start is implemented for macOS and Linux".into())
+    let out = Command::new("schtasks")
+        .args(["/run", "/tn", TASK_NAME])
+        .output()
+        .map_err(|e| format!("schtasks /run: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("already running") && !err.contains("2147750562") {
+            return Err(format!("schtasks /run failed: {}", err.trim()));
+        }
+    }
+    Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn stop_supervisor() -> Result<(), String> {
+    let _ = Command::new("schtasks")
+        .args(["/end", "/tn", TASK_NAME])
+        .output();
+    stop_unmanaged();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn uninstall_supervisor() -> Result<(), String> {
+    stop_supervisor()?;
+    let _ = uninstall_watch();
+    let _ = Command::new("schtasks")
+        .args(["/delete", "/tn", TASK_NAME, "/f"])
+        .output();
+    let xml_path = host::config_dir().join("tunnel-task.xml");
+    if xml_path.is_file() {
+        let _ = fs::remove_file(xml_path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_watch() -> Result<(), String> {
+    let hands = harness_bin()?;
+    let xml = task_xml(&hands, "watch", "Hands tunnel down notifier");
+    let xml_path = host::config_dir().join("watch-task.xml");
+    if let Some(parent) = xml_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&xml_path, &xml).map_err(|e| format!("write {}: {e}", xml_path.display()))?;
+
+    let out = Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            WATCH_TASK_NAME,
+            "/xml",
+            &xml_path.display().to_string(),
+            "/f",
+        ])
+        .output()
+        .map_err(|e| format!("schtasks /create watch: {e}"))?;
+
+    if out.status.success() {
+        let _ = Command::new("schtasks")
+            .args(["/run", "/tn", WATCH_TASK_NAME])
+            .output();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn uninstall_watch() -> Result<(), String> {
+    let _ = Command::new("schtasks")
+        .args(["/end", "/tn", WATCH_TASK_NAME])
+        .output();
+    let _ = Command::new("schtasks")
+        .args(["/delete", "/tn", WATCH_TASK_NAME, "/f"])
+        .output();
+    let xml_path = host::config_dir().join("watch-task.xml");
+    if xml_path.is_file() {
+        let _ = fs::remove_file(xml_path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stop_unmanaged() {
+    let script = r#"
+Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -match '^(tunnel-client\.exe|hands\.exe)$' -and
+    ($_.CommandLine -match '--profile hands' -or $_.CommandLine -match '--profile grok-harness' -or $_.CommandLine -match 'run-tunnel')
+} | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+"#;
+    let _ = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output();
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+pub fn run_tunnel_daemon() -> Result<(), String> {
+    host::migrate_from_legacy();
+    let key = crate::secrets::get().ok_or_else(|| {
+        "missing runtime key. run hands setup, or export CONTROL_PLANE_API_KEY".to_string()
+    })?;
+    let tunnel_id = resolve_tunnel_id()?;
+    let harness = harness_bin()?;
+    let client = tunnel_client_bin()?;
+    let fake_key_path = crate::secrets::key_file();
+    write_profile(&fake_key_path, &harness, &tunnel_id)?;
+
+    let mut cmd = Command::new(client);
+    cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
+    cmd.env("CONTROL_PLANE_API_KEY", key);
+    cmd.env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id);
+    let mut child = cmd.spawn().map_err(|e| format!("spawn tunnel-client: {e}"))?;
+    let status = child.wait().map_err(|e| format!("wait tunnel-client: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("tunnel-client exited with status: {status}"))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn install_supervisor() -> Result<(), String> {
+    Err("auto-start is not implemented for this platform".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn start_supervisor() -> Result<(), String> {
+    Err("auto-start is not implemented for this platform".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn stop_supervisor() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn uninstall_supervisor() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn install_watch() -> Result<(), String> {
     Ok(())
 }
@@ -784,11 +1026,13 @@ fn run_ok(bin: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 pub fn ureq_get(url: &str) -> Result<String, ()> {
@@ -807,5 +1051,78 @@ pub fn ureq_get(url: &str) -> Result<String, ()> {
         Ok(buf.trim().to_string())
     } else {
         Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn test_task_xml_structure_and_least_privilege() {
+        let exe = PathBuf::from(r"C:\Program Files\Hands\hands.exe");
+        let xml = task_xml(&exe, "run-tunnel", "Hands test task");
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains("<RestartOnFailure>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<Arguments>run-tunnel</Arguments>"));
+        assert!(xml.contains(r"C:\Program Files\Hands\hands.exe"));
+        assert!(!xml.contains("sk-"));
+    }
+
+    #[test]
+    fn test_write_profile_hides_secrets_on_windows() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hands_profile_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let _key_file = temp_dir.join("control-plane.key");
+        let harness = temp_dir.join("hands.exe");
+        let tunnel_id = "tunnel_123456789";
+
+        let profile_path = temp_dir.join("hands.yaml");
+        let harness_str = harness.display().to_string();
+
+        #[cfg(windows)]
+        let api_key_entry = "api_key: \"env:CONTROL_PLANE_API_KEY\"".to_string();
+        #[cfg(not(windows))]
+        let api_key_entry = format!("api_key: \"file:{}\"", _key_file.display());
+
+        let yaml = format!(
+            r#"config_version: 1
+control_plane:
+  base_url: "https://api.openai.com"
+  tunnel_id: "{tunnel_id}"
+  {api_key_entry}
+health:
+  listen_addr: "{HEALTH_LISTEN}"
+admin_ui:
+  open_browser: false
+log:
+  level: warn
+  format: json
+mcp:
+  commands:
+    - channel: main
+      command: "{harness_str}"
+"#
+        );
+        fs::write(&profile_path, &yaml).unwrap();
+        let read = fs::read_to_string(&profile_path).unwrap();
+
+        #[cfg(windows)]
+        {
+            assert!(read.contains("api_key: \"env:CONTROL_PLANE_API_KEY\""));
+            assert!(!read.contains("file:"));
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
