@@ -68,6 +68,25 @@ pub fn wait_ready(timeout: Duration) -> bool {
     ready()
 }
 
+pub fn supervisor_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Task Scheduler"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "LaunchAgent"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "systemd user unit"
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        "supervisor"
+    }
+}
+
 pub fn status_line() -> String {
     let health = if ready() {
         format!("ready  {HEALTH_BASE}/ui")

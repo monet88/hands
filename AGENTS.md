@@ -30,6 +30,8 @@ hands setup
 | **First-time Setup** | `hands setup` | Interactive TTY checklist; saves keys to OS Credential Manager |
 | **Check Status** | `hands status` | Check active workspace, pin, and tunnel readiness |
 | **Status (JSON)** | `hands status --json` | Structured output for scripting/agents |
+| **Diagnostics** | `hands doctor` | Comprehensive local host & config diagnostics |
+| **Diagnostics (JSON)** | `hands doctor --json` | Machine-readable local diagnostic object |
 | **Pin Workspace** | `hands use [path]` | Pin folder (ChatGPT uses this on next tool call) |
 | **Start Service** | `hands start` | Start tunnel supervisor background service |
 | **Auto-boot Enable** | `hands enable` | Register Task Scheduler / LaunchAgent auto-start |

@@ -101,6 +101,7 @@ ChatGPT will automatically execute all tools in the pinned folder starting from 
 
 ### Service Management
 * **Check Status:** `hands status` (or `hands status --json`)
+* **Local Diagnostics:** `hands doctor` (or `hands doctor --json`)
 * **Auto-Start on Boot (Recommended):** `hands enable` (uses Task Scheduler on Windows, LaunchAgent on macOS, systemd on Linux)
 * **Start / Stop manually:** `hands start` / `hands stop`
 * **Windows Quick-Run (Foreground):** Double-click `start-hands.bat`
@@ -138,6 +139,7 @@ Commands:
   hands config --open              Serve and open config UI in browser
   hands use [path]                 Pin working folder for ChatGPT
   hands status [--json]            Show current pin and tunnel readiness
+  hands doctor [--json]            Run local host & configuration diagnostics
   hands enable | disable           Register / remove auto-start service
   hands start | stop               Start / stop tunnel supervisor
   hands list                       List available MCP tools

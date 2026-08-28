@@ -45,18 +45,18 @@ pub fn key_file() -> PathBuf {
     host::config_dir().join("control-plane.key")
 }
 
-pub fn get() -> Option<String> {
+fn get_with_source() -> Option<(String, &'static str)> {
     if let Ok(k) = std::env::var("CONTROL_PLANE_API_KEY") {
         let k = k.trim().to_string();
         if valid_runtime_key(&k) {
-            return Some(k);
+            return Some((k, "environment variable"));
         }
     }
     #[cfg(windows)]
     {
         if let Some(k) = win_cred_get() {
             if valid_runtime_key(&k) {
-                return Some(k);
+                return Some((k, host::CREDENTIAL_STORE));
             }
         }
     }
@@ -65,7 +65,7 @@ pub fn get() -> Option<String> {
         if let Ok(file) = fs::read_to_string(key_file()) {
             let k = file.trim().to_string();
             if valid_runtime_key(&k) {
-                return Some(k);
+                return Some((k, "config file"));
             }
         }
         // Keychain can prompt; only from a TTY (hands setup), never LaunchAgent.
@@ -73,7 +73,7 @@ pub fn get() -> Option<String> {
             if let Some(k) = keychain_get() {
                 if valid_runtime_key(&k) {
                     let _ = ensure_file(&k);
-                    return Some(k);
+                    return Some((k, host::CREDENTIAL_STORE));
                 }
             }
         }
@@ -82,6 +82,14 @@ pub fn get() -> Option<String> {
     // Credential Manager (or the env var); a leftover control-plane.key is
     // never read implicitly.
     None
+}
+
+pub fn get() -> Option<String> {
+    get_with_source().map(|(k, _)| k)
+}
+
+pub fn source() -> Option<&'static str> {
+    get_with_source().map(|(_, s)| s)
 }
 
 pub fn set(key: &str) -> Result<PathBuf, String> {
