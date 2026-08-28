@@ -192,9 +192,13 @@ pub fn save_connect(key: Option<&str>, tunnel_id: Option<&str>) -> Result<(), St
     Ok(())
 }
 
+pub fn valid_tunnel_id(id: &str) -> bool {
+    id.starts_with("tunnel_")
+}
+
 pub fn set_tunnel_id(id: &str) -> Result<(), String> {
     let id = id.trim();
-    if !id.starts_with("tunnel_") {
+    if !valid_tunnel_id(id) {
         return Err("tunnel id should look like tunnel_…".into());
     }
     let dir = host::config_dir();
@@ -256,13 +260,13 @@ fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
 fn resolve_tunnel_id() -> Result<String, String> {
     if let Ok(id) = std::env::var("CONTROL_PLANE_TUNNEL_ID") {
         let id = id.trim();
-        if !id.is_empty() {
+        if valid_tunnel_id(id) {
             return Ok(id.to_string());
         }
     }
     if let Ok(id) = fs::read_to_string(host::config_dir().join("tunnel_id")) {
         let id = id.trim();
-        if !id.is_empty() {
+        if valid_tunnel_id(id) {
             return Ok(id.to_string());
         }
     }
@@ -272,7 +276,7 @@ fn resolve_tunnel_id() -> Result<String, String> {
                 let t = line.trim();
                 if let Some(rest) = t.strip_prefix("tunnel_id:") {
                     let id = rest.trim().trim_matches('"').trim();
-                    if !id.is_empty() {
+                    if valid_tunnel_id(id) {
                         return Ok(id.to_string());
                     }
                 }
@@ -1421,5 +1425,12 @@ mod tests {
             "profile must contain tunnel id: {read}"
         );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_valid_tunnel_id() {
+        assert!(valid_tunnel_id("tunnel_123456789"));
+        assert!(!valid_tunnel_id("invalid_tunnel_id"));
+        assert!(!valid_tunnel_id(""));
     }
 }

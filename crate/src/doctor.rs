@@ -565,12 +565,13 @@ fn diagnose_with_observations(
 
     // Overall OK condition
     let pin_valid = workspace_report.pin_status != "invalid";
-    let ok = ws_exists && ws_is_dir && pin_valid && tc_found && has_key && has_tunnel_id;
+    let configured = ws_exists && ws_is_dir && pin_valid && tc_found && has_key && has_tunnel_id;
+    let ok = configured && probe_ready;
     let summary = if workspace_report.pin_status == "invalid" {
         "action required: fix invalid workspace pin".to_string()
-    } else if ok && probe_ready {
-        "all checks passed, tunnel active".to_string()
     } else if ok {
+        "all checks passed, tunnel active".to_string()
+    } else if configured {
         "configuration ready, tunnel service not running".to_string()
     } else {
         "action required: configure missing components".to_string()
@@ -942,5 +943,34 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "workspace_pin" && check.status == "fail")
         );
+    }
+
+    #[test]
+    fn test_malformed_tunnel_id_is_treated_as_missing() {
+        let mut observations = deterministic_observations();
+        observations.tunnel_id = None;
+        let report = diagnose_with_observations(
+            Path::new("C:/fixture/workspace"),
+            true,
+            true,
+            observations,
+        );
+        assert!(!report.ok);
+        assert_eq!(report.configuration.has_tunnel_id, false);
+        assert_eq!(report.configuration.tunnel_id, None);
+    }
+
+    #[test]
+    fn test_ok_requires_probe_ready() {
+        let mut observations = deterministic_observations();
+        observations.probe_ready = false;
+        let report = diagnose_with_observations(
+            Path::new("C:/fixture/workspace"),
+            true,
+            true,
+            observations,
+        );
+        assert!(!report.ok);
+        assert_eq!(report.summary, "configuration ready, tunnel service not running");
     }
 }

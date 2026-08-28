@@ -20,10 +20,23 @@ def main() -> int:
     parser.add_argument("--hands", default="hands", help="Hands executable/path")
     args = parser.parse_args()
 
-    payload = json.loads(args.json_file.read_text(encoding="utf-8-sig"))
-    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return subprocess.run([args.hands, "call", args.tool, encoded], check=False).returncode
+    try:
+        raw = args.json_file.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        parser.error(f"cannot read JSON file '{args.json_file}': {e}")
 
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as e:
+        parser.error(f"invalid JSON in '{args.json_file}': {e}")
+
+    try:
+        return subprocess.run(
+            [args.hands, "call", args.tool, f"@{args.json_file}"],
+            check=False,
+        ).returncode
+    except OSError as e:
+        parser.error(f"failed to execute '{args.hands}': {e}")
 
 if __name__ == "__main__":
     raise SystemExit(main())

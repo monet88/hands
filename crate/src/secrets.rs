@@ -45,7 +45,7 @@ pub fn key_file() -> PathBuf {
     host::config_dir().join("control-plane.key")
 }
 
-fn get_with_source() -> Option<(String, &'static str)> {
+fn lookup_key_and_source() -> Option<(String, &'static str)> {
     if let Ok(k) = std::env::var("CONTROL_PLANE_API_KEY") {
         let k = k.trim().to_string();
         if valid_runtime_key(&k) {
@@ -72,7 +72,6 @@ fn get_with_source() -> Option<(String, &'static str)> {
         if std::io::stdin().is_terminal() {
             if let Some(k) = keychain_get() {
                 if valid_runtime_key(&k) {
-                    let _ = ensure_file(&k);
                     return Some((k, host::CREDENTIAL_STORE));
                 }
             }
@@ -85,11 +84,18 @@ fn get_with_source() -> Option<(String, &'static str)> {
 }
 
 pub fn get() -> Option<String> {
-    get_with_source().map(|(k, _)| k)
+    let (key, _source) = lookup_key_and_source()?;
+    #[cfg(not(windows))]
+    {
+        if _source == host::CREDENTIAL_STORE {
+            let _ = ensure_file(&key);
+        }
+    }
+    Some(key)
 }
 
 pub fn source() -> Option<&'static str> {
-    get_with_source().map(|(_, s)| s)
+    lookup_key_and_source().map(|(_, s)| s)
 }
 
 pub fn set(key: &str) -> Result<PathBuf, String> {

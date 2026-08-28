@@ -3,3 +3,7 @@
 .DS_Store
 *.log
 .env
+.claude
+.agents
+AGENTS.md
+CLAUDE.md

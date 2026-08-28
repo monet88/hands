@@ -83,8 +83,36 @@ try {
     throw "hands doctor --json did not produce valid JSON. Raw output: $DoctorRaw"
 }
 
-if ($Doctor.name -ne "Hands" -or $null -eq $Doctor.checks) {
+function Test-HasProperty($obj, [string]$prop) {
+    return ($null -ne $obj) -and ($obj.PSObject.Properties.Match($prop).Count -gt 0)
+}
+
+if (-not (Test-HasProperty $Doctor "name") -or $Doctor.name -ne "Hands" -or
+    -not (Test-HasProperty $Doctor "ok") -or
+    -not (Test-HasProperty $Doctor "summary") -or
+    -not (Test-HasProperty $Doctor "checks") -or
+    -not ($Doctor.checks -is [System.Collections.IEnumerable] -and -not ($Doctor.checks -is [string]))) {
     throw "hands doctor --json returned an unexpected schema."
+}
+
+$ExpectedCheckNames = @("workspace", "workspace_pin", "tunnel_client", "runtime_key", "tunnel_id", "service", "local_probe")
+$AllowedStatuses = @("ok", "warn", "fail", "info")
+$ObservedCheckNames = @()
+
+foreach ($check in $Doctor.checks) {
+    if (-not (Test-HasProperty $check "name") -or
+        -not (Test-HasProperty $check "status") -or
+        -not (Test-HasProperty $check "message") -or
+        $AllowedStatuses -notcontains $check.status) {
+        throw "hands doctor --json returned a malformed check entry: $($check | ConvertTo-Json -Compress)"
+    }
+    $ObservedCheckNames += $check.name
+}
+
+foreach ($expectedName in $ExpectedCheckNames) {
+    if ($ObservedCheckNames -notcontains $expectedName) {
+        throw "hands doctor --json missing expected check: $expectedName"
+    }
 }
 
 Write-Host ("doctor.ok: {0}" -f $Doctor.ok)
