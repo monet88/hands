@@ -145,10 +145,10 @@ function Assert-TerminalSuccess([string]$text, [string]$label) {
 
 function Parse-EmbeddedJson([string]$raw, [string]$label) {
     # Native CLIs can write diagnostics before their JSON payload, and Hands
-    # can append task metadata after it. Scan each object/array candidate and
-    # stop at its balanced closing delimiter. Crashpad diagnostics on Windows
-    # also begin with '[', so invalid candidates are skipped rather than
-    # assumed to be the payload.
+    # can append task metadata after it. Scan every balanced JSON candidate
+    # and keep the LAST valid parse; earlier fragments are likely diagnostics
+    # (e.g. Crashpad on Windows) rather than the intended data payload.
+    $lastValid = $null
     for ($start = 0; $start -lt $raw.Length; $start++) {
         $open = $raw[$start]
         if ($open -ne '{' -and $open -ne '[') { continue }
@@ -170,9 +170,14 @@ function Parse-EmbeddedJson([string]$raw, [string]$label) {
             $depth--
             if ($depth -ne 0) { continue }
             $jsonText = $raw.Substring($start, $i - $start + 1)
-            try { return $jsonText | ConvertFrom-Json } catch { break }
+            try {
+                $lastValid = $jsonText | ConvertFrom-Json
+                $start = $i  # skip past this fragment on next outer iteration
+            } catch { }
+            break
         }
     }
+    if ($null -ne $lastValid) { return $lastValid }
     throw "$label produced no valid embedded JSON payload: $raw"
 }
 

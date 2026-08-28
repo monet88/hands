@@ -18,6 +18,30 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
 
+/// Short platform name for user-facing messages.
+#[cfg(target_os = "macos")]
+pub const PLATFORM_SHORT: &str = "Mac";
+#[cfg(windows)]
+pub const PLATFORM_SHORT: &str = "PC";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const PLATFORM_SHORT: &str = "machine";
+
+/// Human-readable name of the OS credential store.
+#[cfg(target_os = "macos")]
+pub const CREDENTIAL_STORE: &str = "Keychain";
+#[cfg(windows)]
+pub const CREDENTIAL_STORE: &str = "Windows Credential Manager";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const CREDENTIAL_STORE: &str = "credential store";
+
+/// Install hint shown when tunnel-client is not found.
+#[cfg(windows)]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} run install.ps1 or place tunnel-client.exe in PATH";
+#[cfg(target_os = "macos")]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} brew install openai/tools/tunnel-client";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} install tunnel-client on PATH";
+
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }

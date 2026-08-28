@@ -880,6 +880,14 @@ fn unregister_windows_task(task_name: &str) {
 }
 
 #[cfg(windows)]
+fn remove_stale_task_xml(stem: &str) {
+    let path = host::config_dir().join(format!("{stem}.xml"));
+    if path.is_file() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
 fn install_supervisor() -> Result<(), String> {
     let hands = harness_bin()?;
 
@@ -893,10 +901,7 @@ fn install_supervisor() -> Result<(), String> {
         "run-tunnel",
         "Hands ChatGPT tunnel supervisor",
     )?;
-    let stale_xml = host::config_dir().join("tunnel-task.xml");
-    if stale_xml.is_file() {
-        let _ = fs::remove_file(stale_xml);
-    }
+    remove_stale_task_xml("tunnel-task");
 
     start_supervisor()?;
     Ok(())
@@ -942,10 +947,7 @@ fn uninstall_supervisor() -> Result<(), String> {
     stop_supervisor()?;
     let _ = uninstall_watch();
     unregister_windows_task(TASK_NAME);
-    let xml_path = host::config_dir().join("tunnel-task.xml");
-    if xml_path.is_file() {
-        let _ = fs::remove_file(xml_path);
-    }
+    remove_stale_task_xml("tunnel-task");
     Ok(())
 }
 
@@ -959,10 +961,7 @@ fn install_watch() -> Result<(), String> {
         "watch",
         "Hands tunnel down notifier",
     )?;
-    let stale_xml = host::config_dir().join("watch-task.xml");
-    if stale_xml.is_file() {
-        let _ = fs::remove_file(stale_xml);
-    }
+    remove_stale_task_xml("watch-task");
     start_windows_task(WATCH_TASK_NAME)
 }
 
@@ -970,10 +969,7 @@ fn install_watch() -> Result<(), String> {
 fn uninstall_watch() -> Result<(), String> {
     stop_windows_task(WATCH_TASK_NAME);
     unregister_windows_task(WATCH_TASK_NAME);
-    let xml_path = host::config_dir().join("watch-task.xml");
-    if xml_path.is_file() {
-        let _ = fs::remove_file(xml_path);
-    }
+    remove_stale_task_xml("watch-task");
     Ok(())
 }
 
@@ -988,26 +984,41 @@ fn tunnel_pid_file() -> PathBuf {
 
 #[cfg(windows)]
 fn query_process_creation(pid: u32) -> Option<String> {
-    let out = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "$p=Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; if ($p) {{ [Console]::Out.Write($p.CreationDate.ToUniversalTime().Ticks) }}"
-            ),
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn GetProcessTimes(
+            hProcess: *mut std::ffi::c_void,
+            lpCreationTime: *mut u64,
+            lpExitTime: *mut u64,
+            lpKernelTime: *mut u64,
+            lpUserTime: *mut u64,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // FILETIME epoch is 1601-01-01; .NET DateTime.Ticks epoch is 0001-01-01.
+    // The PowerShell comparator in `stop_unmanaged` uses
+    // `$p.CreationDate.ToUniversalTime().Ticks` (.NET ticks), so this writer
+    // must produce the same value.
+    const FILETIME_TO_DOTNET_TICKS: u64 = 504_911_232_000_000_000;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
-        None
-    } else {
-        Some(s)
+    let mut creation = 0u64;
+    let mut exit = 0u64;
+    let mut kernel = 0u64;
+    let mut user = 0u64;
+    let ok = unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
     }
+    Some((creation + FILETIME_TO_DOTNET_TICKS).to_string())
 }
 
 #[cfg(windows)]

@@ -29,6 +29,14 @@ fn service_target() -> &'static str {
     SERVICE
 }
 
+#[cfg(windows)]
+fn target_utf16() -> Vec<u16> {
+    service_target()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 pub fn valid_runtime_key(key: &str) -> bool {
     key.starts_with("sk-") && key.len() >= 32 && !key.contains(char::is_whitespace)
 }
@@ -279,10 +287,7 @@ mod win_cred {
 #[cfg(windows)]
 pub fn win_cred_get() -> Option<String> {
     use std::ptr;
-    let target: Vec<u16> = service_target()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let target = target_utf16();
     let mut pcred: *mut win_cred::CREDENTIALW = ptr::null_mut();
     let res =
         unsafe { win_cred::CredReadW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0, &mut pcred) };
@@ -307,10 +312,7 @@ pub fn win_cred_get() -> Option<String> {
 #[cfg(windows)]
 pub fn win_cred_set(key: &str) -> Result<(), String> {
     use std::ptr;
-    let mut target: Vec<u16> = service_target()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let mut target = target_utf16();
     let mut account: Vec<u16> = ACCOUNT.encode_utf16().chain(std::iter::once(0)).collect();
     let mut comment: Vec<u16> = "Hands ChatGPT runtime key\0".encode_utf16().collect();
     let mut blob = key.as_bytes().to_vec();
@@ -343,10 +345,7 @@ pub fn win_cred_set(key: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 pub fn win_cred_delete() -> Result<(), String> {
-    let target: Vec<u16> = service_target()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let target = target_utf16();
     let res = unsafe { win_cred::CredDeleteW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0) };
     if res != 0 {
         Ok(())

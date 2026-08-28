@@ -137,6 +137,24 @@ async fn main() {
     }
 }
 
+/// Resolve a CLI argument to a JSON value: `@path` reads from file, valid JSON
+/// is used directly, a path to an existing `.json` file is read, and anything
+/// else is attempted as literal JSON. Strips a leading UTF-8 BOM if present.
+fn resolve_json_argument(raw: String) -> Result<serde_json::Value, String> {
+    let content = if raw.starts_with('@') {
+        let p = &raw[1..];
+        std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?
+    } else if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
+        raw
+    } else if std::path::Path::new(&raw).is_file() {
+        std::fs::read_to_string(&raw).map_err(|e| format!("read {}: {e}", raw))?
+    } else {
+        raw
+    };
+    let trimmed = content.trim_start_matches('\u{feff}').trim();
+    serde_json::from_str(trimmed).map_err(|e| format!("invalid json args: {e}"))
+}
+
 async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
     match cmd {
         Cmd::Setup { open_ui } => {
@@ -224,21 +242,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     Ok(())
                 }
                 Cmd::Call { tool, args_json } => {
-                    let json_str = if args_json.starts_with('@') {
-                        let p = &args_json[1..];
-                        std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?
-                    } else if serde_json::from_str::<serde_json::Value>(&args_json).is_ok() {
-                        // Valid JSON (including scalars true/false/null/numbers) — never reinterpret as file.
-                        args_json
-                    } else if std::path::Path::new(&args_json).is_file() {
-                        std::fs::read_to_string(&args_json)
-                            .map_err(|e| format!("read {}: {e}", args_json))?
-                    } else {
-                        args_json
-                    };
-                    let trimmed = json_str.trim_start_matches('\u{feff}').trim();
-                    let params: serde_json::Value = serde_json::from_str(trimmed)
-                        .map_err(|e| format!("invalid json args: {e}"))?;
+                    let params = resolve_json_argument(args_json)?;
                     let result = bridge
                         .call(&tool, params, "hands-1")
                         .await

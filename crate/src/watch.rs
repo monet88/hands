@@ -21,13 +21,7 @@ pub fn run() -> Result<(), String> {
                 Some(t) => t.elapsed() > Duration::from_secs(30 * 60),
             };
             if due {
-                let machine_desc = if cfg!(target_os = "macos") {
-                    "Mac"
-                } else if cfg!(windows) {
-                    "PC"
-                } else {
-                    "machine"
-                };
+                let machine_desc = crate::host::PLATFORM_SHORT;
                 notify(
                     "Hands",
                     &format!(

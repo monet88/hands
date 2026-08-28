@@ -19,12 +19,8 @@ pub fn run(dir: &Path) -> Result<(), String> {
 
     let client_msg = if client_ok {
         "ok"
-    } else if cfg!(windows) {
-        "missing — run install.ps1 or place tunnel-client.exe in PATH"
-    } else if cfg!(target_os = "macos") {
-        "missing — brew install openai/tools/tunnel-client"
     } else {
-        "missing — install tunnel-client on PATH"
+        crate::host::TUNNEL_CLIENT_HINT
     };
 
     eprintln!("Hands setup");
@@ -47,13 +43,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         if let Some(k) = read_secret()? {
             secrets::set(&k)?;
             key_ok = true;
-            let target_desc = if cfg!(windows) {
-                "Windows Credential Manager"
-            } else if cfg!(target_os = "macos") {
-                "Keychain"
-            } else {
-                "credential store"
-            };
+            let target_desc = crate::host::CREDENTIAL_STORE;
             eprintln!("saved to {target_desc}");
         }
     }
