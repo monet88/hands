@@ -1,0 +1,16 @@
+AGENTS.md
+  h_17f2fa2b92da6a 1,3,5-12,15,17-18,21-72,75-87,89-92
+README.md
+  h_17f2fa2b92da6a 3,5,8,11,13,15-45,52,54-63,65,67-69,71,73,75-89,91-100,102-106,108,110,112-125,127,129,131-145,147,152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5da8791df983edd987c94c8b6f9f0a6b016e590a",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
