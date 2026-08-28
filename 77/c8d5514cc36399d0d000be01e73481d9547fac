@@ -1,0 +1,26 @@
+crate/src/build_provenance.rs
+  h_17f2fa2b92da6a 1-4
+crate/src/main.rs
+  h_17f2fa2b92da6a 3
+crate/src/mcp.rs
+  h_17f2fa2b92da6a 197-201
+crate/src/service.rs
+  h_17f2fa2b92da6a 178,352-374,841-844,1091-1099
+install.ps1
+  h_17f2fa2b92da6a 102-103,105-108,110,131-132,134-136,138-165,168-174,180-183
+scripts/e2e_gate_windows.ps1
+  h_17f2fa2b92da6a 1-6,8-12,22-28,31-39,42-45,48,55,59-61,63,66-69,71-87,89-91,93-96,98-99,101-122,124-125,127-133,135-140,144-179,181-197,200-218,221-250,252-258,262-263,267-279,282-284,286-295,297-309,311-340,343-345,348-358,360-364,367-369,371-378,380-390,394-403
+scripts/inject.py
+  h_17f2fa2b92da6a 7,33-59,122,127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "77c8d5514cc36399d0d000be01e73481d9547fac",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
