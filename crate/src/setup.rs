@@ -17,18 +17,20 @@ pub fn run(dir: &Path) -> Result<(), String> {
     let mut id_ok = service::tunnel_id_opt().is_some();
     let tty = io::stdin().is_terminal();
 
+    let client_msg = if client_ok {
+        "ok"
+    } else {
+        crate::host::TUNNEL_CLIENT_HINT
+    };
+
     eprintln!("Hands setup");
     check("workspace", true, &cwd.display().to_string());
+    check("tunnel-client", client_ok, client_msg);
     check(
-        "tunnel-client",
-        client_ok,
-        if client_ok {
-            "ok"
-        } else {
-            "missing — brew install openai/tools/tunnel-client"
-        },
+        "runtime key",
+        key_ok,
+        if key_ok { "saved" } else { "missing" },
     );
-    check("runtime key", key_ok, if key_ok { "saved" } else { "missing" });
     check("tunnel id", id_ok, if id_ok { "saved" } else { "missing" });
 
     if !client_ok {
@@ -41,7 +43,8 @@ pub fn run(dir: &Path) -> Result<(), String> {
         if let Some(k) = read_secret()? {
             secrets::set(&k)?;
             key_ok = true;
-            eprintln!("saved to Keychain");
+            let target_desc = crate::host::CREDENTIAL_STORE;
+            eprintln!("saved to {target_desc}");
         }
     }
     if !id_ok && tty {
@@ -87,6 +90,45 @@ fn read_line() -> Result<Option<String>, String> {
     Ok(if t.is_empty() { None } else { Some(t) })
 }
 
+#[cfg(windows)]
+fn read_secret() -> Result<Option<String>, String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode = 0u32;
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return Err(
+            "hidden input unavailable: not a console (run hands setup in a terminal)".into(),
+        );
+    }
+    // Restore the original console mode on every exit path — including read
+    // errors and panics — via a guard.
+    struct RestoreConsole(*mut std::ffi::c_void, u32);
+    impl Drop for RestoreConsole {
+        fn drop(&mut self) {
+            unsafe { SetConsoleMode(self.0, self.1) };
+        }
+    }
+    let _guard = RestoreConsole(handle, mode);
+    if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
+        return Err("hidden input unavailable: cannot disable echo".into());
+    }
+    let mut s = String::new();
+    let r = io::stdin().lock().read_line(&mut s);
+    eprintln!();
+    r.map_err(|e| e.to_string())?;
+    let t = s.trim().to_string();
+    Ok(if t.is_empty() { None } else { Some(t) })
+}
+
+#[cfg(not(windows))]
 fn read_secret() -> Result<Option<String>, String> {
     let _ = Command::new("stty").arg("-echo").status();
     let mut s = String::new();
@@ -113,9 +155,16 @@ fn copy_clip(text: &str) {
         }
         false
     };
-    if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    {
+        let _ = try_copy("clip.exe", &[]) || try_copy("clip", &[]);
+    }
+    #[cfg(target_os = "macos")]
+    {
         let _ = try_copy("pbcopy", &[]);
-    } else {
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
         let _ = try_copy("wl-copy", &[]) || try_copy("xclip", &["-selection", "clipboard"]);
     }
 }

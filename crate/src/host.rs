@@ -18,12 +18,43 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
 
+/// Short platform name for user-facing messages.
+#[cfg(target_os = "macos")]
+pub const PLATFORM_SHORT: &str = "Mac";
+#[cfg(windows)]
+pub const PLATFORM_SHORT: &str = "PC";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const PLATFORM_SHORT: &str = "machine";
+
+/// Human-readable name of the OS credential store.
+#[cfg(target_os = "macos")]
+pub const CREDENTIAL_STORE: &str = "Keychain";
+#[cfg(windows)]
+pub const CREDENTIAL_STORE: &str = "Windows Credential Manager";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const CREDENTIAL_STORE: &str = "credential store";
+
+/// Install hint shown when tunnel-client is not found.
+#[cfg(windows)]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} run install.ps1 or place tunnel-client.exe in PATH";
+#[cfg(target_os = "macos")]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} brew install openai/tools/tunnel-client";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} install tunnel-client on PATH";
+
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// XDG on Unix (`~/.config/hands`). `%APPDATA%\hands` on Windows.
+/// Tests set `HANDS_CONFIG_DIR` to an isolated temp root so they never touch
+/// the user's real Hands config (workspace pin, key file).
 pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("HANDS_CONFIG_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
     #[cfg(windows)]
     {
         dirs::config_dir()
@@ -39,9 +70,12 @@ pub fn config_dir() -> PathBuf {
 pub fn tunnel_client_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        dirs::config_dir()
-            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
-            .join("tunnel-client")
+        // The official Windows tunnel-client follows the same ~/.config
+        // profile location as its cross-platform runtime. Using APPDATA here
+        // makes `tunnel-client run --profile hands` look in a different
+        // directory than Hands writes, so the supervised child immediately
+        // exits with "config file ... not found".
+        home_dir().join(".config/tunnel-client")
     }
     #[cfg(not(windows))]
     {
@@ -223,19 +257,49 @@ pub fn compose_host_path() {
 }
 
 /// Copy `~/.config/grok-harness` once if the new dir is empty.
+/// On Windows, a legacy plaintext `control-plane.key` is never copied as a
+/// file: if the user opts in (HANDS_MIGRATE_LEGACY_KEY=1), it is migrated
+/// into the Credential Manager and the plaintext source is deleted. Ordinary
+/// config (workspace pin) copies as-is.
+/// Workspace migration and optional Runtime Key migration are independent
+/// so an existing workspace pin does not block an explicit key migration.
 pub fn migrate_from_legacy() {
     let dest = config_dir();
-    if dest.join("workspace").is_file() || dest.join("control-plane.key").is_file() {
-        return;
-    }
     let src = home_dir().join(".config/grok-harness");
     if !src.is_dir() {
         return;
     }
     let _ = std::fs::create_dir_all(&dest);
-    for name in ["workspace", "control-plane.key"] {
-        let from = src.join(name);
-        let to = dest.join(name);
+    // Workspace pin: ordinary config, safe to copy if destination missing.
+    {
+        let from = src.join("workspace");
+        let to = dest.join("workspace");
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+    // Runtime key: never a plaintext copy on Windows. Migrate into the
+    // Credential Manager only with explicit opt-in; remove the source after
+    // a successful import. This runs independently of workspace state so
+    // `HANDS_MIGRATE_LEGACY_KEY=1` is honored even when the new workspace pin
+    // already exists. Unix keeps the existing plaintext file copy.
+    #[cfg(windows)]
+    {
+        let key_path = src.join("control-plane.key");
+        if std::env::var("HANDS_MIGRATE_LEGACY_KEY").is_ok_and(|v| v == "1")
+            && let Ok(key) = std::fs::read_to_string(&key_path)
+        {
+            let key = key.trim().to_string();
+            if crate::secrets::valid_runtime_key(&key) && crate::secrets::win_cred_set(&key).is_ok()
+            {
+                let _ = std::fs::remove_file(&key_path);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let from = src.join("control-plane.key");
+        let to = dest.join("control-plane.key");
         if from.is_file() && !to.exists() {
             let _ = std::fs::copy(&from, &to);
         }
@@ -344,6 +408,13 @@ pub async fn build_bridge(cwd: PathBuf) -> Result<ToolBridge, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_tunnel_client_profile_dir_matches_runtime_contract() {
+        let expected = home_dir().join(".config/tunnel-client");
+        assert_eq!(tunnel_client_dir(), expected);
+    }
 
     #[test]
     #[cfg(windows)]
@@ -795,5 +866,289 @@ mod tests {
                 control_pid
             );
         }
+    }
+
+    #[test]
+    fn test_workspace_pin_and_resolve_with_unicode_and_spaces() {
+        // Hermetic: isolated config root; never touches the user's real pin.
+        // All workspace env overrides that affect `resolve_workspace` are
+        // snapshotted and restored on every exit path, including panics.
+        let temp_base = std::env::temp_dir().join(format!(
+            "hands_ws_test_🚀_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&temp_base).expect("create isolated config root");
+
+        struct EnvGuard {
+            saved_config_dir: Option<std::ffi::OsString>,
+            saved_workspace: Option<std::ffi::OsString>,
+            saved_legacy_workspace: Option<std::ffi::OsString>,
+            root: PathBuf,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.saved_config_dir {
+                        Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
+                        None => std::env::remove_var("HANDS_CONFIG_DIR"),
+                    }
+                    match &self.saved_workspace {
+                        Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
+                        None => std::env::remove_var("HANDS_WORKSPACE"),
+                    }
+                    match &self.saved_legacy_workspace {
+                        Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
+                        None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let _guard = EnvGuard {
+            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
+            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
+            saved_legacy_workspace: std::env::var_os("GROK_HARNESS_WORKSPACE"),
+            root: temp_base.clone(),
+        };
+        unsafe {
+            std::env::set_var("HANDS_CONFIG_DIR", &temp_base);
+            std::env::remove_var("HANDS_WORKSPACE");
+            std::env::remove_var("GROK_HARNESS_WORKSPACE");
+        }
+
+        let ws_dir = temp_base.join("Sub Folder With Spaces 測試");
+        std::fs::create_dir_all(&ws_dir).expect("should create test workspace directory");
+
+        let pinned = pin_workspace(&ws_dir)
+            .expect("pin_workspace should succeed for unicode path with spaces");
+        assert_eq!(pinned, dunce::canonicalize(&ws_dir).unwrap());
+
+        let read =
+            read_pinned_workspace().expect("read_pinned_workspace should return pinned path");
+        assert_eq!(read, pinned);
+
+        let resolved = resolve_workspace(&std::env::temp_dir());
+        assert_eq!(resolved, pinned);
+    }
+    #[test]
+    fn test_which_executable_discovery() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hands_which_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        #[cfg(windows)]
+        let fake_exe = temp_dir.join("fake-tool.exe");
+        #[cfg(not(windows))]
+        let fake_exe = temp_dir.join("fake-tool");
+
+        std::fs::write(&fake_exe, "mock binary").expect("write fake binary");
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let mut entries = vec![temp_dir.clone()];
+        entries.extend(std::env::split_paths(&orig_path));
+        let new_path = std::env::join_paths(entries).unwrap();
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
+        let found = crate::service::which("fake-tool");
+        // Preserve comparison before destroying the fixture directory.
+        let found_canon = found.as_ref().and_then(|p| p.canonicalize().ok());
+        let expected_canon = fake_exe.canonicalize().ok();
+        // Restore PATH before assertions so env is clean even on failure.
+        unsafe {
+            std::env::set_var("PATH", &orig_path);
+        }
+
+        assert!(
+            found.is_some(),
+            "which('fake-tool') should locate fake-tool binary on PATH"
+        );
+        assert_eq!(found_canon, expected_canon);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_windows_terminal_foreground_and_bounded_output() {
+        compose_host_path();
+        let temp_ws = std::env::temp_dir().join(format!(
+            "hands_term_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let _ = std::fs::create_dir_all(&temp_ws);
+        let canonical_ws = dunce::canonicalize(&temp_ws).unwrap();
+
+        let bridge = build_bridge(canonical_ws.clone())
+            .await
+            .expect("bridge should build with canonical workspace");
+
+        // 1. Foreground command execution — must run in the intended
+        // workspace CWD, not the process cwd.
+        let fg_args = serde_json::json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"(Get-Location).Path; Write-Output 'TERMINAL_FOREGROUND_OK'\"",
+            "description": "check foreground execution"
+        });
+        let fg_res = bridge
+            .call("run_terminal_cmd", fg_args, "test-term-fg")
+            .await
+            .expect("foreground terminal call should succeed");
+        assert!(
+            fg_res.prompt_text.contains("TERMINAL_FOREGROUND_OK"),
+            "foreground terminal output should contain expected marker: {}",
+            fg_res.prompt_text
+        );
+        let fg_has_cwd = fg_res
+            .prompt_text
+            .contains(canonical_ws.as_os_str().to_string_lossy().as_ref());
+        assert!(
+            fg_has_cwd,
+            "foreground command must report the intended workspace CWD ({}), got: {}",
+            canonical_ws.display(),
+            fg_res.prompt_text
+        );
+        // 2. Background command returning task ID and retrieving ordered output.
+        // Assert relative positions: LINE_1 < LINE_2 < LINE_3.
+        let bg_args = serde_json::json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output LINE_1; Write-Output LINE_2; Write-Output LINE_3; Start-Sleep -Milliseconds 200\"",
+            "description": "ordered output test",
+            "is_background": true
+        });
+        let bg_res = bridge
+            .call("run_terminal_cmd", bg_args, "test-term-bg")
+            .await
+            .expect("background terminal call should succeed");
+
+        let task_id = if let Some(start) = bg_res.prompt_text.find("<task-id>") {
+            let rest = &bg_res.prompt_text[start + 9..];
+            if let Some(end) = rest.find("</task-id>") {
+                rest[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            bg_res
+                .prompt_text
+                .lines()
+                .find_map(|line| {
+                    if line.contains("Task ID:") || line.contains("task_id:") {
+                        line.split(':').nth(1).map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        };
+        assert!(!task_id.is_empty(), "background task should return task ID");
+
+        // Wait for background job to emit output
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let out_args = serde_json::json!({ "task_id": &task_id });
+        let out_res = bridge
+            .call("get_task_output", out_args, "test-term-out")
+            .await
+            .expect("get_task_output should succeed");
+
+        let pos_1 = out_res
+            .prompt_text
+            .find("LINE_1")
+            .expect("output should contain LINE_1");
+        let pos_2 = out_res
+            .prompt_text
+            .find("LINE_2")
+            .expect("output should contain LINE_2");
+        let pos_3 = out_res
+            .prompt_text
+            .find("LINE_3")
+            .expect("output should contain LINE_3");
+        assert!(
+            pos_1 < pos_2 && pos_2 < pos_3,
+            "output must be ordered LINE_1 < LINE_2 < LINE_3: {}",
+            out_res.prompt_text
+        );
+
+        // 3. Bounded/truncation behavior: deterministic output far beyond the
+        // 40 KB tool-output cap. Response must stay bounded, carry the
+        // truncation marker, and not hang.
+        let big_args = serde_json::json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write(('BULK_A:' + [string][char]0x41) * 60000); Write-Output 'TRUNC_TAIL_SENTINEL'\"",
+            "description": "truncation bound test",
+            "is_background": true
+        });
+        let big_res = bridge
+            .call("run_terminal_cmd", big_args, "test-term-big")
+            .await
+            .expect("large output terminal call should succeed");
+        let big_task_id = if let Some(start) = big_res.prompt_text.find("<task-id>") {
+            let rest = &big_res.prompt_text[start + 9..];
+            if let Some(end) = rest.find("</task-id>") {
+                rest[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        assert!(
+            !big_task_id.is_empty(),
+            "large output task should return task ID"
+        );
+
+        // Block (bounded) on completion with `timeout_ms`, then read the
+        // truncated output. `run_terminal_cmd` enforces a 20K-char ring
+        // (front+back halves joined by a truncation marker), so the ~420KB
+        // raw output is always clipped without hanging. The tool response
+        // MUST carry the truncation marker and the truncation hint footer.
+        let big_out = bridge
+            .call(
+                "get_task_output",
+                serde_json::json!({ "task_id": &big_task_id, "timeout_ms": 30000 }),
+                "test-term-big-out",
+            )
+            .await
+            .expect("get_task_output for large output should succeed");
+        assert!(
+            big_out.prompt_text.contains("... (output truncated) ..."),
+            "oversized output must carry the front/back truncation marker: {}",
+            big_out.prompt_text
+        );
+        assert!(
+            big_out.prompt_text.contains("[truncated - use read_file"),
+            "oversized output must carry the truncation hint footer: {}",
+            big_out.prompt_text
+        );
+        assert!(
+            big_out.prompt_text.len() <= 60_000,
+            "rendered output must stay bounded (20K-char ring + hint), got {} bytes",
+            big_out.prompt_text.len()
+        );
+
+        // 4. kill_task on the bulk producer: owned task tree is stopped.
+        let kill_res = bridge
+            .call(
+                "kill_task",
+                serde_json::json!({ "task_id": &big_task_id }),
+                "test-term-big-kill",
+            )
+            .await
+            .expect("kill_task should succeed");
+        let _ = kill_res;
+
+        let _ = std::fs::remove_dir_all(&temp_ws);
     }
 }

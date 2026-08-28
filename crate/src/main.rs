@@ -1,5 +1,6 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
+mod build_provenance;
 mod host;
 mod host_env;
 mod mcp;
@@ -43,6 +44,7 @@ enum Cmd {
     Start,
     Stop,
     Watch,
+    RunTunnel,
     McpStdio,
     McpHttp { addr: SocketAddr },
     List,
@@ -90,6 +92,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             [op] if op == "setup" => Cmd::Setup { open_ui: open },
             [op] if op == "config" => Cmd::Config { addr, open },
             [op] if op == "watch" => Cmd::Watch,
+            [op] if op == "run-tunnel" || op == "daemon" => Cmd::RunTunnel,
             [op] if op == "use" => Cmd::Use {
                 dir: fallback.clone(),
             },
@@ -134,6 +137,24 @@ async fn main() {
     }
 }
 
+/// Resolve a CLI argument to a JSON value: `@path` reads from file, valid JSON
+/// is used directly, a path to an existing `.json` file is read, and anything
+/// else is attempted as literal JSON. Strips a leading UTF-8 BOM if present.
+fn resolve_json_argument(raw: String) -> Result<serde_json::Value, String> {
+    let content = if raw.starts_with('@') {
+        let p = &raw[1..];
+        std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?
+    } else if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
+        raw
+    } else if std::path::Path::new(&raw).is_file() {
+        std::fs::read_to_string(&raw).map_err(|e| format!("read {}: {e}", raw))?
+    } else {
+        raw
+    };
+    let trimmed = content.trim_start_matches('\u{feff}').trim();
+    serde_json::from_str(trimmed).map_err(|e| format!("invalid json args: {e}"))
+}
+
 async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
     match cmd {
         Cmd::Setup { open_ui } => {
@@ -156,6 +177,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
             mcp::McpHost::new(fallback).serve_http(addr).await
         }
         Cmd::Watch => watch::run(),
+        Cmd::RunTunnel => service::run_tunnel_daemon(),
         Cmd::Use { dir } => {
             let cwd = host::pin_workspace(&dir)?;
             println!("{}", cwd.display());
@@ -220,8 +242,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     Ok(())
                 }
                 Cmd::Call { tool, args_json } => {
-                    let params: serde_json::Value = serde_json::from_str(&args_json)
-                        .map_err(|e| format!("invalid json args: {e}"))?;
+                    let params = resolve_json_argument(args_json)?;
                     let result = bridge
                         .call(&tool, params, "hands-1")
                         .await

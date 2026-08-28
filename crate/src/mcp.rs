@@ -64,11 +64,7 @@ impl McpHost {
         let stdin = BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();
         let mut stdout = tokio::io::stdout();
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| format!("stdin: {e}"))?
-        {
+        while let Some(line) = lines.next_line().await.map_err(|e| format!("stdin: {e}"))? {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -120,11 +116,7 @@ impl McpHost {
             "ping" => Ok(json!({})),
             "tools/list" => self.tools_list().await,
             "tools/call" => self.tools_call(params).await,
-            other => Err((
-                -32601,
-                format!("method not found: {other}"),
-                Value::Null,
-            )),
+            other => Err((-32601, format!("method not found: {other}"), Value::Null)),
         };
 
         Some(match result {
@@ -192,29 +184,28 @@ impl McpHost {
     }
 
     async fn tools_call(&self, params: Value) -> Result<Value, (i64, String, Value)> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or((-32602, "tools/call requires name".into(), Value::Null))?;
+        let name = params.get("name").and_then(Value::as_str).ok_or((
+            -32602,
+            "tools/call requires name".into(),
+            Value::Null,
+        ))?;
         if name == "workspace_info" {
             let cwd = self.workspace();
             return Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": format!("workspace: {}", cwd.display())
+                    "text": format!(
+                        "workspace: {}\nsource_git_sha: {}",
+                        cwd.display(),
+                        crate::build_provenance::SOURCE_GIT_SHA
+                    )
                 }],
                 "isError": false
             }));
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-        let call_id = format!(
-            "mcp-{}",
-            self.call_seq.fetch_add(1, Ordering::Relaxed)
-        );
-        let bridge = self
-            .bridge()
-            .await
-            .map_err(|e| (-32603, e, Value::Null))?;
+        let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
+        let bridge = self.bridge().await.map_err(|e| (-32603, e, Value::Null))?;
         match bridge.call(name, arguments, &call_id).await {
             Ok(result) => Ok(json!({
                 "content": [{ "type": "text", "text": result.prompt_text }],

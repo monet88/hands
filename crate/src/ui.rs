@@ -12,13 +12,13 @@ const PAGE: &str = include_str!("ui.html");
 pub fn route(method: &str, path: &str, body: &[u8]) -> Option<(u16, &'static str, Vec<u8>)> {
     let path = path.split('?').next().unwrap_or(path);
     match (method, path) {
-        ("GET", "/") | ("GET", "/index.html") | ("GET", "/ui") => Some((
-            200,
-            "text/html; charset=utf-8",
-            PAGE.as_bytes().to_vec(),
-        )),
+        ("GET", "/") | ("GET", "/index.html") | ("GET", "/ui") => {
+            Some((200, "text/html; charset=utf-8", PAGE.as_bytes().to_vec()))
+        }
         ("GET", "/api/status") => {
-            let ws = host::resolve_workspace(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let ws = host::resolve_workspace(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            );
             let payload = service::status_json(&ws);
             Some(json_ok(200, payload))
         }
@@ -47,7 +47,11 @@ fn handle_workspace(body: &[u8]) -> (u16, &'static str, Vec<u8>) {
 
 fn handle_connect(body: &[u8]) -> (u16, &'static str, Vec<u8>) {
     match parse(body).and_then(|v| {
-        if let Some(path) = v.get("path").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if let Some(path) = v
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
             host::pin_workspace(Path::new(path))?;
         }
         service::save_connect(
@@ -88,7 +92,7 @@ pub fn open_browser(url: &str) {
     } else if cfg!(target_os = "windows") {
         match crate::host::native_cmd_exe() {
             Ok(cmd) => std::process::Command::new(cmd)
-                .args(["/C", "start", url])
+                .args(["/C", "start", "", url])
                 .spawn(),
             Err(error) => {
                 eprintln!("cannot open browser: {error}");
