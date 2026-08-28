@@ -796,4 +796,72 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_workspace_pin_and_resolve_with_unicode_and_spaces() {
+        let temp_base = std::env::temp_dir().join(format!(
+            "hands_ws_test_🚀_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let ws_dir = temp_base.join("Sub Folder With Spaces 測試");
+        std::fs::create_dir_all(&ws_dir).expect("should create test workspace directory");
+
+        let pinned = pin_workspace(&ws_dir).expect("pin_workspace should succeed for unicode path with spaces");
+        assert_eq!(pinned, dunce::canonicalize(&ws_dir).unwrap());
+
+        let read = read_pinned_workspace().expect("read_pinned_workspace should return pinned path");
+        assert_eq!(read, pinned);
+
+        let resolved = resolve_workspace(&std::env::temp_dir());
+        assert_eq!(resolved, pinned);
+
+        let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    #[test]
+    fn test_which_executable_discovery() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hands_which_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        #[cfg(windows)]
+        let fake_exe = temp_dir.join("fake-tool.exe");
+        #[cfg(not(windows))]
+        let fake_exe = temp_dir.join("fake-tool");
+
+        std::fs::write(&fake_exe, "mock binary").expect("write fake binary");
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let mut entries = vec![temp_dir.clone()];
+        entries.extend(std::env::split_paths(&orig_path));
+        let new_path = std::env::join_paths(entries).unwrap();
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
+        let found = crate::service::which("fake-tool");
+        unsafe {
+            std::env::set_var("PATH", &orig_path);
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            found.is_some(),
+            "which('fake-tool') should locate fake-tool binary on PATH"
+        );
+        assert_eq!(
+            found.unwrap().canonicalize().ok(),
+            fake_exe.canonicalize().ok()
+        );
+    }
 }

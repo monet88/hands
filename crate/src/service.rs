@@ -317,24 +317,66 @@ fn harness_bin() -> Result<PathBuf, String> {
 
 pub fn tunnel_client_bin() -> Result<PathBuf, String> {
     which("tunnel-client").ok_or_else(|| {
-        "tunnel-client not found. brew install openai/tools/tunnel-client".into()
+        if cfg!(windows) {
+            "tunnel-client.exe not found. Run install.ps1 or place tunnel-client.exe in PATH".into()
+        } else {
+            "tunnel-client not found. brew install openai/tools/tunnel-client".into()
+        }
     })
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+pub fn which(name: &str) -> Option<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(path) = std::env::var("PATH") {
-        dirs.extend(path.split(':').map(PathBuf::from));
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
     }
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".local/bin"));
+        #[cfg(windows)]
+        {
+            dirs.push(home.join(".cargo/bin"));
+        }
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
+    #[cfg(windows)]
+    {
+        if let Some(local) = dirs::data_local_dir() {
+            dirs.push(local.join("Programs/hands/bin"));
+            dirs.push(local.join("Programs/openai/tunnel-client"));
+            dirs.push(local.join("Programs/orca/resources/bin"));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+
+    #[cfg(windows)]
+    let extensions: Vec<String> = {
+        if let Some(pathext) = std::env::var_os("PATHEXT") {
+            std::env::split_paths(&pathext)
+                .filter_map(|p| p.to_str().map(|s| s.to_ascii_lowercase()))
+                .collect()
+        } else {
+            vec![".exe".into(), ".cmd".into(), ".bat".into()]
+        }
+    };
+
     for dir in dirs {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            if !name.contains('.') {
+                for ext in &extensions {
+                    let ext_candidate = dir.join(format!("{name}{ext}"));
+                    if ext_candidate.is_file() {
+                        return Some(ext_candidate);
+                    }
+                }
+            }
         }
     }
     None

@@ -88,7 +88,7 @@ pub fn open_browser(url: &str) {
     } else if cfg!(target_os = "windows") {
         match crate::host::native_cmd_exe() {
             Ok(cmd) => std::process::Command::new(cmd)
-                .args(["/C", "start", url])
+                .args(["/C", "start", "", url])
                 .spawn(),
             Err(error) => {
                 eprintln!("cannot open browser: {error}");
