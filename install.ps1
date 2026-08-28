@@ -8,8 +8,18 @@ if (-not $RepoRoot) {
     $RepoRoot = (Get-Location).Path
 }
 
-# Prefix directory for binaries: %LOCALAPPDATA%\Programs\hands\bin or custom prefix
-$Prefix = if ($env:HANDS_PREFIX) { $env:HANDS_PREFIX } else { Join-Path $env:LOCALAPPDATA "Programs\hands\bin" }
+# Prefix directory for binaries: %LOCALAPPDATA%\Programs\hands\bin or custom prefix.
+# A custom prefix must be absolute; persisting a relative directory into PATH
+# would make command resolution depend on each shell's current directory.
+if ($env:HANDS_PREFIX) {
+    if (-not [System.IO.Path]::IsPathRooted($env:HANDS_PREFIX)) {
+        Write-Error "HANDS_PREFIX must be an absolute Windows path. Got: $($env:HANDS_PREFIX)"
+        exit 1
+    }
+    $Prefix = [System.IO.Path]::GetFullPath($env:HANDS_PREFIX)
+} else {
+    $Prefix = Join-Path $env:LOCALAPPDATA "Programs\hands\bin"
+}
 $Cache = if ($env:HANDS_CACHE) { $env:HANDS_CACHE } elseif ($env:GROK_HARNESS_CACHE) { $env:GROK_HARNESS_CACHE } else { Join-Path $env:LOCALAPPDATA "hands\cache" }
 $GrokBuildUrl = if ($env:GROK_BUILD_URL) { $env:GROK_BUILD_URL } else { "https://github.com/xai-org/grok-build.git" }
 $GrokBuildRef = if ($env:GROK_BUILD_REF) { $env:GROK_BUILD_REF } else { "9684fa3cdbf2995e30ea8b9b637f1db008f144fc" }
@@ -99,8 +109,32 @@ Write-Host "Installed: $DestBin"
 & $DestBin --version
 Write-Host ""
 
-# 5. Ensure the managed Hands prefix is first on User PATH. This keeps the
-# pinned hands.exe / tunnel-client.exe ahead of unrelated same-name binaries.
+# 5. Ensure the managed Hands prefix is first on User PATH. Before relying on
+# User PATH, fail closed if Machine PATH already exposes another hands command:
+# Windows composes Machine PATH ahead of User PATH for new processes.
+$MachinePath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+$PathExts = @($env:PATHEXT -split ';' | Where-Object { $_ })
+if ($PathExts.Count -eq 0) { $PathExts = @('.COM', '.EXE', '.BAT', '.CMD') }
+$MachineHandsCollisions = @()
+foreach ($entry in @($MachinePath -split ';' | Where-Object { $_ })) {
+    $expandedEntry = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
+    if (-not $expandedEntry -or -not [System.IO.Path]::IsPathRooted($expandedEntry)) { continue }
+    foreach ($ext in $PathExts) {
+        $candidate = Join-Path $expandedEntry ("hands" + $ext)
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $resolved = [System.IO.Path]::GetFullPath($candidate)
+            if ($resolved -ine [System.IO.Path]::GetFullPath($DestBin)) {
+                $MachineHandsCollisions += $resolved
+            }
+        }
+    }
+}
+$MachineHandsCollisions = @($MachineHandsCollisions | Sort-Object -Unique)
+if ($MachineHandsCollisions.Count -gt 0) {
+    Write-Error ("Machine PATH contains another 'hands' command that would shadow this user install: " + ($MachineHandsCollisions -join ', ') + ". Remove or rename the collision, or install Hands to the machine-managed location deliberately.")
+    exit 1
+}
+
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
 $PathEntries = @($UserPath -split ';' | Where-Object { $_ -and $_ -ine $Prefix })
 $NewUserPath = (@($Prefix) + $PathEntries) -join ';'
@@ -159,6 +193,20 @@ try {
     if ($ExistingExeHash -eq $ExpectedExeHash) {
         Write-Host "Existing tunnel-client.exe matches the verified pinned artifact."
     } else {
+        # Windows cannot overwrite a running executable. Stop only processes
+        # whose ExecutablePath is exactly the Hands-managed verified binary;
+        # never kill unrelated tunnel-client.exe instances elsewhere.
+        Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ieq $VerifiedBin } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 200
+        $StillRunning = @(Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ieq $VerifiedBin })
+        if ($StillRunning.Count -gt 0) {
+            Write-Error "Hands-managed tunnel-client.exe is still running; refusing to overwrite it."
+            exit 1
+        }
+
         Copy-Item -Path $ExtractedExe.FullName -Destination $VerifiedBin -Force
         $InstalledHash = (Get-FileHash -Path $VerifiedBin -Algorithm SHA256).Hash.ToLower()
         if ($InstalledHash -ne $ExpectedExeHash) {
