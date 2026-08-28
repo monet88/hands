@@ -41,7 +41,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
         ).strip()
         dirty = subprocess.check_output(
-            ["git", "-C", str(src_repo), "status", "--porcelain", "--untracked-files=no"],
+            ["git", "-C", str(src_repo), "status", "--porcelain", "--untracked-files=all"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
