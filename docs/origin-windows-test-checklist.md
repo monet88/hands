@@ -2,6 +2,8 @@
 
 Goal: verify the upstream/origin core path on Windows before implementing Issues #2-#9.
 
+> Historical acceptance flow: do not rerun its release-build or runtime-mutation steps while an active Hands connection is serving work. Use `scripts/smoke_windows.ps1` for routine development verification; rerun this checklist only in an isolated E2E window.
+
 ```text
 ChatGPT Web -> Secure MCP Tunnel -> tunnel-client.exe -> Hands -> filesystem/terminal -> Orca CLI
 ```
@@ -40,7 +42,10 @@ $Hands = Join-Path $RepoRoot ".grok-build\target\release\hands.exe"
 
 ```powershell
 & $Hands --cwd $RepoRoot list
-& $Hands --cwd $RepoRoot call read_file '{"target_file":"README.md"}'
+$Payload = New-TemporaryFile
+@{ target_file = "README.md" } | ConvertTo-Json -Compress | Set-Content -Path $Payload -Encoding utf8
+python .\scripts\call_tool_json.py --hands $Hands read_file $Payload
+Remove-Item $Payload
 ```
 
 - [x] Tool list appears
