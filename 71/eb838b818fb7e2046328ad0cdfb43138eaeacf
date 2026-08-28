@@ -1,0 +1,32 @@
+.gitignore
+  h_17f2fa2b92da6a 6-9
+AGENTS.md
+  h_17f2fa2b92da6a 97-155
+crate/src/doctor.rs
+  h_17f2fa2b92da6a 568-569,573-574,947-975
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 48,87-94,98
+crate/src/service.rs
+  h_17f2fa2b92da6a 195-198,201,263,269,279,1429-1435
+docs/agents/domain.md
+  h_17f2fa2b92da6a 1-51
+docs/agents/issue-tracker.md
+  h_17f2fa2b92da6a 1-45
+docs/agents/triage-labels.md
+  h_17f2fa2b92da6a 1-15
+scripts/call_tool_json.py
+  h_17f2fa2b92da6a 23-39
+scripts/smoke_windows.ps1
+  h_17f2fa2b92da6a 86-94,98-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "71eb838b818fb7e2046328ad0cdfb43138eaeacf",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
