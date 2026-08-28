@@ -1,0 +1,24 @@
+AGENTS.md
+  h_17f2fa2b92da6a 33-34
+README.md
+  h_17f2fa2b92da6a 104,142
+crate/src/doctor.rs
+  h_17f2fa2b92da6a 1-653
+crate/src/main.rs
+  h_17f2fa2b92da6a 4,28,44,107-108,220-233
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 48,52,59,68,76,87-94
+crate/src/service.rs
+  h_17f2fa2b92da6a 71-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "439cf8b84d64e46c3389d8207dc5719cfcfcae44",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
