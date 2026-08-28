@@ -46,9 +46,12 @@ pub fn config_dir() -> PathBuf {
 pub fn tunnel_client_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        dirs::config_dir()
-            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
-            .join("tunnel-client")
+        // The official Windows tunnel-client follows the same ~/.config
+        // profile location as its cross-platform runtime. Using APPDATA here
+        // makes `tunnel-client run --profile hands` look in a different
+        // directory than Hands writes, so the supervised child immediately
+        // exits with "config file ... not found".
+        home_dir().join(".config/tunnel-client")
     }
     #[cfg(not(windows))]
     {
@@ -381,6 +384,13 @@ pub async fn build_bridge(cwd: PathBuf) -> Result<ToolBridge, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_tunnel_client_profile_dir_matches_runtime_contract() {
+        let expected = home_dir().join(".config/tunnel-client");
+        assert_eq!(tunnel_client_dir(), expected);
+    }
 
     #[test]
     #[cfg(windows)]

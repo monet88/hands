@@ -16,6 +16,17 @@ use crate::host;
 pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
 pub const PROFILE: &str = "hands";
+const TUNNEL_CHILD_ENV_REMOVE: &[&str] = &[
+    "MCP_SERVER_URL",
+    "MCP_COMMAND",
+    "TUNNEL_CLIENT_CONFIG",
+    "TUNNEL_CLIENT_PROFILE",
+    "TUNNEL_CLIENT_PROFILE_FILE",
+    "TUNNEL_CLIENT_PROFILE_DIR",
+    "HEALTH_LISTEN_ADDR",
+    "HEALTH_UNIX_SOCKET",
+    "HEALTH_URL_FILE",
+];
 #[cfg(target_os = "macos")]
 const LABEL: &str = "dev.hands.tunnel";
 #[cfg(target_os = "macos")]
@@ -265,13 +276,17 @@ fn write_profile_at(
     if let Some(parent) = profile_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let harness = harness.display().to_string();
+    let harness = yaml_double_quoted(&mcp_command_value(harness));
+    let tunnel_id = yaml_double_quoted(tunnel_id);
     // Windows: profile references the env var; the key itself lives only in
     // Credential Manager. Unix: profile references the 0600 key file.
     #[cfg(windows)]
     let api_key_entry = "api_key: \"env:CONTROL_PLANE_API_KEY\"".to_string();
     #[cfg(not(windows))]
-    let api_key_entry = format!("api_key: \"file:{}\"", key.display());
+    let api_key_entry = format!(
+        "api_key: \"file:{}\"",
+        yaml_double_quoted(&key.display().to_string())
+    );
 
     let yaml = format!(
         r#"config_version: 1
@@ -476,8 +491,12 @@ pub fn installed() -> bool {
 
 #[cfg(windows)]
 pub fn installed() -> bool {
-    let out = Command::new("schtasks")
-        .args(["/query", "/tn", TASK_NAME])
+    let script = format!(
+        "if (Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
+        ps_single_quote(TASK_NAME)
+    );
+    let out = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .output();
@@ -773,119 +792,143 @@ fn uninstall_supervisor() -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn task_xml(exec_path: &Path, args: &str, description: &str) -> String {
+fn ps_single_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+#[cfg(windows)]
+fn scheduled_task_registration_script(
+    task_name: &str,
+    exec_path: &Path,
+    args: &str,
+    description: &str,
+) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>{description}</Description>
-    <Author>Hands</Author>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>PT10S</Interval>
-      <Count>999</Count>
-    </RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{}</Command>
-      <Arguments>{}</Arguments>
-    </Exec>
-  </Actions>
-</Task>
+        r#"$ErrorActionPreference = 'Stop'
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute '{}' -Argument '{}'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 7 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName '{}' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description '{}' -Force | Out-Null
 "#,
-        xml_escape(&exec_path.display().to_string()),
-        xml_escape(args),
+        ps_single_quote(&exec_path.display().to_string()),
+        ps_single_quote(args),
+        ps_single_quote(task_name),
+        ps_single_quote(description),
     )
+}
+
+#[cfg(windows)]
+fn run_windows_powershell(script: &str, label: &str) -> Result<(), String> {
+    let out = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("{label}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        Err(format!("{label} failed: {detail}"))
+    }
+}
+
+#[cfg(windows)]
+fn register_windows_task(
+    task_name: &str,
+    exec_path: &Path,
+    args: &str,
+    description: &str,
+) -> Result<(), String> {
+    let script = scheduled_task_registration_script(task_name, exec_path, args, description);
+    run_windows_powershell(&script, "Register-ScheduledTask")
+}
+
+#[cfg(windows)]
+fn start_windows_task(task_name: &str) -> Result<(), String> {
+    let script = format!(
+        "Start-ScheduledTask -TaskName '{}' -ErrorAction Stop",
+        ps_single_quote(task_name)
+    );
+    run_windows_powershell(&script, "Start-ScheduledTask")
+}
+
+#[cfg(windows)]
+fn stop_windows_task(task_name: &str) {
+    let script = format!(
+        "Stop-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue",
+        ps_single_quote(task_name)
+    );
+    let _ = run_windows_powershell(&script, "Stop-ScheduledTask");
+}
+
+#[cfg(windows)]
+fn unregister_windows_task(task_name: &str) {
+    let script = format!(
+        "Unregister-ScheduledTask -TaskName '{}' -Confirm:$false -ErrorAction SilentlyContinue",
+        ps_single_quote(task_name)
+    );
+    let _ = run_windows_powershell(&script, "Unregister-ScheduledTask");
 }
 
 #[cfg(windows)]
 fn install_supervisor() -> Result<(), String> {
     let hands = harness_bin()?;
-    let xml = task_xml(&hands, "run-tunnel", "Hands ChatGPT tunnel supervisor");
-    let xml_path = host::config_dir().join("tunnel-task.xml");
-    if let Some(parent) = xml_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(&xml_path, &xml).map_err(|e| format!("write {}: {e}", xml_path.display()))?;
 
     // A previous scheduled `hands run-tunnel` may be inside its own retry
     // loop. End the owning Task Scheduler instance before replacing the task
     // definition, then clean up only its recorded tunnel-client tree.
     stop_supervisor()?;
-
-    let out = Command::new("schtasks")
-        .args([
-            "/create",
-            "/tn",
-            TASK_NAME,
-            "/xml",
-            &xml_path.display().to_string(),
-            "/f",
-        ])
-        .output()
-        .map_err(|e| format!("schtasks /create: {e}"))?;
-
-    if !out.status.success() {
-        return Err(format!(
-            "schtasks /create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    register_windows_task(
+        TASK_NAME,
+        &hands,
+        "run-tunnel",
+        "Hands ChatGPT tunnel supervisor",
+    )?;
+    let stale_xml = host::config_dir().join("tunnel-task.xml");
+    if stale_xml.is_file() {
+        let _ = fs::remove_file(stale_xml);
     }
 
     start_supervisor()?;
     Ok(())
 }
 
+fn yaml_double_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+fn mcp_command_value(executable: &Path) -> String {
+    let raw = executable.display().to_string();
+    #[cfg(windows)]
+    {
+        // tunnel-client parses the YAML command value with a shell-like lexer:
+        // Windows backslashes are escape characters there. Forward slashes
+        // are accepted by CreateProcess/Go exec and quoting preserves spaces.
+        return format!("\"{}\"", raw.replace('\\', "/"));
+    }
+    #[cfg(not(windows))]
+    {
+        raw
+    }
+}
+
 #[cfg(windows)]
 fn start_supervisor() -> Result<(), String> {
-    let out = Command::new("schtasks")
-        .args(["/run", "/tn", TASK_NAME])
-        .output()
-        .map_err(|e| format!("schtasks /run: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.contains("already running") && !err.contains("2147750562") {
-            return Err(format!("schtasks /run failed: {}", err.trim()));
-        }
-    }
-    Ok(())
+    start_windows_task(TASK_NAME)
 }
 
 #[cfg(windows)]
 fn stop_supervisor() -> Result<(), String> {
-    let _ = Command::new("schtasks")
-        .args(["/end", "/tn", TASK_NAME])
-        .output();
+    stop_windows_task(TASK_NAME);
     stop_unmanaged();
     Ok(())
 }
@@ -894,9 +937,7 @@ fn stop_supervisor() -> Result<(), String> {
 fn uninstall_supervisor() -> Result<(), String> {
     stop_supervisor()?;
     let _ = uninstall_watch();
-    let _ = Command::new("schtasks")
-        .args(["/delete", "/tn", TASK_NAME, "/f"])
-        .output();
+    unregister_windows_task(TASK_NAME);
     let xml_path = host::config_dir().join("tunnel-task.xml");
     if xml_path.is_file() {
         let _ = fs::remove_file(xml_path);
@@ -907,45 +948,24 @@ fn uninstall_supervisor() -> Result<(), String> {
 #[cfg(windows)]
 fn install_watch() -> Result<(), String> {
     let hands = harness_bin()?;
-    let xml = task_xml(&hands, "watch", "Hands tunnel down notifier");
-    let xml_path = host::config_dir().join("watch-task.xml");
-    if let Some(parent) = xml_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    stop_windows_task(WATCH_TASK_NAME);
+    register_windows_task(
+        WATCH_TASK_NAME,
+        &hands,
+        "watch",
+        "Hands tunnel down notifier",
+    )?;
+    let stale_xml = host::config_dir().join("watch-task.xml");
+    if stale_xml.is_file() {
+        let _ = fs::remove_file(stale_xml);
     }
-    fs::write(&xml_path, &xml).map_err(|e| format!("write {}: {e}", xml_path.display()))?;
-
-    let out = Command::new("schtasks")
-        .args([
-            "/create",
-            "/tn",
-            WATCH_TASK_NAME,
-            "/xml",
-            &xml_path.display().to_string(),
-            "/f",
-        ])
-        .output()
-        .map_err(|e| format!("schtasks /create watch: {e}"))?;
-
-    if !out.status.success() {
-        return Err(format!(
-            "schtasks /create watch failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let _ = Command::new("schtasks")
-        .args(["/run", "/tn", WATCH_TASK_NAME])
-        .output();
-    Ok(())
+    start_windows_task(WATCH_TASK_NAME)
 }
 
 #[cfg(windows)]
 fn uninstall_watch() -> Result<(), String> {
-    let _ = Command::new("schtasks")
-        .args(["/end", "/tn", WATCH_TASK_NAME])
-        .output();
-    let _ = Command::new("schtasks")
-        .args(["/delete", "/tn", WATCH_TASK_NAME, "/f"])
-        .output();
+    stop_windows_task(WATCH_TASK_NAME);
+    unregister_windows_task(WATCH_TASK_NAME);
     let xml_path = host::config_dir().join("watch-task.xml");
     if xml_path.is_file() {
         let _ = fs::remove_file(xml_path);
@@ -970,7 +990,7 @@ fn query_process_creation(pid: u32) -> Option<String> {
             "-NonInteractive",
             "-Command",
             &format!(
-                "(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue).CreationDate | Out-String"
+                "$p=Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; if ($p) {{ [Console]::Out.Write($p.CreationDate.ToUniversalTime().Ticks) }}"
             ),
         ])
         .output()
@@ -979,7 +999,7 @@ fn query_process_creation(pid: u32) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s.contains("CreationDate") {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
         None
     } else {
         Some(s)
@@ -987,31 +1007,29 @@ fn query_process_creation(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn write_tunnel_pid(pid: u32) {
+fn write_tunnel_pid(pid: u32) -> Result<(), String> {
     let path = tunnel_pid_file();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let creation = query_process_creation(pid).unwrap_or_default();
-    let json = if creation.is_empty() {
-        format!(r#"{{"pid":{pid},"profile":"{PROFILE}"}}"#)
-    } else {
-        // Escape backslashes/quotes in creation string
-        let esc = creation.replace('\\', r"\\").replace('"', r#"\""#);
-        format!(r#"{{"pid":{pid},"creation":"{esc}","profile":"{PROFILE}"}}"#)
-    };
-    let _ = fs::write(&path, json);
+    let creation = query_process_creation(pid)
+        .ok_or_else(|| format!("cannot prove process creation token for PID {pid}"))?;
+    let json = format!(r#"{{"pid":{pid},"creation":"{creation}","profile":"{PROFILE}"}}"#);
+    fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(windows)]
-fn read_tunnel_pid() -> Option<(u32, Option<String>)> {
+fn read_tunnel_pid() -> Option<(u32, String)> {
     let raw = fs::read_to_string(tunnel_pid_file()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if v.get("profile")?.as_str()? != PROFILE {
+        return None;
+    }
     let pid = v.get("pid")?.as_u64()? as u32;
-    let creation = v
-        .get("creation")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+    let creation = v.get("creation")?.as_str()?.to_string();
+    if creation.is_empty() || !creation.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     Some((pid, creation))
 }
 
@@ -1022,20 +1040,19 @@ fn read_tunnel_pid() -> Option<(u32, Option<String>)> {
 #[cfg(windows)]
 fn stop_unmanaged() {
     let Some((pid, stored_creation)) = read_tunnel_pid() else {
+        let _ = fs::remove_file(tunnel_pid_file());
         return;
     };
     // Validate ownership before killing; use creation time to defeat PID recycling.
-    if let Some(stored) = stored_creation.as_ref().filter(|s| !s.is_empty()) {
-        if let Some(live) = query_process_creation(pid) {
-            if live.trim() != stored.trim() {
-                let _ = fs::remove_file(tunnel_pid_file());
-                return;
-            }
-        } else {
-            // Process gone: clean stale record.
+    if let Some(live) = query_process_creation(pid) {
+        if live.trim() != stored_creation.trim() {
             let _ = fs::remove_file(tunnel_pid_file());
             return;
         }
+    } else {
+        // Process gone: clean stale record.
+        let _ = fs::remove_file(tunnel_pid_file());
+        return;
     }
     let pid_file_esc = tunnel_pid_file().display().to_string().replace('\'', "''");
     let script = format!(
@@ -1056,7 +1073,7 @@ if (-not $isOurs) {{
 # Additional creation-time check from PowerShell when Rust-stored creation exists
 $storedCreation = '{stored_creation_esc}'
 if ($storedCreation) {{
-    $liveCreation = $p.CreationDate
+    $liveCreation = $p.CreationDate.ToUniversalTime().Ticks
     if ($liveCreation -and "$liveCreation" -ne $storedCreation) {{
         Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
         exit 0
@@ -1069,7 +1086,7 @@ Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
 "#,
         pid = pid,
         pid_file_esc = pid_file_esc,
-        stored_creation_esc = stored_creation.as_deref().unwrap_or("").replace('\'', "''")
+        stored_creation_esc = stored_creation.replace('\'', "''")
     );
     let _ = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -1099,13 +1116,24 @@ pub fn run_tunnel_daemon() -> Result<(), String> {
 
         let mut cmd = Command::new(&client);
         cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
+        // Hands owns the MCP target and fixed health endpoint in its profile.
+        // Do not let unrelated parent-shell/app environment overrides replace
+        // that stdio target (for example MCP_SERVER_URL from a local bridge)
+        // or move /readyz away from HEALTH_LISTEN.
+        for name in TUNNEL_CHILD_ENV_REMOVE {
+            cmd.env_remove(name);
+        }
         cmd.env("CONTROL_PLANE_API_KEY", &key);
         cmd.env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn tunnel-client: {e}"))?;
         #[cfg(windows)]
-        write_tunnel_pid(child.id());
+        if let Err(e) = write_tunnel_pid(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("record tunnel ownership: {e}"));
+        }
         let status = child
             .wait()
             .map_err(|e| format!("wait tunnel-client: {e}"))?;
@@ -1206,7 +1234,7 @@ fn run_ok(bin: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1239,17 +1267,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_yaml_double_quoted_escapes_windows_path_characters() {
+        let raw = "C:\\Program Files\\Hands\\say \"hello\".exe";
+        assert_eq!(
+            yaml_double_quoted(raw),
+            "C:\\\\Program Files\\\\Hands\\\\say \\\"hello\\\".exe"
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
-    fn test_task_xml_structure_and_least_privilege() {
+    fn test_windows_mcp_command_quotes_spaces_without_backslash_escapes() {
+        let path = PathBuf::from(r"C:\Program Files\Hands\hands.exe");
+        assert_eq!(
+            mcp_command_value(&path),
+            r#""C:/Program Files/Hands/hands.exe""#
+        );
+    }
+
+    #[test]
+    fn test_tunnel_child_env_scrubs_profile_owned_overrides() {
+        for required in [
+            "MCP_SERVER_URL",
+            "MCP_COMMAND",
+            "TUNNEL_CLIENT_CONFIG",
+            "TUNNEL_CLIENT_PROFILE_FILE",
+            "TUNNEL_CLIENT_PROFILE_DIR",
+            "HEALTH_LISTEN_ADDR",
+            "HEALTH_UNIX_SOCKET",
+        ] {
+            assert!(
+                TUNNEL_CHILD_ENV_REMOVE.contains(&required),
+                "missing profile-owned env scrub: {required}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_process_creation_token_is_numeric_and_stable() {
+        let pid = std::process::id();
+        let first = query_process_creation(pid).expect("current process creation token");
+        let second = query_process_creation(pid).expect("current process creation token again");
+        assert!(first.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_task_registration_script_is_user_scoped_and_bounded() {
         let exe = PathBuf::from(r"C:\Program Files\Hands\hands.exe");
-        let xml = task_xml(&exe, "run-tunnel", "Hands test task");
-        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
-        assert!(xml.contains("<LogonTrigger>"));
-        assert!(xml.contains("<RestartOnFailure>"));
-        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
-        assert!(xml.contains("<Arguments>run-tunnel</Arguments>"));
-        assert!(xml.contains(r"C:\Program Files\Hands\hands.exe"));
-        assert!(!xml.contains("sk-"));
+        let script =
+            scheduled_task_registration_script(TASK_NAME, &exe, "run-tunnel", "Hands test task");
+        assert!(script.contains("New-ScheduledTaskTrigger -AtLogOn -User $user"));
+        assert!(script.contains("-LogonType Interactive -RunLevel Limited"));
+        assert!(script.contains("-MultipleInstances IgnoreNew"));
+        assert!(script.contains("-RestartCount 999"));
+        assert!(script.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
+        assert!(script.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
+        assert!(script.contains("-Argument 'run-tunnel'"));
+        assert!(script.contains(r"C:\Program Files\Hands\hands.exe"));
+        assert!(!script.contains("sk-"));
     }
 
     #[test]

@@ -46,13 +46,7 @@ Write-Host "SHA-256: $HandsSha256"
 Write-Host "========================================="
 
 # ---- snapshot before any mutation ------------------------------------------
-$PinFile = if ($env:HANDS_CONFIG_DIR -and $env:HANDS_CONFIG_DIR.Trim()) {
-    Join-Path $env:HANDS_CONFIG_DIR "workspace"
-} else {
-    Join-Path $env:APPDATA "hands\workspace"
-}
-$SavedPinExists = Test-Path $PinFile
-$SavedPin = if ($SavedPinExists) { Get-Content -Path $PinFile -Raw -ErrorAction SilentlyContinue } else { $null }
+$SavedConfigDir = $env:HANDS_CONFIG_DIR
 $SavedWorkspaceEnv = $env:HANDS_WORKSPACE
 $SavedLegacyWorkspaceEnv = $env:GROK_HARNESS_WORKSPACE
 
@@ -62,6 +56,7 @@ $script:TrackedTaskId = $null
 $script:ControlProc = $null
 $script:ControlDir = $null
 $script:TestWs = $null
+$script:TestConfigDir = $null
 
 function Get-McpText($result) {
     if (-not $result -or -not $result.content) { return "" }
@@ -110,6 +105,13 @@ function Start-McpSession {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
+    if ($env:HANDS_CONFIG_DIR) {
+        $psi.EnvironmentVariables["HANDS_CONFIG_DIR"] = $env:HANDS_CONFIG_DIR
+    }
+    # Workspace env overrides outrank the isolated pin; remove them explicitly
+    # from the child even if the parent shell carried them before this gate.
+    $psi.EnvironmentVariables.Remove("HANDS_WORKSPACE")
+    $psi.EnvironmentVariables.Remove("GROK_HARNESS_WORKSPACE")
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
@@ -243,19 +245,16 @@ function Restore-State {
     if ($script:TestWs -and (Test-Path $script:TestWs)) {
         Remove-Item -Path $script:TestWs -Recurse -Force -ErrorAction SilentlyContinue
     }
+    if ($script:TestConfigDir -and (Test-Path $script:TestConfigDir)) {
+        Remove-Item -Path $script:TestConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
+    if ($null -ne $SavedConfigDir) { $env:HANDS_CONFIG_DIR = $SavedConfigDir }
+    else { Remove-Item Env:\HANDS_CONFIG_DIR -ErrorAction SilentlyContinue }
     if ($null -ne $SavedWorkspaceEnv) { $env:HANDS_WORKSPACE = $SavedWorkspaceEnv }
     else { Remove-Item Env:\HANDS_WORKSPACE -ErrorAction SilentlyContinue }
     if ($null -ne $SavedLegacyWorkspaceEnv) { $env:GROK_HARNESS_WORKSPACE = $SavedLegacyWorkspaceEnv }
     else { Remove-Item Env:\GROK_HARNESS_WORKSPACE -ErrorAction SilentlyContinue }
-
-    if ($SavedPinExists -and $null -ne $SavedPin) {
-        $pinDir = Split-Path $PinFile -Parent
-        if ($pinDir) { New-Item -ItemType Directory -Force -Path $pinDir | Out-Null }
-        Set-Content -Path $PinFile -Value $SavedPin -NoNewline -ErrorAction SilentlyContinue
-    } elseif (-not $SavedPinExists -and (Test-Path $PinFile)) {
-        Remove-Item -Path $PinFile -Force -ErrorAction SilentlyContinue
-    }
 }
 
 try {
@@ -280,13 +279,23 @@ try {
     }
 
     Write-Host "`n[2/9] Persistent MCP stdio tool scan..."
+    # The local deterministic section uses an isolated Hands config root so it
+    # never calls `hands use` (which intentionally auto-enables the real
+    # supervisor). This keeps the user's production supervisor state untouched.
+    $script:TestConfigDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hands_e2e_config_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $script:TestConfigDir | Out-Null
+    $env:HANDS_CONFIG_DIR = $script:TestConfigDir
     $script:TestWs = Join-Path ([System.IO.Path]::GetTempPath()) ("hands_e2e_ws_" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $script:TestWs | Out-Null
     $fixtureRel = "hands_e2e_fixture.txt"
     $fixtureMarker = "HANDS_E2E_FIXTURE_" + [guid]::NewGuid().ToString("N")
     Set-Content -Path (Join-Path $script:TestWs $fixtureRel) -Value $fixtureMarker -Encoding utf8
-    & $HandsBin use $script:TestWs | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "hands use failed for E2E workspace." }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $script:TestConfigDir "workspace"),
+        $script:TestWs,
+        $utf8NoBom
+    )
 
     Start-McpSession
     $list = Invoke-McpRpc "tools/list" @{}
