@@ -223,7 +223,16 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     Ok(())
                 }
                 Cmd::Call { tool, args_json } => {
-                    let params: serde_json::Value = serde_json::from_str(&args_json)
+                    let json_str = if args_json.starts_with('@') {
+                        let p = &args_json[1..];
+                        std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?
+                    } else if std::path::Path::new(&args_json).is_file() {
+                        std::fs::read_to_string(&args_json).map_err(|e| format!("read {}: {e}", args_json))?
+                    } else {
+                        args_json
+                    };
+                    let trimmed = json_str.trim_start_matches('\u{feff}').trim();
+                    let params: serde_json::Value = serde_json::from_str(trimmed)
                         .map_err(|e| format!("invalid json args: {e}"))?;
                     let result = bridge
                         .call(&tool, params, "hands-1")
