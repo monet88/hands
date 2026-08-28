@@ -17,17 +17,19 @@ pub fn run(dir: &Path) -> Result<(), String> {
     let mut id_ok = service::tunnel_id_opt().is_some();
     let tty = io::stdin().is_terminal();
 
+    let client_msg = if client_ok {
+        "ok"
+    } else if cfg!(windows) {
+        "missing — run install.ps1 or place tunnel-client.exe in PATH"
+    } else if cfg!(target_os = "macos") {
+        "missing — brew install openai/tools/tunnel-client"
+    } else {
+        "missing — install tunnel-client on PATH"
+    };
+
     eprintln!("Hands setup");
     check("workspace", true, &cwd.display().to_string());
-    check(
-        "tunnel-client",
-        client_ok,
-        if client_ok {
-            "ok"
-        } else {
-            "missing — brew install openai/tools/tunnel-client"
-        },
-    );
+    check("tunnel-client", client_ok, client_msg);
     check("runtime key", key_ok, if key_ok { "saved" } else { "missing" });
     check("tunnel id", id_ok, if id_ok { "saved" } else { "missing" });
 
@@ -41,7 +43,14 @@ pub fn run(dir: &Path) -> Result<(), String> {
         if let Some(k) = read_secret()? {
             secrets::set(&k)?;
             key_ok = true;
-            eprintln!("saved to Keychain");
+            let target_desc = if cfg!(windows) {
+                "Windows Credential Manager"
+            } else if cfg!(target_os = "macos") {
+                "Keychain"
+            } else {
+                "credential store"
+            };
+            eprintln!("saved to {target_desc}");
         }
     }
     if !id_ok && tty {
@@ -87,6 +96,35 @@ fn read_line() -> Result<Option<String>, String> {
     Ok(if t.is_empty() { None } else { Some(t) })
 }
 
+#[cfg(windows)]
+fn read_secret() -> Result<Option<String>, String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode = 0u32;
+    let have_mode = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
+    if have_mode {
+        unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) };
+    }
+    let mut s = String::new();
+    let r = io::stdin().lock().read_line(&mut s);
+    if have_mode {
+        unsafe { SetConsoleMode(handle, mode) };
+    }
+    eprintln!();
+    r.map_err(|e| e.to_string())?;
+    let t = s.trim().to_string();
+    Ok(if t.is_empty() { None } else { Some(t) })
+}
+
+#[cfg(not(windows))]
 fn read_secret() -> Result<Option<String>, String> {
     let _ = Command::new("stty").arg("-echo").status();
     let mut s = String::new();
@@ -113,9 +151,16 @@ fn copy_clip(text: &str) {
         }
         false
     };
-    if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    {
+        let _ = try_copy("clip.exe", &[]) || try_copy("clip", &[]);
+    }
+    #[cfg(target_os = "macos")]
+    {
         let _ = try_copy("pbcopy", &[]);
-    } else {
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
         let _ = try_copy("wl-copy", &[]) || try_copy("xclip", &["-selection", "clipboard"]);
     }
 }
