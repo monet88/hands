@@ -36,7 +36,8 @@ pub const CREDENTIAL_STORE: &str = "credential store";
 
 /// Install hint shown when tunnel-client is not found.
 #[cfg(windows)]
-pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} run install.ps1 or place tunnel-client.exe in PATH";
+pub const TUNNEL_CLIENT_HINT: &str =
+    "missing \u{2014} run install.ps1 or place tunnel-client.exe in PATH";
 #[cfg(target_os = "macos")]
 pub const TUNNEL_CLIENT_HINT: &str = "missing \u{2014} brew install openai/tools/tunnel-client";
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -306,10 +307,18 @@ pub fn migrate_from_legacy() {
     }
 }
 
-pub fn read_pinned_workspace() -> Option<PathBuf> {
+pub fn read_workspace_pin_raw() -> Option<PathBuf> {
     migrate_from_legacy();
     let raw = std::fs::read_to_string(workspace_file()).ok()?;
-    let path = PathBuf::from(raw.trim());
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+pub fn read_pinned_workspace() -> Option<PathBuf> {
+    let path = read_workspace_pin_raw()?;
     if path.is_dir() {
         dunce::canonicalize(&path).ok()
     } else {

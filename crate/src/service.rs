@@ -1005,7 +1005,11 @@ fn tunnel_pid_file() -> PathBuf {
 fn query_process_creation(pid: u32) -> Option<String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
         fn GetProcessTimes(
             hProcess: *mut std::ffi::c_void,
             lpCreationTime: *mut u64,
@@ -1030,9 +1034,7 @@ fn query_process_creation(pid: u32) -> Option<String> {
     let mut exit = 0u64;
     let mut kernel = 0u64;
     let mut user = 0u64;
-    let ok = unsafe {
-        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-    };
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     unsafe { CloseHandle(handle) };
     if ok == 0 {
         return None;

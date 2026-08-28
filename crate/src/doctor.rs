@@ -1,7 +1,7 @@
 //! Local diagnostics for Hands host configuration, environment, and runtime.
 
-use std::path::Path;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 use crate::host;
 use crate::secrets;
@@ -19,6 +19,7 @@ pub struct WorkspaceReport {
     pub path: String,
     pub pinned: bool,
     pub pin: Option<String>,
+    pub pin_status: String,
     pub exists: bool,
     pub is_dir: bool,
     pub status: String,
@@ -71,6 +72,20 @@ pub struct DoctorReport {
     pub checks: Vec<CheckItem>,
 }
 
+#[derive(Debug, Clone)]
+struct DiagnosticObservations {
+    pin: Option<PathBuf>,
+    pin_is_dir: bool,
+    tunnel_client_path: Option<PathBuf>,
+    has_key: bool,
+    key_source: Option<String>,
+    tunnel_id: Option<String>,
+    profile_file: PathBuf,
+    profile_exists: bool,
+    service_installed: bool,
+    probe_ready: bool,
+}
+
 impl DoctorReport {
     pub fn to_json(&self) -> Value {
         json!({
@@ -85,6 +100,7 @@ impl DoctorReport {
                 "path": self.workspace.path,
                 "pinned": self.workspace.pinned,
                 "pin": self.workspace.pin,
+                "pin_status": self.workspace.pin_status,
                 "exists": self.workspace.exists,
                 "is_dir": self.workspace.is_dir,
                 "status": self.workspace.status,
@@ -129,16 +145,36 @@ impl DoctorReport {
         out.push_str("Hands Doctor — Local Diagnostics\n\n");
 
         out.push_str("Hands:\n");
-        out.push_str(&format!("  version       {} (sha: {})\n", self.version, self.source_git_sha));
-        out.push_str(&format!("  platform      {} ({})\n\n", self.platform_short, self.platform));
+        out.push_str(&format!(
+            "  version       {} (sha: {})\n",
+            self.version, self.source_git_sha
+        ));
+        out.push_str(&format!(
+            "  platform      {} ({})\n\n",
+            self.platform_short, self.platform
+        ));
 
         out.push_str("Workspace:\n");
-        let ws_mark = if self.workspace.exists && self.workspace.is_dir { "ok" } else { "FAIL" };
-        out.push_str(&format!("  [{}] path     {}\n", ws_mark, self.workspace.path));
+        let ws_mark = if self.workspace.exists && self.workspace.is_dir {
+            "ok"
+        } else {
+            "FAIL"
+        };
+        out.push_str(&format!(
+            "  [{}] path     {}\n",
+            ws_mark, self.workspace.path
+        ));
         out.push_str(&format!(
             "  [{}] pin      {}\n",
-            if self.workspace.pinned { "ok" } else { "·" },
-            self.workspace.pin.as_deref().unwrap_or("(none — using cwd/env)")
+            match self.workspace.pin_status.as_str() {
+                "ok" => "ok",
+                "invalid" => "FAIL",
+                _ => "·",
+            },
+            self.workspace
+                .pin
+                .as_deref()
+                .unwrap_or("(none — using cwd/env)")
         ));
         let ws_state = if !self.workspace.exists {
             "path does not exist"
@@ -150,7 +186,11 @@ impl DoctorReport {
         out.push_str(&format!("  [{}] state    {}\n\n", ws_mark, ws_state));
 
         out.push_str("Tunnel Client:\n");
-        let tc_mark = if self.tunnel_client.found { "ok" } else { "WARN" };
+        let tc_mark = if self.tunnel_client.found {
+            "ok"
+        } else {
+            "WARN"
+        };
         if self.tunnel_client.found {
             out.push_str(&format!(
                 "  [{}] binary   {}\n\n",
@@ -166,16 +206,30 @@ impl DoctorReport {
         }
 
         out.push_str("Configuration:\n");
-        out.push_str(&format!("  [ok] config   {}\n", self.configuration.config_dir));
-        let key_mark = if self.configuration.has_key { "ok" } else { "WARN" };
+        out.push_str(&format!(
+            "  [ok] config   {}\n",
+            self.configuration.config_dir
+        ));
+        let key_mark = if self.configuration.has_key {
+            "ok"
+        } else {
+            "WARN"
+        };
         let key_desc = if self.configuration.has_key {
-            format!("present ({})", self.configuration.key_source.as_deref().unwrap_or("saved"))
+            format!(
+                "present ({})",
+                self.configuration.key_source.as_deref().unwrap_or("saved")
+            )
         } else {
             "missing (run 'hands setup' or set CONTROL_PLANE_API_KEY)".into()
         };
         out.push_str(&format!("  [{}] key      {}\n", key_mark, key_desc));
 
-        let id_mark = if self.configuration.has_tunnel_id { "ok" } else { "WARN" };
+        let id_mark = if self.configuration.has_tunnel_id {
+            "ok"
+        } else {
+            "WARN"
+        };
         let id_desc = if let Some(id) = &self.configuration.tunnel_id {
             id.clone()
         } else {
@@ -183,7 +237,11 @@ impl DoctorReport {
         };
         out.push_str(&format!("  [{}] tunnel   {}\n", id_mark, id_desc));
 
-        let prof_mark = if self.configuration.profile_exists { "ok" } else { "·" };
+        let prof_mark = if self.configuration.profile_exists {
+            "ok"
+        } else {
+            "·"
+        };
         let prof_desc = if self.configuration.profile_exists {
             self.configuration.profile_path.clone()
         } else {
@@ -192,7 +250,11 @@ impl DoctorReport {
         out.push_str(&format!("  [{}] profile  {}\n\n", prof_mark, prof_desc));
 
         out.push_str("Supervisor & Runtime:\n");
-        let svc_mark = if self.runtime.service_installed { "ok" } else { "·" };
+        let svc_mark = if self.runtime.service_installed {
+            "ok"
+        } else {
+            "·"
+        };
         out.push_str(&format!(
             "  [{}] service  {} ({})\n",
             svc_mark, self.runtime.service_status, self.runtime.supervisor_name
@@ -205,16 +267,55 @@ impl DoctorReport {
             format!("down ({})", self.runtime.health_url)
         };
         out.push_str(&format!("  [{}] probe    {}\n", probe_mark, probe_desc));
-        out.push_str(&format!("  [{}] admin    {}\n\n", probe_mark, self.runtime.admin_url));
+        out.push_str(&format!(
+            "  [{}] admin    {}\n\n",
+            probe_mark, self.runtime.admin_url
+        ));
 
         out.push_str(&format!("Summary: {}\n", self.summary));
         out
     }
 }
 
+fn collect_observations() -> DiagnosticObservations {
+    let pin = host::read_workspace_pin_raw();
+    let pin_is_dir = pin.as_ref().is_some_and(|path| path.is_dir());
+    let tunnel_client_path = service::tunnel_client_bin().ok();
+    let key_source = secrets::source().map(str::to_string);
+    let tunnel_id = service::tunnel_id_opt();
+    let profile_file = service::profile_file();
+
+    DiagnosticObservations {
+        pin,
+        pin_is_dir,
+        tunnel_client_path,
+        has_key: key_source.is_some(),
+        key_source,
+        tunnel_id,
+        profile_exists: profile_file.is_file(),
+        profile_file,
+        service_installed: service::installed(),
+        probe_ready: service::ready(),
+    }
+}
+
 pub fn diagnose(workspace: &Path) -> DoctorReport {
     host::migrate_from_legacy();
 
+    diagnose_with_observations(
+        workspace,
+        workspace.exists(),
+        workspace.is_dir(),
+        collect_observations(),
+    )
+}
+
+fn diagnose_with_observations(
+    workspace: &Path,
+    ws_exists: bool,
+    ws_is_dir: bool,
+    observations: DiagnosticObservations,
+) -> DoctorReport {
     // 1. Hands metadata
     let name = host::DISPLAY.to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
@@ -223,10 +324,15 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
     let platform_short = host::PLATFORM_SHORT.to_string();
 
     // 2. Workspace
-    let pin = host::read_pinned_workspace().map(|p| p.display().to_string());
+    let pin = observations.pin.as_ref().map(|p| p.display().to_string());
     let pinned = pin.is_some();
-    let ws_exists = workspace.exists();
-    let ws_is_dir = workspace.is_dir();
+    let pin_status = if !pinned {
+        "missing".to_string()
+    } else if observations.pin_is_dir {
+        "ok".to_string()
+    } else {
+        "invalid".to_string()
+    };
     let ws_status = if !ws_exists {
         "missing".to_string()
     } else if !ws_is_dir {
@@ -238,21 +344,28 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
         path: workspace.display().to_string(),
         pinned,
         pin,
+        pin_status,
         exists: ws_exists,
         is_dir: ws_is_dir,
         status: ws_status,
     };
 
     // 3. Tunnel client
-    let tc_res = service::tunnel_client_bin();
-    let tc_found = tc_res.is_ok();
-    let tc_path = tc_res.as_ref().ok().map(|p| p.display().to_string());
+    let tc_found = observations.tunnel_client_path.is_some();
+    let tc_path = observations
+        .tunnel_client_path
+        .as_ref()
+        .map(|p| p.display().to_string());
     let tc_hint = if tc_found {
         None
     } else {
         Some(host::TUNNEL_CLIENT_HINT.to_string())
     };
-    let tc_status = if tc_found { "ok".to_string() } else { "missing".to_string() };
+    let tc_status = if tc_found {
+        "ok".to_string()
+    } else {
+        "missing".to_string()
+    };
     let tunnel_client_report = TunnelClientReport {
         found: tc_found,
         path: tc_path,
@@ -262,12 +375,12 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
 
     // 4. Configuration
     let config_dir = host::config_dir().display().to_string();
-    let has_key = service::has_key();
-    let key_source = secrets::source().map(|s| s.to_string());
-    let tunnel_id = service::tunnel_id_opt();
+    let has_key = observations.has_key;
+    let key_source = observations.key_source;
+    let tunnel_id = observations.tunnel_id;
     let has_tunnel_id = tunnel_id.is_some();
-    let profile_file = service::profile_file();
-    let profile_exists = profile_file.is_file();
+    let profile_file = observations.profile_file;
+    let profile_exists = observations.profile_exists;
     let profile_path = profile_file.display().to_string();
     let cfg_status = if has_key && has_tunnel_id && profile_exists {
         "ok".to_string()
@@ -288,11 +401,15 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
     };
 
     // 5. Runtime / Supervisor
-    let service_installed = service::installed();
-    let service_status = if service_installed { "enabled".to_string() } else { "off".to_string() };
+    let service_installed = observations.service_installed;
+    let service_status = if service_installed {
+        "enabled".to_string()
+    } else {
+        "off".to_string()
+    };
     let supervisor_name = service::supervisor_name().to_string();
 
-    let probe_ready = service::ready();
+    let probe_ready = observations.probe_ready;
     let health_url = format!("{}/readyz", service::HEALTH_BASE);
     let admin_url = format!("{}/ui", service::HEALTH_BASE);
     let runtime_status = if probe_ready {
@@ -336,12 +453,39 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
         });
     }
 
+    match workspace_report.pin_status.as_str() {
+        "ok" => checks.push(CheckItem {
+            name: "workspace_pin".into(),
+            status: "ok".into(),
+            message: format!(
+                "workspace pin is valid ({})",
+                workspace_report.pin.as_deref().unwrap_or("")
+            ),
+        }),
+        "invalid" => checks.push(CheckItem {
+            name: "workspace_pin".into(),
+            status: "fail".into(),
+            message: format!(
+                "workspace pin is invalid or no longer a directory: {}",
+                workspace_report.pin.as_deref().unwrap_or("")
+            ),
+        }),
+        _ => checks.push(CheckItem {
+            name: "workspace_pin".into(),
+            status: "info".into(),
+            message: "no workspace pin configured; using environment or current directory".into(),
+        }),
+    }
+
     // Check tunnel-client
     if tc_found {
         checks.push(CheckItem {
             name: "tunnel_client".into(),
             status: "ok".into(),
-            message: format!("tunnel-client binary found at {}", tunnel_client_report.path.as_deref().unwrap_or("")),
+            message: format!(
+                "tunnel-client binary found at {}",
+                tunnel_client_report.path.as_deref().unwrap_or("")
+            ),
         });
     } else {
         checks.push(CheckItem {
@@ -356,13 +500,20 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
         checks.push(CheckItem {
             name: "runtime_key".into(),
             status: "ok".into(),
-            message: format!("Runtime API Key present in {}", configuration_report.key_source.as_deref().unwrap_or("storage")),
+            message: format!(
+                "Runtime API Key present in {}",
+                configuration_report
+                    .key_source
+                    .as_deref()
+                    .unwrap_or("storage")
+            ),
         });
     } else {
         checks.push(CheckItem {
             name: "runtime_key".into(),
             status: "warn".into(),
-            message: "Runtime API Key missing (run 'hands setup' or export CONTROL_PLANE_API_KEY)".into(),
+            message: "Runtime API Key missing (run 'hands setup' or export CONTROL_PLANE_API_KEY)"
+                .into(),
         });
     }
 
@@ -377,7 +528,8 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
         checks.push(CheckItem {
             name: "tunnel_id".into(),
             status: "warn".into(),
-            message: "Tunnel ID missing (run 'hands setup' or export CONTROL_PLANE_TUNNEL_ID)".into(),
+            message: "Tunnel ID missing (run 'hands setup' or export CONTROL_PLANE_TUNNEL_ID)"
+                .into(),
         });
     }
 
@@ -412,8 +564,11 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
     }
 
     // Overall OK condition
-    let ok = ws_exists && ws_is_dir && tc_found && has_key && has_tunnel_id;
-    let summary = if ok && probe_ready {
+    let pin_valid = workspace_report.pin_status != "invalid";
+    let ok = ws_exists && ws_is_dir && pin_valid && tc_found && has_key && has_tunnel_id;
+    let summary = if workspace_report.pin_status == "invalid" {
+        "action required: fix invalid workspace pin".to_string()
+    } else if ok && probe_ready {
         "all checks passed, tunnel active".to_string()
     } else if ok {
         "configuration ready, tunnel service not running".to_string()
@@ -441,6 +596,7 @@ pub fn diagnose(workspace: &Path) -> DoctorReport {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -448,7 +604,8 @@ mod tests {
     #[test]
     fn test_doctor_report_json_schema_and_secrecy() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("hands_doc_test_1_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("hands_doc_test_1_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let ws_dir = temp_dir.join("workspace");
         fs::create_dir_all(&ws_dir).expect("create ws");
@@ -519,7 +676,8 @@ mod tests {
     #[test]
     fn test_doctor_missing_components() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("hands_doc_test_2_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("hands_doc_test_2_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let ws_dir = temp_dir.join("workspace");
         fs::create_dir_all(&ws_dir).expect("create ws");
@@ -554,7 +712,8 @@ mod tests {
     #[test]
     fn test_doctor_pinned_workspace() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("hands_doc_test_3_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("hands_doc_test_3_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let ws_dir = temp_dir.join("workspace");
         fs::create_dir_all(&ws_dir).expect("create ws");
@@ -585,7 +744,8 @@ mod tests {
     #[test]
     fn test_doctor_not_a_directory_workspace() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("hands_doc_test_4_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("hands_doc_test_4_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("create temp");
         let file_path = temp_dir.join("file.txt");
@@ -607,7 +767,8 @@ mod tests {
     #[test]
     fn test_doctor_partial_failure_independence() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("hands_doc_test_5_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("hands_doc_test_5_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let ws_dir = temp_dir.join("workspace");
         fs::create_dir_all(&ws_dir).expect("create ws");
@@ -634,12 +795,30 @@ mod tests {
         // Key is missing, but Tunnel ID is found
         assert_eq!(report.configuration.has_key, false);
         assert_eq!(report.configuration.has_tunnel_id, true);
-        assert_eq!(report.configuration.tunnel_id, Some("tunnel_partial_test123".to_string()));
+        assert_eq!(
+            report.configuration.tunnel_id,
+            Some("tunnel_partial_test123".to_string())
+        );
 
         // All checks are populated
-        assert!(report.checks.iter().any(|c| c.name == "workspace" && c.status == "ok"));
-        assert!(report.checks.iter().any(|c| c.name == "runtime_key" && c.status == "warn"));
-        assert!(report.checks.iter().any(|c| c.name == "tunnel_id" && c.status == "ok"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "workspace" && c.status == "ok")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "runtime_key" && c.status == "warn")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "tunnel_id" && c.status == "ok")
+        );
 
         assert_eq!(json["configuration"]["has_key"], false);
         assert_eq!(json["configuration"]["has_tunnel_id"], true);
@@ -649,5 +828,119 @@ mod tests {
             std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
         }
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn deterministic_observations() -> DiagnosticObservations {
+        DiagnosticObservations {
+            pin: None,
+            pin_is_dir: false,
+            tunnel_client_path: Some(PathBuf::from("C:/tools/tunnel-client.exe")),
+            has_key: true,
+            key_source: Some("test credential store".into()),
+            tunnel_id: Some("tunnel_fixture".into()),
+            profile_file: PathBuf::from("C:/config/hands.yaml"),
+            profile_exists: true,
+            service_installed: true,
+            probe_ready: true,
+        }
+    }
+
+    #[test]
+    fn test_deterministic_healthy_diagnostics() {
+        let ws = Path::new("C:/fixture/workspace");
+        let report = diagnose_with_observations(ws, true, true, deterministic_observations());
+
+        assert!(report.ok);
+        assert_eq!(report.workspace.status, "ok");
+        assert_eq!(report.workspace.pin_status, "missing");
+        assert_eq!(report.tunnel_client.status, "ok");
+        assert_eq!(report.configuration.status, "ok");
+        assert_eq!(report.runtime.status, "ready");
+        assert!(report.checks.iter().all(|check| check.status != "fail"));
+    }
+
+    #[test]
+    fn test_deterministic_missing_components_diagnostics() {
+        let mut observations = deterministic_observations();
+        observations.tunnel_client_path = None;
+        observations.has_key = false;
+        observations.key_source = None;
+        observations.tunnel_id = None;
+        observations.profile_exists = false;
+        observations.service_installed = false;
+        observations.probe_ready = false;
+
+        let report =
+            diagnose_with_observations(Path::new("C:/fixture/workspace"), true, true, observations);
+
+        assert!(!report.ok);
+        assert_eq!(report.tunnel_client.status, "missing");
+        assert_eq!(report.configuration.status, "incomplete");
+        assert_eq!(report.runtime.status, "off");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "runtime_key" && check.status == "warn")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "tunnel_client" && check.status == "warn")
+        );
+    }
+
+    #[test]
+    fn test_deterministic_partial_failure_keeps_independent_results() {
+        let mut observations = deterministic_observations();
+        observations.has_key = false;
+        observations.key_source = None;
+
+        let report =
+            diagnose_with_observations(Path::new("C:/fixture/workspace"), true, true, observations);
+
+        assert!(!report.ok);
+        assert_eq!(report.workspace.status, "ok");
+        assert_eq!(report.tunnel_client.status, "ok");
+        assert_eq!(report.runtime.status, "ready");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "runtime_key" && check.status == "warn")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "local_probe" && check.status == "ok")
+        );
+    }
+
+    #[test]
+    fn test_invalid_workspace_pin_is_reported_without_hiding_active_workspace() {
+        let mut observations = deterministic_observations();
+        observations.pin = Some(PathBuf::from("Z:/missing/pinned-workspace"));
+        observations.pin_is_dir = false;
+
+        let report =
+            diagnose_with_observations(Path::new("C:/fixture/fallback"), true, true, observations);
+
+        assert!(!report.ok);
+        assert_eq!(report.workspace.path, "C:/fixture/fallback");
+        assert!(report.workspace.pinned);
+        assert_eq!(
+            report.workspace.pin.as_deref(),
+            Some("Z:/missing/pinned-workspace")
+        );
+        assert_eq!(report.workspace.pin_status, "invalid");
+        assert_eq!(report.summary, "action required: fix invalid workspace pin");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "workspace_pin" && check.status == "fail")
+        );
     }
 }

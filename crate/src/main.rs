@@ -223,8 +223,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report.to_json())
-                        .map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&report.to_json()).map_err(|e| e.to_string())?
                 );
             } else {
                 print!("{}", report.render_human());
