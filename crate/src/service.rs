@@ -68,6 +68,25 @@ pub fn wait_ready(timeout: Duration) -> bool {
     ready()
 }
 
+pub fn supervisor_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Task Scheduler"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "LaunchAgent"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "systemd user unit"
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        "supervisor"
+    }
+}
+
 pub fn status_line() -> String {
     let health = if ready() {
         format!("ready  {HEALTH_BASE}/ui")
@@ -173,9 +192,13 @@ pub fn save_connect(key: Option<&str>, tunnel_id: Option<&str>) -> Result<(), St
     Ok(())
 }
 
+pub fn valid_tunnel_id(id: &str) -> bool {
+    id.starts_with("tunnel_")
+}
+
 pub fn set_tunnel_id(id: &str) -> Result<(), String> {
     let id = id.trim();
-    if !id.starts_with("tunnel_") {
+    if !valid_tunnel_id(id) {
         return Err("tunnel id should look like tunnel_…".into());
     }
     let dir = host::config_dir();
@@ -237,13 +260,13 @@ fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
 fn resolve_tunnel_id() -> Result<String, String> {
     if let Ok(id) = std::env::var("CONTROL_PLANE_TUNNEL_ID") {
         let id = id.trim();
-        if !id.is_empty() {
+        if valid_tunnel_id(id) {
             return Ok(id.to_string());
         }
     }
     if let Ok(id) = fs::read_to_string(host::config_dir().join("tunnel_id")) {
         let id = id.trim();
-        if !id.is_empty() {
+        if valid_tunnel_id(id) {
             return Ok(id.to_string());
         }
     }
@@ -253,7 +276,7 @@ fn resolve_tunnel_id() -> Result<String, String> {
                 let t = line.trim();
                 if let Some(rest) = t.strip_prefix("tunnel_id:") {
                     let id = rest.trim().trim_matches('"').trim();
-                    if !id.is_empty() {
+                    if valid_tunnel_id(id) {
                         return Ok(id.to_string());
                     }
                 }
@@ -986,7 +1009,11 @@ fn tunnel_pid_file() -> PathBuf {
 fn query_process_creation(pid: u32) -> Option<String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
         fn GetProcessTimes(
             hProcess: *mut std::ffi::c_void,
             lpCreationTime: *mut u64,
@@ -1011,9 +1038,7 @@ fn query_process_creation(pid: u32) -> Option<String> {
     let mut exit = 0u64;
     let mut kernel = 0u64;
     let mut user = 0u64;
-    let ok = unsafe {
-        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-    };
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     unsafe { CloseHandle(handle) };
     if ok == 0 {
         return None;
@@ -1400,5 +1425,12 @@ mod tests {
             "profile must contain tunnel id: {read}"
         );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_valid_tunnel_id() {
+        assert!(valid_tunnel_id("tunnel_123456789"));
+        assert!(!valid_tunnel_id("invalid_tunnel_id"));
+        assert!(!valid_tunnel_id(""));
     }
 }

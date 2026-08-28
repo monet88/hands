@@ -1,6 +1,7 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
 mod build_provenance;
+mod doctor;
 mod host;
 mod host_env;
 mod mcp;
@@ -24,6 +25,7 @@ Hands — unofficial ChatGPT plugin (local tools, no model)
   hands config --open              serve UI and open it
   cd /repo && hands use            pin this folder
   hands status [--json]
+  hands doctor [--json]
   hands enable | disable | start | stop
   hands                            MCP stdio (ChatGPT tunnel)
 
@@ -39,6 +41,7 @@ enum Cmd {
     Config { addr: SocketAddr, open: bool },
     Use { dir: PathBuf },
     Status { json: bool },
+    Doctor { json: bool },
     Enable,
     Disable,
     Start,
@@ -101,6 +104,8 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             },
             [op] if op == "status" => Cmd::Status { json: false },
             [op, flag] if op == "status" && flag == "--json" => Cmd::Status { json: true },
+            [op] if op == "doctor" => Cmd::Doctor { json: false },
+            [op, flag] if op == "doctor" && flag == "--json" => Cmd::Doctor { json: true },
             [op] if op == "enable" => Cmd::Enable,
             [op] if op == "disable" => Cmd::Disable,
             [op] if op == "start" => Cmd::Start,
@@ -209,6 +214,19 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                         .unwrap_or_else(|| "(none — using cwd/env)".into())
                 );
                 println!("tunnel     {}", service::status_line());
+            }
+            Ok(())
+        }
+        Cmd::Doctor { json } => {
+            let cwd = host::resolve_workspace(&fallback);
+            let report = doctor::diagnose(&cwd);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report.to_json()).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", report.render_human());
             }
             Ok(())
         }
