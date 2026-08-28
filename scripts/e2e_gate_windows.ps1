@@ -144,22 +144,36 @@ function Assert-TerminalSuccess([string]$text, [string]$label) {
 }
 
 function Parse-EmbeddedJson([string]$raw, [string]$label) {
-    $objStart = $raw.IndexOf("{")
-    $arrStart = $raw.IndexOf("[")
-    $start = -1
-    $end = -1
-    if ($objStart -ge 0 -and ($arrStart -lt 0 -or $objStart -lt $arrStart)) {
-        $start = $objStart
-        $end = $raw.LastIndexOf("}")
-    } elseif ($arrStart -ge 0) {
-        $start = $arrStart
-        $end = $raw.LastIndexOf("]")
+    # Native CLIs can write diagnostics before their JSON payload, and Hands
+    # can append task metadata after it. Scan each object/array candidate and
+    # stop at its balanced closing delimiter. Crashpad diagnostics on Windows
+    # also begin with '[', so invalid candidates are skipped rather than
+    # assumed to be the payload.
+    for ($start = 0; $start -lt $raw.Length; $start++) {
+        $open = $raw[$start]
+        if ($open -ne '{' -and $open -ne '[') { continue }
+        $close = if ($open -eq '{') { '}' } else { ']' }
+        $depth = 0
+        $inString = $false
+        $escaped = $false
+        for ($i = $start; $i -lt $raw.Length; $i++) {
+            $ch = $raw[$i]
+            if ($inString) {
+                if ($escaped) { $escaped = $false; continue }
+                if ($ch -eq '\') { $escaped = $true; continue }
+                if ($ch -eq '"') { $inString = $false }
+                continue
+            }
+            if ($ch -eq '"') { $inString = $true; continue }
+            if ($ch -eq $open) { $depth++; continue }
+            if ($ch -ne $close) { continue }
+            $depth--
+            if ($depth -ne 0) { continue }
+            $jsonText = $raw.Substring($start, $i - $start + 1)
+            try { return $jsonText | ConvertFrom-Json } catch { break }
+        }
     }
-    if ($start -lt 0 -or $end -lt $start) {
-        throw "$label produced no complete JSON payload: $raw"
-    }
-    $jsonText = $raw.Substring($start, $end - $start + 1)
-    try { return $jsonText | ConvertFrom-Json } catch { throw "$label returned invalid JSON: $jsonText" }
+    throw "$label produced no valid embedded JSON payload: $raw"
 }
 
 function Validate-ChatGPTEvidence {

@@ -17,12 +17,16 @@ pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
 pub const PROFILE: &str = "hands";
 const TUNNEL_CHILD_ENV_REMOVE: &[&str] = &[
+    "CONTROL_PLANE_BASE_URL",
+    "CONTROL_PLANE_URL_PATH",
+    "LOG_HTTP_RAW_UNSAFE",
     "MCP_SERVER_URL",
     "MCP_COMMAND",
     "TUNNEL_CLIENT_CONFIG",
     "TUNNEL_CLIENT_PROFILE",
     "TUNNEL_CLIENT_PROFILE_FILE",
     "TUNNEL_CLIENT_PROFILE_DIR",
+    "XDG_CONFIG_HOME",
     "HEALTH_LISTEN_ADDR",
     "HEALTH_UNIX_SOCKET",
     "HEALTH_URL_FILE",
@@ -1115,7 +1119,12 @@ pub fn run_tunnel_daemon() -> Result<(), String> {
         write_profile(&fake_key_path, &harness, &tunnel_id)?;
 
         let mut cmd = Command::new(&client);
-        cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
+        cmd.arg("run")
+            .arg("--profile")
+            .arg(PROFILE)
+            .arg("--profile-dir")
+            .arg(host::tunnel_client_dir())
+            .arg("--log.level=warn");
         // Hands owns the MCP target and fixed health endpoint in its profile.
         // Do not let unrelated parent-shell/app environment overrides replace
         // that stdio target (for example MCP_SERVER_URL from a local bridge)
@@ -1288,11 +1297,14 @@ mod tests {
     #[test]
     fn test_tunnel_child_env_scrubs_profile_owned_overrides() {
         for required in [
+            "CONTROL_PLANE_URL_PATH",
+            "LOG_HTTP_RAW_UNSAFE",
             "MCP_SERVER_URL",
             "MCP_COMMAND",
             "TUNNEL_CLIENT_CONFIG",
             "TUNNEL_CLIENT_PROFILE_FILE",
             "TUNNEL_CLIENT_PROFILE_DIR",
+            "XDG_CONFIG_HOME",
             "HEALTH_LISTEN_ADDR",
             "HEALTH_UNIX_SOCKET",
         ] {
@@ -1301,6 +1313,14 @@ mod tests {
                 "missing profile-owned env scrub: {required}"
             );
         }
+    }
+
+    #[test]
+    fn test_tunnel_child_env_scrubs_control_plane_base_url() {
+        assert!(
+            TUNNEL_CHILD_ENV_REMOVE.contains(&"CONTROL_PLANE_BASE_URL"),
+            "CONTROL_PLANE_BASE_URL must not override the Hands-owned control-plane endpoint"
+        );
     }
 
     #[test]
