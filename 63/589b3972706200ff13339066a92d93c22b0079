@@ -1,0 +1,16 @@
+crate/src/service.rs
+  h_17f2fa2b92da6a 20-22,29,1122-1127,1300-1301,1307,1318-1325
+scripts/e2e_gate_windows.ps1
+  h_17f2fa2b92da6a 147-174,176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "63589b3972706200ff13339066a92d93c22b0079",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
