@@ -28,9 +28,9 @@ if ($LASTEXITCODE -ne 0 -or -not $HeadSha) {
     Write-Error "Unable to resolve Hands repository HEAD."
     exit 1
 }
-$TrackedDirty = (& git -C $RepoRoot status --porcelain --untracked-files=no) | Out-String
+$TrackedDirty = (& git -C $RepoRoot status --porcelain --untracked-files=all) | Out-String
 if (-not $LocalOnly -and -not [string]::IsNullOrWhiteSpace($TrackedDirty)) {
-    Write-Error "Issue #8 acceptance requires a clean tracked worktree at exact HEAD."
+    Write-Error "Issue #8 acceptance requires a clean worktree at exact HEAD."
     exit 1
 }
 $HandsSha256 = (Get-FileHash -Path $HandsBin -Algorithm SHA256).Hash.ToLower()
@@ -335,7 +335,7 @@ try {
     $script:ControlDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hands_e2e_control_" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $script:ControlDir | Out-Null
     $fakeTunnel = Join-Path $script:ControlDir "tunnel-client.exe"
-    Copy-Item -Path (Join-Path $PSHOME "powershell.exe") -Destination $fakeTunnel
+    Copy-Item -Path ((Get-Command powershell.exe -ErrorAction Stop).Source) -Destination $fakeTunnel
     $script:ControlProc = Start-Process -FilePath $fakeTunnel -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 900") -PassThru
     Start-Sleep -Milliseconds 500
     if ($script:ControlProc.HasExited) { throw "Unrelated tunnel-client.exe fixture failed to start." }
