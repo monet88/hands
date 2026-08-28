@@ -1,0 +1,20 @@
+README.md
+  h_17f2fa2b92da6a 124
+crate/src/main.rs
+  h_17f2fa2b92da6a 8,246-251,253,263-270
+crate/src/mcp.rs
+  h_17f2fa2b92da6a 163,207-210
+crate/src/run_proc.rs
+  h_17f2fa2b92da6a 1-487
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2a198ab5f8b7340627a26a2c14bd2ce26fc32109",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
