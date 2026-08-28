@@ -1,0 +1,26 @@
+crate/src/host.rs
+  h_17f2fa2b92da6a 21-44
+crate/src/main.rs
+  h_17f2fa2b92da6a 140-157,245
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 32-39,290,315,348
+crate/src/service.rs
+  h_17f2fa2b92da6a 882-889,904,950,964,972,987-1007,1010-1019,1021
+crate/src/setup.rs
+  h_17f2fa2b92da6a 23,46
+crate/src/watch.rs
+  h_17f2fa2b92da6a 24
+scripts/e2e_gate_windows.ps1
+  h_17f2fa2b92da6a 148-151,173-177,180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "136dc06a6a812fca49b669db45bca0a57ebf4c6d",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
