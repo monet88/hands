@@ -175,6 +175,7 @@ pub fn status_json(workspace: &Path) -> serde_json::Value {
         "name": host::DISPLAY,
         "unofficial": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "source_git_sha": crate::build_provenance::SOURCE_GIT_SHA,
         "workspace": workspace.display().to_string(),
         "pin": pin.as_ref().map(|p| p.display().to_string()),
         "tunnel_ready": ready(),
@@ -348,6 +349,29 @@ fn harness_bin() -> Result<PathBuf, String> {
 }
 
 pub fn tunnel_client_bin() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        // The Windows installer owns a pinned, verified tunnel-client next to
+        // hands.exe, including custom HANDS_PREFIX installs. Prefer that exact
+        // sibling before consulting PATH so an unrelated earlier PATH entry
+        // can never receive the Runtime Key in the normal installed flow.
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            let sibling = parent.join("tunnel-client.exe");
+            if sibling.is_file() {
+                return Ok(sibling);
+            }
+        }
+        // Preserve the standard install location as a fallback for callers
+        // whose executable path cannot be resolved normally.
+        if let Some(local) = dirs::data_local_dir() {
+            let managed = local.join("Programs/hands/bin/tunnel-client.exe");
+            if managed.is_file() {
+                return Ok(managed);
+            }
+        }
+    }
     which("tunnel-client").ok_or_else(|| {
         if cfg!(windows) {
             "tunnel-client.exe not found. Run install.ps1 or place tunnel-client.exe in PATH".into()
@@ -814,7 +838,10 @@ fn install_supervisor() -> Result<(), String> {
     }
     fs::write(&xml_path, &xml).map_err(|e| format!("write {}: {e}", xml_path.display()))?;
 
-    stop_unmanaged();
+    // A previous scheduled `hands run-tunnel` may be inside its own retry
+    // loop. End the owning Task Scheduler instance before replacing the task
+    // definition, then clean up only its recorded tunnel-client tree.
+    stop_supervisor()?;
 
     let out = Command::new("schtasks")
         .args([
@@ -1052,20 +1079,24 @@ Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
 
 pub fn run_tunnel_daemon() -> Result<(), String> {
     host::migrate_from_legacy();
-    let key = crate::secrets::get().ok_or_else(|| {
-        "missing runtime key. run hands setup, or export CONTROL_PLANE_API_KEY".to_string()
-    })?;
-    let tunnel_id = resolve_tunnel_id()?;
     let harness = harness_bin()?;
     let client = tunnel_client_bin()?;
     let fake_key_path = crate::secrets::key_file();
-    write_profile(&fake_key_path, &harness, &tunnel_id)?;
 
     // Continuous supervision: if the tunnel-client exits unexpectedly, restart
     // with backoff so the Task Scheduler RestartOnFailure cap (now 999) is not
     // the sole recovery path. This satisfies the "reliable login/restart
     // supervisor" requirement without ever leaving Hands down permanently.
     loop {
+        // Reload both values before every spawn. Runtime keys and Tunnel IDs
+        // can be rotated while the supervisor remains alive; a retry must not
+        // keep using stale credentials/configuration.
+        let key = crate::secrets::get().ok_or_else(|| {
+            "missing runtime key. run hands setup, or export CONTROL_PLANE_API_KEY".to_string()
+        })?;
+        let tunnel_id = resolve_tunnel_id()?;
+        write_profile(&fake_key_path, &harness, &tunnel_id)?;
+
         let mut cmd = Command::new(&client);
         cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
         cmd.env("CONTROL_PLANE_API_KEY", &key);
@@ -1087,14 +1118,6 @@ pub fn run_tunnel_daemon() -> Result<(), String> {
         }
         eprintln!("tunnel-client exited with status: {status}; restarting in 5s...");
         std::thread::sleep(Duration::from_secs(5));
-        // Re-validate credentials/tunnel_id in case they were rotated.
-        // If they become invalid, break and surface error.
-        if crate::secrets::get().is_none() {
-            return Err("runtime key missing after restart".into());
-        }
-        if resolve_tunnel_id().is_err() {
-            return Err("tunnel id missing after restart".into());
-        }
     }
 }
 

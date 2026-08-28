@@ -99,14 +99,15 @@ Write-Host "Installed: $DestBin"
 & $DestBin --version
 Write-Host ""
 
-# 5. Ensure $Prefix is on User PATH
+# 5. Ensure the managed Hands prefix is first on User PATH. This keeps the
+# pinned hands.exe / tunnel-client.exe ahead of unrelated same-name binaries.
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
-$PathEntries = $UserPath -split ';' | Where-Object { $_ -ne "" }
-if ($PathEntries -notcontains $Prefix) {
-    Write-Host "Adding $Prefix to User PATH..."
-    $NewUserPath = "$UserPath;$Prefix"
+$PathEntries = @($UserPath -split ';' | Where-Object { $_ -and $_ -ine $Prefix })
+$NewUserPath = (@($Prefix) + $PathEntries) -join ';'
+if ($UserPath -ne $NewUserPath) {
+    Write-Host "Putting $Prefix first on User PATH..."
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [EnvironmentVariableTarget]::User)
-    $env:Path = "$env:Path;$Prefix"
+    $env:Path = "$Prefix;$env:Path"
     # Broadcast WM_SETTINGCHANGE so Explorer-launched terminals see the new PATH without shell restart.
     try {
         Add-Type @"
@@ -127,82 +128,59 @@ public class EnvBroadcast {
     Write-Host "$Prefix already on User PATH."
 }
 
-# 6. Locate or download official tunnel-client.exe (always use pinned verified artifact; never trust unverified PATH entry with Runtime Key)
+# 6. Download and verify the pinned official tunnel-client.exe on every install.
+# Never trust an existing PATH entry or cached executable with the Runtime Key.
 $VerifiedBin = Join-Path $Prefix "tunnel-client.exe"
-$TunnelClientCandidate = Get-Command tunnel-client -ErrorAction SilentlyContinue
-if ($TunnelClientCandidate) {
-    $candidatePath = $TunnelClientCandidate.Source
-    if ($candidatePath -ine $VerifiedBin) {
-        Write-Host "Found tunnel-client on PATH at $candidatePath, but will use/install verified pinned artifact at $VerifiedBin"
-    }
-}
-# Ensure verified pinned artifact exists at $VerifiedBin
-$needDownload = $true
-if (Test-Path $VerifiedBin) {
-    # If already cached, keep it but ensure it came from verified source.
-    # The SHA of the zip is verified on download; an existing $VerifiedBin is trusted only if it was placed by this installer.
-    # For hermeticity we still prefer to re-verify on demand if HANDS_VERIFY_TUNNEL_CLIENT env is set, otherwise reuse.
-    $needDownload = $false
-    Write-Host "Verified tunnel-client already at $VerifiedBin (pinned $TunnelClientVersion)"
-}
-if ($needDownload) {
+$TempZip = Join-Path ([System.IO.Path]::GetTempPath()) ("tunnel-client-" + [System.Guid]::NewGuid().ToString("N") + ".zip")
+$ExtractDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tunnel-client-extract-" + [System.Guid]::NewGuid().ToString("N"))
+try {
     Write-Host "Downloading pinned official OpenAI artifact ($TunnelClientVersion)..."
-    $TempZip = Join-Path ([System.IO.Path]::GetTempPath()) ("tunnel-client-" + [System.Guid]::NewGuid().ToString("N") + ".zip")
-    try {
-        Invoke-WebRequest -Uri $TunnelClientZipUrl -OutFile $TempZip -UseBasicParsing
-        $ActualHash = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
-        if ($ActualHash -ne $TunnelClientExpectedSha256.ToLower()) {
-            Remove-Item -Path $TempZip -Force -ErrorAction SilentlyContinue
-            Write-Error "SHA-256 verification failed for downloaded tunnel-client artifact. Expected: $TunnelClientExpectedSha256, got: $ActualHash"
+    Invoke-WebRequest -Uri $TunnelClientZipUrl -OutFile $TempZip -UseBasicParsing
+    $ActualHash = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
+    if ($ActualHash -ne $TunnelClientExpectedSha256.ToLower()) {
+        Write-Error "SHA-256 verification failed for downloaded tunnel-client artifact. Expected: $TunnelClientExpectedSha256, got: $ActualHash"
+        exit 1
+    }
+    Write-Host "Verified archive SHA-256: $ActualHash"
+
+    Expand-Archive -Path $TempZip -DestinationPath $ExtractDir -Force
+    $ExtractedExe = Get-ChildItem -Path $ExtractDir -Filter "tunnel-client.exe" -Recurse | Select-Object -First 1
+    if (-not $ExtractedExe) {
+        Write-Error "tunnel-client.exe not found in downloaded zip archive."
+        exit 1
+    }
+
+    $ExpectedExeHash = (Get-FileHash -Path $ExtractedExe.FullName -Algorithm SHA256).Hash.ToLower()
+    $ExistingExeHash = if (Test-Path $VerifiedBin) {
+        (Get-FileHash -Path $VerifiedBin -Algorithm SHA256).Hash.ToLower()
+    } else {
+        $null
+    }
+    if ($ExistingExeHash -eq $ExpectedExeHash) {
+        Write-Host "Existing tunnel-client.exe matches the verified pinned artifact."
+    } else {
+        Copy-Item -Path $ExtractedExe.FullName -Destination $VerifiedBin -Force
+        $InstalledHash = (Get-FileHash -Path $VerifiedBin -Algorithm SHA256).Hash.ToLower()
+        if ($InstalledHash -ne $ExpectedExeHash) {
+            Write-Error "Installed tunnel-client.exe hash mismatch after copy."
             exit 1
         }
-        Write-Host "Verified SHA-256: $ActualHash"
-        $ExtractDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tunnel-client-extract-" + [System.Guid]::NewGuid().ToString("N"))
-        Expand-Archive -Path $TempZip -DestinationPath $ExtractDir -Force
-        $ExtractedExe = Get-ChildItem -Path $ExtractDir -Filter "tunnel-client.exe" -Recurse | Select-Object -First 1
-        if ($ExtractedExe) {
-            Copy-Item -Path $ExtractedExe.FullName -Destination $VerifiedBin -Force
-            Write-Host "Installed verified tunnel-client.exe to $VerifiedBin"
-        } else {
-            Write-Error "tunnel-client.exe not found in downloaded zip archive."
-            exit 1
-        }
+        Write-Host "Installed verified tunnel-client.exe to $VerifiedBin"
+    }
+} finally {
+    if (Test-Path $TempZip) {
+        Remove-Item -Path $TempZip -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $ExtractDir) {
         Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
-    } finally {
-        if (Test-Path $TempZip) {
-            Remove-Item -Path $TempZip -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 Write-Host "tunnel-client ready: $VerifiedBin"
 
-# 7. Register Hands AUMID for Windows toast notifications (no UAC required)
-# Create Start Menu shortcut with AppUserModelID "Hands" so CreateToastNotifier('Hands') works for unpackaged install.
-try {
-    $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Hands"
-    New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
-    $ShortcutPath = Join-Path $StartMenuDir "Hands.lnk"
-    $WshShell = New-Object -ComObject WScript.Shell
-    $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = $DestBin
-    $Shortcut.WorkingDirectory = Split-Path $DestBin
-    $Shortcut.Description = "Hands - ChatGPT tunnel"
-    $Shortcut.Save()
-    # Set AppUserModelID via Shell property store (requires Windows 10+)
-    try {
-        $shellApp = New-Object -ComObject Shell.Application
-        $folder = $shellApp.Namespace($StartMenuDir)
-        $item = $folder.ParseName("Hands.lnk")
-        # PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5
-        # Setting via extended property not trivial from PowerShell; fallback is registry-based AUMID.
-        # As a user-level fallback, ensure notification fallback path in watch.rs handles unregistered case.
-    } catch {}
-    Write-Host "Registered Hands AUMID shortcut: $ShortcutPath"
-} catch {
-    Write-Host "Note: could not register toast shortcut (non-fatal): $_"
-}
-
-# 8. Setup check or next steps (check $LASTEXITCODE: native exe non-zero does not throw)
+# 7. Setup check or next steps (check $LASTEXITCODE: native exe non-zero does not throw)
+# Windows disconnect notifications use the user-level NotifyIcon fallback when
+# an unpackaged WinRT AppUserModelID is unavailable, so installation does not
+# claim or depend on an AUMID registration it cannot actually establish.
 if ($env:CONTROL_PLANE_API_KEY -and $env:CONTROL_PLANE_TUNNEL_ID) {
     & $DestBin setup
     if ($LASTEXITCODE -ne 0) {

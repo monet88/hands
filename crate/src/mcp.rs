@@ -194,7 +194,11 @@ impl McpHost {
             return Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": format!("workspace: {}", cwd.display())
+                    "text": format!(
+                        "workspace: {}\nsource_git_sha: {}",
+                        cwd.display(),
+                        crate::build_provenance::SOURCE_GIT_SHA
+                    )
                 }],
                 "isError": false
             }));

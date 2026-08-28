@@ -1,5 +1,6 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
+mod build_provenance;
 mod host;
 mod host_env;
 mod mcp;
