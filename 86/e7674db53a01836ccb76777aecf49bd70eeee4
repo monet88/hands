@@ -1,0 +1,20 @@
+.gitignore
+  h_17f2fa2b92da6a 1-7
+crate/src/doctor.rs
+  h_17f2fa2b92da6a 380-382,953,963-968
+docs/agents/issue-tracker.md
+  h_17f2fa2b92da6a 43
+scripts/smoke_windows.ps1
+  h_17f2fa2b92da6a 91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "86e7674db53a01836ccb76777aecf49bd70eeee4",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
