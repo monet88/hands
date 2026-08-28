@@ -1,0 +1,18 @@
+crate/src/main.rs
+  h_17f2fa2b92da6a 46,94,161
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 2,5,28-33,36-57,71-88,90,94-107,122,138,142-145,148,176,180-184,187,201,227-375
+crate/src/service.rs
+  h_17f2fa2b92da6a 23-26,193-201,246,252-256,262,435-445,727-945,947,950,952,955,960,965,1029,1034-1035,1056-1128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d68d538b6d48efeced5ab2257718f9a664fdfee6",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
