@@ -20,6 +20,8 @@ pub const PROFILE: &str = "hands";
 const LABEL: &str = "dev.hands.tunnel";
 #[cfg(target_os = "macos")]
 const WATCH_LABEL: &str = "dev.hands.watch";
+#[cfg(target_os = "macos")]
+const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
 #[cfg(windows)]
 const TASK_NAME: &str = "dev.hands.tunnel";
 #[cfg(windows)]
