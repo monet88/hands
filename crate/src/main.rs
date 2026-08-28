@@ -1,6 +1,7 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
 mod host;
+mod host_env;
 mod mcp;
 mod secrets;
 mod service;
@@ -114,6 +115,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
 
 #[tokio::main]
 async fn main() {
+    host::compose_host_path();
     host::migrate_from_legacy();
     let (fallback, cmd) = match parse_args() {
         Ok(v) => v,
