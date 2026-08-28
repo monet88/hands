@@ -1,0 +1,30 @@
+docs/adr/0001-windows-task-scheduler-supervisor.md
+  h_17f2fa2b92da6a 1-11
+CONTEXT.md
+  h_17f2fa2b92da6a 1-25
+AGENTS.md
+  h_17f2fa2b92da6a 22-35
+docs/agents/issue-tracker.md
+  h_17f2fa2b92da6a 1-45
+docs/agents/triage-labels.md
+  h_17f2fa2b92da6a 1-15
+.gitignore
+  h_17f2fa2b92da6a 6-7
+docs/agents/domain.md
+  h_17f2fa2b92da6a 1-51
+install.ps1
+  h_17f2fa2b92da6a 1-100
+scripts/inject.py
+  h_17f2fa2b92da6a 44-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "93e61241f7954feaea8248014f4d484560a02ecd",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
