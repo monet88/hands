@@ -377,7 +377,9 @@ fn diagnose_with_observations(
     let config_dir = host::config_dir().display().to_string();
     let has_key = observations.has_key;
     let key_source = observations.key_source;
-    let tunnel_id = observations.tunnel_id;
+    let tunnel_id = observations
+        .tunnel_id
+        .filter(|id| service::valid_tunnel_id(id));
     let has_tunnel_id = tunnel_id.is_some();
     let profile_file = observations.profile_file;
     let profile_exists = observations.profile_exists;
@@ -948,7 +950,7 @@ mod tests {
     #[test]
     fn test_malformed_tunnel_id_is_treated_as_missing() {
         let mut observations = deterministic_observations();
-        observations.tunnel_id = None;
+        observations.tunnel_id = Some("malformed_id".to_string());
         let report = diagnose_with_observations(
             Path::new("C:/fixture/workspace"),
             true,
@@ -958,6 +960,12 @@ mod tests {
         assert!(!report.ok);
         assert_eq!(report.configuration.has_tunnel_id, false);
         assert_eq!(report.configuration.tunnel_id, None);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "tunnel_id" && check.status == "warn")
+        );
     }
 
     #[test]

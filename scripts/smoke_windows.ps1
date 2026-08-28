@@ -88,7 +88,7 @@ function Test-HasProperty($obj, [string]$prop) {
 }
 
 if (-not (Test-HasProperty $Doctor "name") -or $Doctor.name -ne "Hands" -or
-    -not (Test-HasProperty $Doctor "ok") -or
+    -not (Test-HasProperty $Doctor "ok") -or -not ($Doctor.ok -is [bool]) -or
     -not (Test-HasProperty $Doctor "summary") -or
     -not (Test-HasProperty $Doctor "checks") -or
     -not ($Doctor.checks -is [System.Collections.IEnumerable] -and -not ($Doctor.checks -is [string]))) {
