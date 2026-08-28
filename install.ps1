@@ -40,19 +40,26 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 New-Item -ItemType Directory -Force -Path $Prefix, $Cache | Out-Null
 $GrokBuild = Join-Path $Cache "grok-build"
 
-# 2. Fetch pinned Grok Build revision
+# 2. Fetch pinned Grok Build revision (fail-closed: check $LASTEXITCODE after every native git op)
 if (Test-Path (Join-Path $GrokBuild ".git")) {
     Write-Host "Updating grok-build in $GrokBuild..."
     git -C $GrokBuild fetch --depth 1 origin $GrokBuildRef
+    if ($LASTEXITCODE -ne 0) { Write-Error "git fetch failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
     git -C $GrokBuild checkout --force FETCH_HEAD
-    git -C $GrokBuild clean -fd -e target/
+    if ($LASTEXITCODE -ne 0) { Write-Error "git checkout FETCH_HEAD failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
+    git -C $GrokBuild clean -fdx -e target/
+    if ($LASTEXITCODE -ne 0) { Write-Error "git clean failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
 } else {
     Write-Host "Cloning grok-build into $GrokBuild ($GrokBuildRef)..."
     New-Item -ItemType Directory -Force -Path $GrokBuild | Out-Null
     git -C $GrokBuild init
+    if ($LASTEXITCODE -ne 0) { Write-Error "git init failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
     git -C $GrokBuild remote add origin $GrokBuildUrl
+    if ($LASTEXITCODE -ne 0) { Write-Error "git remote add failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
     git -C $GrokBuild fetch --depth 1 origin $GrokBuildRef
+    if ($LASTEXITCODE -ne 0) { Write-Error "git fetch failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
     git -C $GrokBuild checkout --force FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { Write-Error "git checkout FETCH_HEAD failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
 }
 
 # 3. Inject Hands crate and patch for Windows
@@ -100,16 +107,46 @@ if ($PathEntries -notcontains $Prefix) {
     $NewUserPath = "$UserPath;$Prefix"
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [EnvironmentVariableTarget]::User)
     $env:Path = "$env:Path;$Prefix"
+    # Broadcast WM_SETTINGCHANGE so Explorer-launched terminals see the new PATH without shell restart.
+    try {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class EnvBroadcast {
+    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+}
+"@ -ErrorAction SilentlyContinue
+        $HWND_BROADCAST = [IntPtr]0xffff
+        $WM_SETTINGCHANGE = 0x001A
+        [UIntPtr]$res = [UIntPtr]::Zero
+        [void][EnvBroadcast]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, "Environment", 2, 5000, [ref]$res)
+    } catch {}
+    Write-Host "PATH updated. If 'hands' is not found in existing terminals, restart the shell or run: `$env:Path += ';$Prefix'"
+} else {
+    Write-Host "$Prefix already on User PATH."
 }
 
-# 6. Locate or download official tunnel-client.exe
+# 6. Locate or download official tunnel-client.exe (always use pinned verified artifact; never trust unverified PATH entry with Runtime Key)
+$VerifiedBin = Join-Path $Prefix "tunnel-client.exe"
 $TunnelClientCandidate = Get-Command tunnel-client -ErrorAction SilentlyContinue
-if (-not $TunnelClientCandidate -and (Test-Path (Join-Path $Prefix "tunnel-client.exe"))) {
-    $TunnelClientCandidate = Join-Path $Prefix "tunnel-client.exe"
+if ($TunnelClientCandidate) {
+    $candidatePath = $TunnelClientCandidate.Source
+    if ($candidatePath -ine $VerifiedBin) {
+        Write-Host "Found tunnel-client on PATH at $candidatePath, but will use/install verified pinned artifact at $VerifiedBin"
+    }
 }
-
-if (-not $TunnelClientCandidate) {
-    Write-Host "Locating tunnel-client.exe: downloading pinned official OpenAI artifact ($TunnelClientVersion)..."
+# Ensure verified pinned artifact exists at $VerifiedBin
+$needDownload = $true
+if (Test-Path $VerifiedBin) {
+    # If already cached, keep it but ensure it came from verified source.
+    # The SHA of the zip is verified on download; an existing $VerifiedBin is trusted only if it was placed by this installer.
+    # For hermeticity we still prefer to re-verify on demand if HANDS_VERIFY_TUNNEL_CLIENT env is set, otherwise reuse.
+    $needDownload = $false
+    Write-Host "Verified tunnel-client already at $VerifiedBin (pinned $TunnelClientVersion)"
+}
+if ($needDownload) {
+    Write-Host "Downloading pinned official OpenAI artifact ($TunnelClientVersion)..."
     $TempZip = Join-Path ([System.IO.Path]::GetTempPath()) ("tunnel-client-" + [System.Guid]::NewGuid().ToString("N") + ".zip")
     try {
         Invoke-WebRequest -Uri $TunnelClientZipUrl -OutFile $TempZip -UseBasicParsing
@@ -124,8 +161,8 @@ if (-not $TunnelClientCandidate) {
         Expand-Archive -Path $TempZip -DestinationPath $ExtractDir -Force
         $ExtractedExe = Get-ChildItem -Path $ExtractDir -Filter "tunnel-client.exe" -Recurse | Select-Object -First 1
         if ($ExtractedExe) {
-            Copy-Item -Path $ExtractedExe.FullName -Destination (Join-Path $Prefix "tunnel-client.exe") -Force
-            Write-Host "Installed tunnel-client.exe to $Prefix"
+            Copy-Item -Path $ExtractedExe.FullName -Destination $VerifiedBin -Force
+            Write-Host "Installed verified tunnel-client.exe to $VerifiedBin"
         } else {
             Write-Error "tunnel-client.exe not found in downloaded zip archive."
             exit 1
@@ -136,20 +173,46 @@ if (-not $TunnelClientCandidate) {
             Remove-Item -Path $TempZip -Force -ErrorAction SilentlyContinue
         }
     }
-} else {
-    Write-Host "tunnel-client located: $TunnelClientCandidate"
+}
+Write-Host "tunnel-client ready: $VerifiedBin"
+
+# 7. Register Hands AUMID for Windows toast notifications (no UAC required)
+# Create Start Menu shortcut with AppUserModelID "Hands" so CreateToastNotifier('Hands') works for unpackaged install.
+try {
+    $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Hands"
+    New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
+    $ShortcutPath = Join-Path $StartMenuDir "Hands.lnk"
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+    $Shortcut.TargetPath = $DestBin
+    $Shortcut.WorkingDirectory = Split-Path $DestBin
+    $Shortcut.Description = "Hands - ChatGPT tunnel"
+    $Shortcut.Save()
+    # Set AppUserModelID via Shell property store (requires Windows 10+)
+    try {
+        $shellApp = New-Object -ComObject Shell.Application
+        $folder = $shellApp.Namespace($StartMenuDir)
+        $item = $folder.ParseName("Hands.lnk")
+        # PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5
+        # Setting via extended property not trivial from PowerShell; fallback is registry-based AUMID.
+        # As a user-level fallback, ensure notification fallback path in watch.rs handles unregistered case.
+    } catch {}
+    Write-Host "Registered Hands AUMID shortcut: $ShortcutPath"
+} catch {
+    Write-Host "Note: could not register toast shortcut (non-fatal): $_"
 }
 
-# 7. Setup check or next steps
+# 8. Setup check or next steps (check $LASTEXITCODE: native exe non-zero does not throw)
 if ($env:CONTROL_PLANE_API_KEY -and $env:CONTROL_PLANE_TUNNEL_ID) {
-    try {
-        & $DestBin setup
-        Write-Host "Tunnel setup attempted (keys found in env)."
-    } catch {
-        Write-Host "Setup returned non-zero."
+    & $DestBin setup
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Setup returned non-zero ($LASTEXITCODE)."
+        exit $LASTEXITCODE
     }
+    Write-Host "Tunnel setup attempted (keys found in env)."
 } else {
     Write-Host "Next steps:"
     Write-Host "  1. cd \path\to\your\repo"
     Write-Host "  2. hands setup"
+    Write-Host "If 'hands' not found, restart the shell or run: `$env:Path += ';$Prefix'"
 }

@@ -30,7 +30,11 @@ pub fn run(dir: &Path) -> Result<(), String> {
     eprintln!("Hands setup");
     check("workspace", true, &cwd.display().to_string());
     check("tunnel-client", client_ok, client_msg);
-    check("runtime key", key_ok, if key_ok { "saved" } else { "missing" });
+    check(
+        "runtime key",
+        key_ok,
+        if key_ok { "saved" } else { "missing" },
+    );
     check("tunnel id", id_ok, if id_ok { "saved" } else { "missing" });
 
     if !client_ok {
@@ -110,7 +114,9 @@ fn read_secret() -> Result<Option<String>, String> {
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let mut mode = 0u32;
     if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        return Err("hidden input unavailable: not a console (run hands setup in a terminal)".into());
+        return Err(
+            "hidden input unavailable: not a console (run hands setup in a terminal)".into(),
+        );
     }
     // Restore the original console mode on every exit path — including read
     // errors and panics — via a guard.

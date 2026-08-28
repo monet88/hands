@@ -234,25 +234,28 @@ pub fn compose_host_path() {
 /// file: if the user opts in (HANDS_MIGRATE_LEGACY_KEY=1), it is migrated
 /// into the Credential Manager and the plaintext source is deleted. Ordinary
 /// config (workspace pin) copies as-is.
+/// Workspace migration and optional Runtime Key migration are independent
+/// so an existing workspace pin does not block an explicit key migration.
 pub fn migrate_from_legacy() {
     let dest = config_dir();
-    if dest.join("workspace").is_file() || dest.join("control-plane.key").is_file() {
-        return;
-    }
     let src = home_dir().join(".config/grok-harness");
     if !src.is_dir() {
         return;
     }
     let _ = std::fs::create_dir_all(&dest);
-    // Workspace pin: ordinary config, safe to copy.
-    let from = src.join("workspace");
-    let to = dest.join("workspace");
-    if from.is_file() && !to.exists() {
-        let _ = std::fs::copy(&from, &to);
+    // Workspace pin: ordinary config, safe to copy if destination missing.
+    {
+        let from = src.join("workspace");
+        let to = dest.join("workspace");
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::copy(&from, &to);
+        }
     }
     // Runtime key: never a plaintext copy on Windows. Migrate into the
     // Credential Manager only with explicit opt-in; remove the source after
-    // a successful import. Unix keeps the existing plaintext file copy.
+    // a successful import. This runs independently of workspace state so
+    // `HANDS_MIGRATE_LEGACY_KEY=1` is honored even when the new workspace pin
+    // already exists. Unix keeps the existing plaintext file copy.
     #[cfg(windows)]
     {
         let key_path = src.join("control-plane.key");
@@ -260,8 +263,7 @@ pub fn migrate_from_legacy() {
             && let Ok(key) = std::fs::read_to_string(&key_path)
         {
             let key = key.trim().to_string();
-            if crate::secrets::valid_runtime_key(&key)
-                && crate::secrets::win_cred_set(&key).is_ok()
+            if crate::secrets::valid_runtime_key(&key) && crate::secrets::win_cred_set(&key).is_ok()
             {
                 let _ = std::fs::remove_file(&key_path);
             }
@@ -835,8 +837,8 @@ mod tests {
     #[test]
     fn test_workspace_pin_and_resolve_with_unicode_and_spaces() {
         // Hermetic: isolated config root; never touches the user's real pin.
-        // `HANDS_CONFIG_DIR` and `HANDS_WORKSPACE` are snapshotted and restored
-        // on every exit path, including panics.
+        // All workspace env overrides that affect `resolve_workspace` are
+        // snapshotted and restored on every exit path, including panics.
         let temp_base = std::env::temp_dir().join(format!(
             "hands_ws_test_🚀_{}_{}",
             std::process::id(),
@@ -850,6 +852,7 @@ mod tests {
         struct EnvGuard {
             saved_config_dir: Option<std::ffi::OsString>,
             saved_workspace: Option<std::ffi::OsString>,
+            saved_legacy_workspace: Option<std::ffi::OsString>,
             root: PathBuf,
         }
         impl Drop for EnvGuard {
@@ -863,6 +866,10 @@ mod tests {
                         Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
                         None => std::env::remove_var("HANDS_WORKSPACE"),
                     }
+                    match &self.saved_legacy_workspace {
+                        Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
+                        None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
+                    }
                 }
                 let _ = std::fs::remove_dir_all(&self.root);
             }
@@ -870,26 +877,29 @@ mod tests {
         let _guard = EnvGuard {
             saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
             saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
+            saved_legacy_workspace: std::env::var_os("GROK_HARNESS_WORKSPACE"),
             root: temp_base.clone(),
         };
         unsafe {
             std::env::set_var("HANDS_CONFIG_DIR", &temp_base);
             std::env::remove_var("HANDS_WORKSPACE");
+            std::env::remove_var("GROK_HARNESS_WORKSPACE");
         }
 
         let ws_dir = temp_base.join("Sub Folder With Spaces 測試");
         std::fs::create_dir_all(&ws_dir).expect("should create test workspace directory");
 
-        let pinned = pin_workspace(&ws_dir).expect("pin_workspace should succeed for unicode path with spaces");
+        let pinned = pin_workspace(&ws_dir)
+            .expect("pin_workspace should succeed for unicode path with spaces");
         assert_eq!(pinned, dunce::canonicalize(&ws_dir).unwrap());
 
-        let read = read_pinned_workspace().expect("read_pinned_workspace should return pinned path");
+        let read =
+            read_pinned_workspace().expect("read_pinned_workspace should return pinned path");
         assert_eq!(read, pinned);
 
         let resolved = resolve_workspace(&std::env::temp_dir());
         assert_eq!(resolved, pinned);
     }
-
     #[test]
     fn test_which_executable_discovery() {
         let temp_dir = std::env::temp_dir().join(format!(
@@ -918,19 +928,20 @@ mod tests {
         }
 
         let found = crate::service::which("fake-tool");
+        // Preserve comparison before destroying the fixture directory.
+        let found_canon = found.as_ref().and_then(|p| p.canonicalize().ok());
+        let expected_canon = fake_exe.canonicalize().ok();
+        // Restore PATH before assertions so env is clean even on failure.
         unsafe {
             std::env::set_var("PATH", &orig_path);
         }
-        let _ = std::fs::remove_dir_all(&temp_dir);
 
         assert!(
             found.is_some(),
             "which('fake-tool') should locate fake-tool binary on PATH"
         );
-        assert_eq!(
-            found.unwrap().canonicalize().ok(),
-            fake_exe.canonicalize().ok()
-        );
+        assert_eq!(found_canon, expected_canon);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
@@ -967,7 +978,9 @@ mod tests {
             "foreground terminal output should contain expected marker: {}",
             fg_res.prompt_text
         );
-        let fg_has_cwd = fg_res.prompt_text.contains(canonical_ws.as_os_str().to_string_lossy().as_ref());
+        let fg_has_cwd = fg_res
+            .prompt_text
+            .contains(canonical_ws.as_os_str().to_string_lossy().as_ref());
         assert!(
             fg_has_cwd,
             "foreground command must report the intended workspace CWD ({}), got: {}",
@@ -1017,9 +1030,18 @@ mod tests {
             .await
             .expect("get_task_output should succeed");
 
-        let pos_1 = out_res.prompt_text.find("LINE_1").expect("output should contain LINE_1");
-        let pos_2 = out_res.prompt_text.find("LINE_2").expect("output should contain LINE_2");
-        let pos_3 = out_res.prompt_text.find("LINE_3").expect("output should contain LINE_3");
+        let pos_1 = out_res
+            .prompt_text
+            .find("LINE_1")
+            .expect("output should contain LINE_1");
+        let pos_2 = out_res
+            .prompt_text
+            .find("LINE_2")
+            .expect("output should contain LINE_2");
+        let pos_3 = out_res
+            .prompt_text
+            .find("LINE_3")
+            .expect("output should contain LINE_3");
         assert!(
             pos_1 < pos_2 && pos_2 < pos_3,
             "output must be ordered LINE_1 < LINE_2 < LINE_3: {}",
@@ -1048,7 +1070,10 @@ mod tests {
         } else {
             String::new()
         };
-        assert!(!big_task_id.is_empty(), "large output task should return task ID");
+        assert!(
+            !big_task_id.is_empty(),
+            "large output task should return task ID"
+        );
 
         // Block (bounded) on completion with `timeout_ms`, then read the
         // truncated output. `run_terminal_cmd` enforces a 20K-char ring

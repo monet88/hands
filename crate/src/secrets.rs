@@ -11,17 +11,22 @@ const SERVICE: &str = "dev.hands.runtime-key";
 const ACCOUNT: &str = "hands";
 
 #[cfg(windows)]
+#[allow(dead_code)]
 const TEST_SERVICE: &str = "dev.hands.runtime-key.test";
-
 /// Credential Manager target name: production or test namespace. Automated
 /// tests only ever touch the `…test` target, never production.
+/// Production (non-test) builds NEVER consult `HANDS_TEST_CRED_NAMESPACE`;
+/// that override is compiled out so an inherited env var cannot redirect
+/// real `hands setup` credentials.
 #[cfg(windows)]
 fn service_target() -> &'static str {
-    if std::env::var("HANDS_TEST_CRED_NAMESPACE").as_deref() == Ok("1") {
-        TEST_SERVICE
-    } else {
-        SERVICE
+    #[cfg(test)]
+    {
+        if std::env::var("HANDS_TEST_CRED_NAMESPACE").as_deref() == Ok("1") {
+            return TEST_SERVICE;
+        }
     }
+    SERVICE
 }
 
 pub fn valid_runtime_key(key: &str) -> bool {
@@ -274,16 +279,13 @@ mod win_cred {
 #[cfg(windows)]
 pub fn win_cred_get() -> Option<String> {
     use std::ptr;
-    let target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = service_target()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut pcred: *mut win_cred::CREDENTIALW = ptr::null_mut();
-    let res = unsafe {
-        win_cred::CredReadW(
-            target.as_ptr(),
-            win_cred::CRED_TYPE_GENERIC,
-            0,
-            &mut pcred,
-        )
-    };
+    let res =
+        unsafe { win_cred::CredReadW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0, &mut pcred) };
     if res == 0 || pcred.is_null() {
         return None;
     }
@@ -293,7 +295,9 @@ pub fn win_cred_get() -> Option<String> {
     } else {
         &[]
     };
-    let result = String::from_utf8(bytes.to_vec()).ok().map(|s| s.trim().to_string());
+    let result = String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(|s| s.trim().to_string());
     unsafe {
         win_cred::CredFree(pcred as *mut _);
     }
@@ -303,7 +307,10 @@ pub fn win_cred_get() -> Option<String> {
 #[cfg(windows)]
 pub fn win_cred_set(key: &str) -> Result<(), String> {
     use std::ptr;
-    let mut target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
+    let mut target: Vec<u16> = service_target()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut account: Vec<u16> = ACCOUNT.encode_utf16().chain(std::iter::once(0)).collect();
     let mut comment: Vec<u16> = "Hands ChatGPT runtime key\0".encode_utf16().collect();
     let mut blob = key.as_bytes().to_vec();
@@ -327,20 +334,27 @@ pub fn win_cred_set(key: &str) -> Result<(), String> {
     if res != 0 {
         Ok(())
     } else {
-        Err(format!("Windows CredWriteW failed (os error {})", std::io::Error::last_os_error()))
+        Err(format!(
+            "Windows CredWriteW failed (os error {})",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
 #[cfg(windows)]
 pub fn win_cred_delete() -> Result<(), String> {
-    let target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
-    let res = unsafe {
-        win_cred::CredDeleteW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0)
-    };
+    let target: Vec<u16> = service_target()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let res = unsafe { win_cred::CredDeleteW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0) };
     if res != 0 {
         Ok(())
     } else {
-        Err(format!("Windows CredDeleteW failed (os error {})", std::io::Error::last_os_error()))
+        Err(format!(
+            "Windows CredDeleteW failed (os error {})",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
@@ -379,15 +393,26 @@ mod tests {
 
         let test_key = "sk-test-key-123456789012345678901234567890";
         let set_res = win_cred_set(test_key);
-        assert!(set_res.is_ok(), "win_cred_set should succeed: {:?}", set_res);
+        assert!(
+            set_res.is_ok(),
+            "win_cred_set should succeed: {:?}",
+            set_res
+        );
 
         let retrieved = win_cred_get();
         assert_eq!(retrieved.as_deref(), Some(test_key));
 
         let del_res = win_cred_delete();
-        assert!(del_res.is_ok(), "win_cred_delete should succeed: {:?}", del_res);
+        assert!(
+            del_res.is_ok(),
+            "win_cred_delete should succeed: {:?}",
+            del_res
+        );
 
         let after_del = win_cred_get();
-        assert!(after_del.is_none(), "credential should be gone after delete");
+        assert!(
+            after_del.is_none(),
+            "credential should be gone after delete"
+        );
     }
 }

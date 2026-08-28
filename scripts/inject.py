@@ -61,8 +61,6 @@ def main() -> int:
             command
                 .arg(format!("--dependency_out={}", dep_file.display()))
                 .arg(format!("--descriptor_set_out={}", desc_file.display()));'''
-            pb_text = pb_text.replace(old_block, new_block, 1)
-
             old_parse = '''            let output =
                 String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
 
@@ -79,15 +77,31 @@ def main() -> int:
             let desc_str = desc_file.to_string_lossy();
             let rem = if let Some(r) = first_line.strip_prefix(desc_str.as_ref()) {
                 r.strip_prefix(':').unwrap_or(r)
-            } else if let Some((_, r)) = first_line.split_once(':') {
+            } else if let Some((_, r)) = first_line.rsplit_once(':') {
                 r
             } else {
                 first_line
             };'''
-            pb_text = pb_text.replace(old_parse, new_parse, 1)
+            if old_block not in pb_text:
+                print("inject: expected xai-proto-build seam not found (old_block missing); refusing half-patched write", file=sys.stderr)
+                print("hint: upstream xai-proto-build src/lib.rs drifted; update inject.py seams", file=sys.stderr)
+                return 1
+            if old_parse not in pb_text:
+                print("inject: expected xai-proto-build seam not found (old_parse missing); refusing half-patched write", file=sys.stderr)
+                print("hint: upstream xai-proto-build src/lib.rs drifted; update inject.py seams", file=sys.stderr)
+                return 1
+            pb_text_after_block = pb_text.replace(old_block, new_block, 1)
+            if pb_text_after_block == pb_text or new_block not in pb_text_after_block:
+                print("inject: xai-proto-build patch failed (old_block replace did not apply)", file=sys.stderr)
+                return 1
+            pb_text = pb_text_after_block
+            pb_text_after_parse = pb_text.replace(old_parse, new_parse, 1)
+            if pb_text_after_parse == pb_text or new_parse not in pb_text_after_parse:
+                print("inject: xai-proto-build patch failed (old_parse replace did not apply); refusing half-patched write", file=sys.stderr)
+                return 1
+            pb_text = pb_text_after_parse
             proto_build_lib.write_text(pb_text, encoding="utf-8")
             print("patched xai-proto-build for Windows compatibility")
-
     print(f"injected {dest}")
     return 0
 

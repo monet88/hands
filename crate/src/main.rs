@@ -226,8 +226,12 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     let json_str = if args_json.starts_with('@') {
                         let p = &args_json[1..];
                         std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))?
+                    } else if serde_json::from_str::<serde_json::Value>(&args_json).is_ok() {
+                        // Valid JSON (including scalars true/false/null/numbers) — never reinterpret as file.
+                        args_json
                     } else if std::path::Path::new(&args_json).is_file() {
-                        std::fs::read_to_string(&args_json).map_err(|e| format!("read {}: {e}", args_json))?
+                        std::fs::read_to_string(&args_json)
+                            .map_err(|e| format!("read {}: {e}", args_json))?
                     } else {
                         args_json
                     };

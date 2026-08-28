@@ -94,7 +94,9 @@ pub fn enable() -> Result<(), String> {
     write_profile(&key, &harness, &tunnel_id)?;
     write_wrapper(&client)?;
     install_supervisor()?;
-    let _ = install_watch();
+    if let Err(e) = install_watch() {
+        eprintln!("warning: Hands watch task not installed: {e}");
+    }
     if wait_ready(Duration::from_secs(15)) {
         eprintln!("tunnel on. login start + restart. config: hands config");
         eprintln!("admin  {HEALTH_BASE}/ui");
@@ -245,12 +247,21 @@ fn resolve_tunnel_id() -> Result<String, String> {
     Err("missing tunnel id. paste it in the config UI (hands config) or export CONTROL_PLANE_TUNNEL_ID".into())
 }
 
-    // `key` is only referenced on Unix (the 0600 key file); Windows carries no
-    // plaintext key, so silence the unused-parameter warning there.
-    #[cfg_attr(windows, allow(unused_variables))]
-    fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
-    let path = profile_file();
-    if let Some(parent) = path.parent() {
+// `key` is only referenced on Unix (the 0600 key file); Windows carries no
+// plaintext key, so silence the unused-parameter warning there.
+#[cfg_attr(windows, allow(unused_variables))]
+fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
+    write_profile_at(&profile_file(), key, harness, tunnel_id)
+}
+
+#[cfg_attr(windows, allow(unused_variables))]
+fn write_profile_at(
+    profile_path: &Path,
+    key: &Path,
+    harness: &Path,
+    tunnel_id: &str,
+) -> Result<(), String> {
+    if let Some(parent) = profile_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let harness = harness.display().to_string();
@@ -280,10 +291,10 @@ mcp:
       command: "{harness}"
 "#
     );
-    fs::write(&path, yaml).map_err(|e| format!("write {}: {e}", path.display()))?;
+    fs::write(profile_path, yaml).map_err(|e| format!("write {}: {e}", profile_path.display()))?;
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(profile_path, fs::Permissions::from_mode(0o600));
     }
     Ok(())
 }
@@ -647,7 +658,10 @@ WantedBy=default.target
     fs::write(&unit, body).map_err(|e| format!("write {}: {e}", unit.display()))?;
     stop_unmanaged();
     run_ok("systemctl", &["--user", "daemon-reload"])?;
-    run_ok("systemctl", &["--user", "enable", "--now", "hands-tunnel.service"])?;
+    run_ok(
+        "systemctl",
+        &["--user", "enable", "--now", "hands-tunnel.service"],
+    )?;
     let _ = install_watch();
     Ok(())
 }
@@ -684,7 +698,10 @@ WantedBy=default.target
     );
     fs::write(&unit, body).map_err(|e| format!("write {}: {e}", unit.display()))?;
     run_ok("systemctl", &["--user", "daemon-reload"])?;
-    run_ok("systemctl", &["--user", "enable", "--now", "hands-watch.service"])?;
+    run_ok(
+        "systemctl",
+        &["--user", "enable", "--now", "hands-watch.service"],
+    )?;
     Ok(())
 }
 
@@ -771,7 +788,7 @@ fn task_xml(exec_path: &Path, args: &str, description: &str) -> String {
     <Priority>7</Priority>
     <RestartOnFailure>
       <Interval>PT10S</Interval>
-      <Count>10</Count>
+      <Count>999</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
@@ -790,11 +807,7 @@ fn task_xml(exec_path: &Path, args: &str, description: &str) -> String {
 #[cfg(windows)]
 fn install_supervisor() -> Result<(), String> {
     let hands = harness_bin()?;
-    let xml = task_xml(
-        &hands,
-        "run-tunnel",
-        "Hands ChatGPT tunnel supervisor",
-    );
+    let xml = task_xml(&hands, "run-tunnel", "Hands ChatGPT tunnel supervisor");
     let xml_path = host::config_dir().join("tunnel-task.xml");
     if let Some(parent) = xml_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -886,11 +899,15 @@ fn install_watch() -> Result<(), String> {
         .output()
         .map_err(|e| format!("schtasks /create watch: {e}"))?;
 
-    if out.status.success() {
-        let _ = Command::new("schtasks")
-            .args(["/run", "/tn", WATCH_TASK_NAME])
-            .output();
+    if !out.status.success() {
+        return Err(format!(
+            "schtasks /create watch failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
+    let _ = Command::new("schtasks")
+        .args(["/run", "/tn", WATCH_TASK_NAME])
+        .output();
     Ok(())
 }
 
@@ -911,10 +928,35 @@ fn uninstall_watch() -> Result<(), String> {
 
 /// PID/state file for the Hands-owned tunnel-client tree. Written by the
 /// supervisor path (`run_tunnel_daemon`) before spawn; `stop_unmanaged` only
-/// ever stops PIDs proven by this file (live check + name + command line).
+/// ever stops PIDs proven by this file (live check + name + command line +
+/// creation time to defeat PID recycling).
 #[cfg(windows)]
 fn tunnel_pid_file() -> PathBuf {
     host::config_dir().join("tunnel-pid.json")
+}
+
+#[cfg(windows)]
+fn query_process_creation(pid: u32) -> Option<String> {
+    let out = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue).CreationDate | Out-String"
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s.contains("CreationDate") {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[cfg(windows)]
@@ -923,50 +965,84 @@ fn write_tunnel_pid(pid: u32) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let json = format!("{{\"pid\":{pid}}}");
+    let creation = query_process_creation(pid).unwrap_or_default();
+    let json = if creation.is_empty() {
+        format!(r#"{{"pid":{pid},"profile":"{PROFILE}"}}"#)
+    } else {
+        // Escape backslashes/quotes in creation string
+        let esc = creation.replace('\\', r"\\").replace('"', r#"\""#);
+        format!(r#"{{"pid":{pid},"creation":"{esc}","profile":"{PROFILE}"}}"#)
+    };
     let _ = fs::write(&path, json);
 }
 
 #[cfg(windows)]
-fn read_tunnel_pid() -> Option<u32> {
+fn read_tunnel_pid() -> Option<(u32, Option<String>)> {
     let raw = fs::read_to_string(tunnel_pid_file()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("pid")?.as_u64().map(|p| p as u32)
+    let pid = v.get("pid")?.as_u64()? as u32;
+    let creation = v
+        .get("creation")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
+    Some((pid, creation))
 }
 
 /// Stop only the Hands-owned tunnel tree: the PID recorded by our supervisor
-/// (validated against executable name + managed profile marker), plus any
-/// child processes of that PID. Unrelated `tunnel-client.exe` processes are
-/// never touched.
+/// (validated against executable name + managed profile marker + creation
+/// time), plus any child processes recursively. Unrelated `tunnel-client.exe`
+/// processes are never touched. Cleans stale PID records.
 #[cfg(windows)]
 fn stop_unmanaged() {
-    let Some(pid) = read_tunnel_pid() else {
+    let Some((pid, stored_creation)) = read_tunnel_pid() else {
         return;
     };
+    // Validate ownership before killing; use creation time to defeat PID recycling.
+    if let Some(stored) = stored_creation.as_ref().filter(|s| !s.is_empty()) {
+        if let Some(live) = query_process_creation(pid) {
+            if live.trim() != stored.trim() {
+                let _ = fs::remove_file(tunnel_pid_file());
+                return;
+            }
+        } else {
+            // Process gone: clean stale record.
+            let _ = fs::remove_file(tunnel_pid_file());
+            return;
+        }
+    }
+    let pid_file_esc = tunnel_pid_file().display().to_string().replace('\'', "''");
     let script = format!(
         r#"
 $owned = {pid}
 if (-not $owned) {{ exit 0 }}
 $p = Get-CimInstance Win32_Process -Filter "ProcessId=$owned" -ErrorAction SilentlyContinue
-if (-not $p) {{ exit 0 }}
+if (-not $p) {{
+    Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
+    exit 0
+}}
 $isOurs = ($p.Name -ieq 'tunnel-client.exe') -and ($p.CommandLine -match '--profile hands')
 if (-not $isOurs) {{
     # PID was recycled or state file is stale: do not kill an unknown owner.
-    Remove-Item -Path '{pid_file}' -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
     exit 0
 }}
-# Kill the recorded process, then any descendants it still owns.
-$descendants = Get-CimInstance Win32_Process -Filter "ParentProcessId=$owned" -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty ProcessId
-Stop-Process -Id $owned -Force -ErrorAction SilentlyContinue
-foreach ($d in $descendants) {{
-    $dc = Get-CimInstance Win32_Process -Filter "ProcessId=$d" -ErrorAction SilentlyContinue
-    if ($dc) {{ Stop-Process -Id $d -Force -ErrorAction SilentlyContinue }}
+# Additional creation-time check from PowerShell when Rust-stored creation exists
+$storedCreation = '{stored_creation_esc}'
+if ($storedCreation) {{
+    $liveCreation = $p.CreationDate
+    if ($liveCreation -and "$liveCreation" -ne $storedCreation) {{
+        Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
+        exit 0
+    }}
 }}
-Remove-Item -Path '{pid_file}' -Force -ErrorAction SilentlyContinue
+# Terminate the complete owned descendant tree recursively (handles grandchildren)
+try {{ taskkill.exe /PID $owned /T /F | Out-Null }} catch {{}}
+try {{ Stop-Process -Id $owned -Force -ErrorAction SilentlyContinue }} catch {{}}
+Remove-Item -Path '{pid_file_esc}' -Force -ErrorAction SilentlyContinue
 "#,
         pid = pid,
-        pid_file = tunnel_pid_file().display().to_string().replace('\'', "''")
+        pid_file_esc = pid_file_esc,
+        stored_creation_esc = stored_creation.as_deref().unwrap_or("").replace('\'', "''")
     );
     let _ = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -985,20 +1061,40 @@ pub fn run_tunnel_daemon() -> Result<(), String> {
     let fake_key_path = crate::secrets::key_file();
     write_profile(&fake_key_path, &harness, &tunnel_id)?;
 
-    let mut cmd = Command::new(client);
-    cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
-    cmd.env("CONTROL_PLANE_API_KEY", key);
-    cmd.env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id);
-    let mut child = cmd.spawn().map_err(|e| format!("spawn tunnel-client: {e}"))?;
-    // Prove ownership: record the spawned PID so lifecycle paths only ever
-    // stop this Hands-owned tree.
-    #[cfg(windows)]
-    write_tunnel_pid(child.id());
-    let status = child.wait().map_err(|e| format!("wait tunnel-client: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("tunnel-client exited with status: {status}"))
+    // Continuous supervision: if the tunnel-client exits unexpectedly, restart
+    // with backoff so the Task Scheduler RestartOnFailure cap (now 999) is not
+    // the sole recovery path. This satisfies the "reliable login/restart
+    // supervisor" requirement without ever leaving Hands down permanently.
+    loop {
+        let mut cmd = Command::new(&client);
+        cmd.args(["run", "--profile", PROFILE, "--log.level=warn"]);
+        cmd.env("CONTROL_PLANE_API_KEY", &key);
+        cmd.env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn tunnel-client: {e}"))?;
+        #[cfg(windows)]
+        write_tunnel_pid(child.id());
+        let status = child
+            .wait()
+            .map_err(|e| format!("wait tunnel-client: {e}"))?;
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_file(tunnel_pid_file());
+        }
+        if status.success() {
+            return Ok(());
+        }
+        eprintln!("tunnel-client exited with status: {status}; restarting in 5s...");
+        std::thread::sleep(Duration::from_secs(5));
+        // Re-validate credentials/tunnel_id in case they were rotated.
+        // If they become invalid, break and surface error.
+        if crate::secrets::get().is_none() {
+            return Err("runtime key missing after restart".into());
+        }
+        if resolve_tunnel_id().is_err() {
+            return Err("tunnel id missing after restart".into());
+        }
     }
 }
 
@@ -1041,7 +1137,8 @@ fn stop_unmanaged() {
         if !cmd.contains("tunnel-client") {
             continue;
         }
-        let ours = cmd.contains("run --profile hands") || cmd.contains("run --profile grok-harness");
+        let ours =
+            cmd.contains("run --profile hands") || cmd.contains("run --profile grok-harness");
         if !ours || cmd.contains("pkill") {
             continue;
         }
@@ -1143,46 +1240,33 @@ mod tests {
                 .as_millis()
         ));
         let _ = fs::create_dir_all(&temp_dir);
-        let _key_file = temp_dir.join("control-plane.key");
+        let key_file = temp_dir.join("control-plane.key");
         let harness = temp_dir.join("hands.exe");
         let tunnel_id = "tunnel_123456789";
-
         let profile_path = temp_dir.join("hands.yaml");
-        let harness_str = harness.display().to_string();
-
-        #[cfg(windows)]
-        let api_key_entry = "api_key: \"env:CONTROL_PLANE_API_KEY\"".to_string();
-        #[cfg(not(windows))]
-        let api_key_entry = format!("api_key: \"file:{}\"", _key_file.display());
-
-        let yaml = format!(
-            r#"config_version: 1
-control_plane:
-  base_url: "https://api.openai.com"
-  tunnel_id: "{tunnel_id}"
-  {api_key_entry}
-health:
-  listen_addr: "{HEALTH_LISTEN}"
-admin_ui:
-  open_browser: false
-log:
-  level: warn
-  format: json
-mcp:
-  commands:
-    - channel: main
-      command: "{harness_str}"
-"#
-        );
-        fs::write(&profile_path, &yaml).unwrap();
-        let read = fs::read_to_string(&profile_path).unwrap();
-
+        write_profile_at(&profile_path, &key_file, &harness, tunnel_id)
+            .expect("write_profile_at should succeed");
+        let read = fs::read_to_string(&profile_path).expect("profile should be written");
         #[cfg(windows)]
         {
-            assert!(read.contains("api_key: \"env:CONTROL_PLANE_API_KEY\""));
-            assert!(!read.contains("file:"));
+            assert!(
+                read.contains("api_key: \"env:CONTROL_PLANE_API_KEY\""),
+                "Windows profile must reference env var, got: {read}"
+            );
+            assert!(
+                !read.contains("file:"),
+                "Windows profile must not contain file: entry, got: {read}"
+            );
+            assert!(!read.contains("sk-"), "profile must not leak raw key");
         }
-
+        #[cfg(not(windows))]
+        {
+            assert!(read.contains(&format!("file:{}", key_file.display())));
+        }
+        assert!(
+            read.contains("tunnel_123456789"),
+            "profile must contain tunnel id: {read}"
+        );
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
