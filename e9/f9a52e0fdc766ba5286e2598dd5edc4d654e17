@@ -1,0 +1,14 @@
+crate/src/setup.rs
+  h_17f2fa2b92da6a 20-29,32,46-53,99-127,154-159,161-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e9f9a52e0fdc766ba5286e2598dd5edc4d654e17",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
