@@ -110,15 +110,21 @@ Write-Host "Installed: $DestBin"
 Write-Host ""
 
 # 5. Ensure the managed Hands prefix is first on User PATH. Before relying on
-# User PATH, fail closed if Machine PATH already exposes another hands command:
-# Windows composes Machine PATH ahead of User PATH for new processes.
+# User PATH, fail closed if Machine PATH can shadow this user-local install.
+# Relative Machine PATH entries are inherently CWD-dependent, so no single
+# install-time normalization can prove future shell resolution is safe.
 $MachinePath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
 $PathExts = @($env:PATHEXT -split ';' | Where-Object { $_ })
 if ($PathExts.Count -eq 0) { $PathExts = @('.COM', '.EXE', '.BAT', '.CMD') }
 $MachineHandsCollisions = @()
 foreach ($entry in @($MachinePath -split ';' | Where-Object { $_ })) {
     $expandedEntry = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
-    if (-not $expandedEntry -or -not [System.IO.Path]::IsPathRooted($expandedEntry)) { continue }
+    if (-not $expandedEntry) { continue }
+    if (-not [System.IO.Path]::IsPathRooted($expandedEntry)) {
+        Write-Error "Machine PATH contains relative entry '$entry'. Hands cannot guarantee that the user-local install will not be shadowed in future working directories. Make the Machine PATH entry absolute, then rerun install.ps1."
+        exit 1
+    }
+    $expandedEntry = [System.IO.Path]::GetFullPath($expandedEntry)
     foreach ($ext in $PathExts) {
         $candidate = Join-Path $expandedEntry ("hands" + $ext)
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
