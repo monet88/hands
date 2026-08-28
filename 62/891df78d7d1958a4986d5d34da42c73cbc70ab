@@ -1,0 +1,14 @@
+.github/workflows/test.yml
+  h_17f2fa2b92da6a 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "62891df78d7d1958a4986d5d34da42c73cbc70ab",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
