@@ -1,0 +1,18 @@
+crate/src/host.rs
+  h_17f2fa2b92da6a 799-866
+crate/src/service.rs
+  h_17f2fa2b92da6a 320-324,328,330-331,335-351,353-364,370-380
+crate/src/ui.rs
+  h_17f2fa2b92da6a 91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3bfb641bd8e6c939431b26b1d84396aab18865d0",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
