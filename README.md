@@ -119,9 +119,9 @@ ChatGPT will automatically execute all tools in the pinned folder starting from 
 | `glob` | Find | Find files matching glob patterns |
 | `search_replace` | Edit | Replace unique code chunks in files |
 | `write` | Create | Write or overwrite files |
-| `apply_patch` | Multi-file | Apply unified diff patches |
 | `todo_write` | Tasks | Manage task checklist |
 | `run_terminal_cmd` | Execution | Run tests, build scripts, shell commands |
+| `run_command` | Execution | Run a native CLI directly with an argv vector, no shell |
 | `get_task_output` | Polling | Poll long-running background tasks |
 | `kill_task` | Cleanup | Terminate background tasks |
 
