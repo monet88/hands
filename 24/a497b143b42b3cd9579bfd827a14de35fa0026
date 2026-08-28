@@ -1,0 +1,18 @@
+.github/workflows/ci.yml
+  h_17f2fa2b92da6a 13,22,33-38,41-45,50-51,62-78,82-84
+install.sh
+  h_17f2fa2b92da6a 9,20-23
+scripts/inject.py
+  h_17f2fa2b92da6a 44-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "24a497b143b42b3cd9579bfd827a14de35fa0026",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
