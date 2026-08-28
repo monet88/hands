@@ -109,15 +109,23 @@ fn read_secret() -> Result<Option<String>, String> {
 
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let mut mode = 0u32;
-    let have_mode = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
-    if have_mode {
-        unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) };
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return Err("hidden input unavailable: not a console (run hands setup in a terminal)".into());
+    }
+    // Restore the original console mode on every exit path — including read
+    // errors and panics — via a guard.
+    struct RestoreConsole(*mut std::ffi::c_void, u32);
+    impl Drop for RestoreConsole {
+        fn drop(&mut self) {
+            unsafe { SetConsoleMode(self.0, self.1) };
+        }
+    }
+    let _guard = RestoreConsole(handle, mode);
+    if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
+        return Err("hidden input unavailable: cannot disable echo".into());
     }
     let mut s = String::new();
     let r = io::stdin().lock().read_line(&mut s);
-    if have_mode {
-        unsafe { SetConsoleMode(handle, mode) };
-    }
     eprintln!();
     r.map_err(|e| e.to_string())?;
     let t = s.trim().to_string();

@@ -10,6 +10,20 @@ use crate::host;
 const SERVICE: &str = "dev.hands.runtime-key";
 const ACCOUNT: &str = "hands";
 
+#[cfg(windows)]
+const TEST_SERVICE: &str = "dev.hands.runtime-key.test";
+
+/// Credential Manager target name: production or test namespace. Automated
+/// tests only ever touch the `…test` target, never production.
+#[cfg(windows)]
+fn service_target() -> &'static str {
+    if std::env::var("HANDS_TEST_CRED_NAMESPACE").as_deref() == Ok("1") {
+        TEST_SERVICE
+    } else {
+        SERVICE
+    }
+}
+
 pub fn valid_runtime_key(key: &str) -> bool {
     key.starts_with("sk-") && key.len() >= 32 && !key.contains(char::is_whitespace)
 }
@@ -51,15 +65,9 @@ pub fn get() -> Option<String> {
             }
         }
     }
-    #[cfg(windows)]
-    {
-        if let Ok(file) = fs::read_to_string(key_file()) {
-            let k = file.trim().to_string();
-            if valid_runtime_key(&k) {
-                return Some(k);
-            }
-        }
-    }
+    // Windows: no plaintext file fallback. The Runtime Key lives only in the
+    // Credential Manager (or the env var); a leftover control-plane.key is
+    // never read implicitly.
     None
 }
 
@@ -266,7 +274,7 @@ mod win_cred {
 #[cfg(windows)]
 pub fn win_cred_get() -> Option<String> {
     use std::ptr;
-    let target: Vec<u16> = SERVICE.encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
     let mut pcred: *mut win_cred::CREDENTIALW = ptr::null_mut();
     let res = unsafe {
         win_cred::CredReadW(
@@ -295,7 +303,7 @@ pub fn win_cred_get() -> Option<String> {
 #[cfg(windows)]
 pub fn win_cred_set(key: &str) -> Result<(), String> {
     use std::ptr;
-    let mut target: Vec<u16> = SERVICE.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
     let mut account: Vec<u16> = ACCOUNT.encode_utf16().chain(std::iter::once(0)).collect();
     let mut comment: Vec<u16> = "Hands ChatGPT runtime key\0".encode_utf16().collect();
     let mut blob = key.as_bytes().to_vec();
@@ -325,7 +333,7 @@ pub fn win_cred_set(key: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 pub fn win_cred_delete() -> Result<(), String> {
-    let target: Vec<u16> = SERVICE.encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = service_target().encode_utf16().chain(std::iter::once(0)).collect();
     let res = unsafe {
         win_cred::CredDeleteW(target.as_ptr(), win_cred::CRED_TYPE_GENERIC, 0)
     };
@@ -351,10 +359,25 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_windows_credential_manager_roundtrip() {
-        let test_key = "sk-test-key-123456789012345678901234567890";
-        // Save original if any
-        let orig = win_cred_get();
+        // Isolated test-namespace target: the production credential
+        // `dev.hands.runtime-key` is never read, written, or deleted here.
+        // The guard restores (or clears) the test target on every exit path,
+        // including panics.
+        unsafe {
+            std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
+        }
+        struct CleanupNamespace;
+        impl Drop for CleanupNamespace {
+            fn drop(&mut self) {
+                let _ = win_cred_delete();
+                unsafe {
+                    std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
+                }
+            }
+        }
+        let _cleanup = CleanupNamespace;
 
+        let test_key = "sk-test-key-123456789012345678901234567890";
         let set_res = win_cred_set(test_key);
         assert!(set_res.is_ok(), "win_cred_set should succeed: {:?}", set_res);
 
@@ -366,10 +389,5 @@ mod tests {
 
         let after_del = win_cred_get();
         assert!(after_del.is_none(), "credential should be gone after delete");
-
-        // Restore original
-        if let Some(orig_key) = orig {
-            let _ = win_cred_set(&orig_key);
-        }
     }
 }

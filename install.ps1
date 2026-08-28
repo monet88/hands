@@ -78,8 +78,12 @@ if ($LASTEXITCODE -ne 0) {
 $BuiltBin = Join-Path $GrokBuild "target\release\hands.exe"
 $DestBin = Join-Path $Prefix "hands.exe"
 
-# Stop any running hands instance if overwriting
-Get-Process -Name hands -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Stop only a running hands.exe that provably belongs to THIS install target
+# (same $DestBin path). Never blanket-kill every hands.exe on the machine.
+$ThisBin = $DestBin
+Get-CimInstance Win32_Process -Filter "Name='hands.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ieq $ThisBin } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 Copy-Item -Path $BuiltBin -Destination $DestBin -Force
 

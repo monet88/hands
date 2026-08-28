@@ -243,12 +243,17 @@ fn resolve_tunnel_id() -> Result<String, String> {
     Err("missing tunnel id. paste it in the config UI (hands config) or export CONTROL_PLANE_TUNNEL_ID".into())
 }
 
-fn write_profile(_key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
+    // `key` is only referenced on Unix (the 0600 key file); Windows carries no
+    // plaintext key, so silence the unused-parameter warning there.
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), String> {
     let path = profile_file();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let harness = harness.display().to_string();
+    // Windows: profile references the env var; the key itself lives only in
+    // Credential Manager. Unix: profile references the 0600 key file.
     #[cfg(windows)]
     let api_key_entry = "api_key: \"env:CONTROL_PLANE_API_KEY\"".to_string();
     #[cfg(not(windows))]
@@ -902,18 +907,67 @@ fn uninstall_watch() -> Result<(), String> {
     Ok(())
 }
 
+/// PID/state file for the Hands-owned tunnel-client tree. Written by the
+/// supervisor path (`run_tunnel_daemon`) before spawn; `stop_unmanaged` only
+/// ever stops PIDs proven by this file (live check + name + command line).
+#[cfg(windows)]
+fn tunnel_pid_file() -> PathBuf {
+    host::config_dir().join("tunnel-pid.json")
+}
+
+#[cfg(windows)]
+fn write_tunnel_pid(pid: u32) {
+    let path = tunnel_pid_file();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let json = format!("{{\"pid\":{pid}}}");
+    let _ = fs::write(&path, json);
+}
+
+#[cfg(windows)]
+fn read_tunnel_pid() -> Option<u32> {
+    let raw = fs::read_to_string(tunnel_pid_file()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("pid")?.as_u64().map(|p| p as u32)
+}
+
+/// Stop only the Hands-owned tunnel tree: the PID recorded by our supervisor
+/// (validated against executable name + managed profile marker), plus any
+/// child processes of that PID. Unrelated `tunnel-client.exe` processes are
+/// never touched.
 #[cfg(windows)]
 fn stop_unmanaged() {
-    let script = r#"
-Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -match '^(tunnel-client\.exe|hands\.exe)$' -and
-    ($_.CommandLine -match '--profile hands' -or $_.CommandLine -match '--profile grok-harness' -or $_.CommandLine -match 'run-tunnel')
-} | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-"#;
+    let Some(pid) = read_tunnel_pid() else {
+        return;
+    };
+    let script = format!(
+        r#"
+$owned = {pid}
+if (-not $owned) {{ exit 0 }}
+$p = Get-CimInstance Win32_Process -Filter "ProcessId=$owned" -ErrorAction SilentlyContinue
+if (-not $p) {{ exit 0 }}
+$isOurs = ($p.Name -ieq 'tunnel-client.exe') -and ($p.CommandLine -match '--profile hands')
+if (-not $isOurs) {{
+    # PID was recycled or state file is stale: do not kill an unknown owner.
+    Remove-Item -Path '{pid_file}' -Force -ErrorAction SilentlyContinue
+    exit 0
+}}
+# Kill the recorded process, then any descendants it still owns.
+$descendants = Get-CimInstance Win32_Process -Filter "ParentProcessId=$owned" -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty ProcessId
+Stop-Process -Id $owned -Force -ErrorAction SilentlyContinue
+foreach ($d in $descendants) {{
+    $dc = Get-CimInstance Win32_Process -Filter "ProcessId=$d" -ErrorAction SilentlyContinue
+    if ($dc) {{ Stop-Process -Id $d -Force -ErrorAction SilentlyContinue }}
+}}
+Remove-Item -Path '{pid_file}' -Force -ErrorAction SilentlyContinue
+"#,
+        pid = pid,
+        pid_file = tunnel_pid_file().display().to_string().replace('\'', "''")
+    );
     let _ = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output();
     std::thread::sleep(Duration::from_millis(300));
 }
@@ -934,6 +988,10 @@ pub fn run_tunnel_daemon() -> Result<(), String> {
     cmd.env("CONTROL_PLANE_API_KEY", key);
     cmd.env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id);
     let mut child = cmd.spawn().map_err(|e| format!("spawn tunnel-client: {e}"))?;
+    // Prove ownership: record the spawned PID so lifecycle paths only ever
+    // stop this Hands-owned tree.
+    #[cfg(windows)]
+    write_tunnel_pid(child.id());
     let status = child.wait().map_err(|e| format!("wait tunnel-client: {e}"))?;
     if status.success() {
         Ok(())
