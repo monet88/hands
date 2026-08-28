@@ -1,0 +1,24 @@
+crate/src/host.rs
+  h_17f2fa2b92da6a 26-27,29-33,233-236,247-273,837-839,848-879,955-956,970-978,980,1020-1022,1024-1025,1029-1092
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 13-26,68-70,277,306,336,362-378,380
+crate/src/service.rs
+  h_17f2fa2b92da6a 246-249,255-256,910-938,941-968,970,991-994
+crate/src/setup.rs
+  h_17f2fa2b92da6a 112-125
+install.ps1
+  h_17f2fa2b92da6a 81-86
+scripts/e2e_gate_windows.ps1
+  h_17f2fa2b92da6a 1-12,17,19,22-23,27,30-50,53-56,58,60-73,76,78-79,81,83,85-91,94-95,98-112,114-118,121,123-131,134,136-218,220,223,226-227,231-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7df06949928f09057201636fc1b49c8905a1cbf7",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
