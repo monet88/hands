@@ -1,0 +1,22 @@
+AGENTS.md
+  h_17f2fa2b92da6a 5-21,24,30,36,43,58,62,64-66,69-70,72,74,76,78,80-84,87,89,91,93-96
+docs/chatgpt-web-e2e.md
+  h_17f2fa2b92da6a 1-58
+docs/origin-windows-test-checklist.md
+  h_17f2fa2b92da6a 5-6,45-48
+scripts/call_tool_json.py
+  h_17f2fa2b92da6a 1-29
+scripts/smoke_windows.ps1
+  h_17f2fa2b92da6a 1-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8c25841205390b48365780807c371317c7e555dd",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
