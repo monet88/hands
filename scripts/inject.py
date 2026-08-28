@@ -41,6 +41,53 @@ def main() -> int:
             return 1
         text = text.replace(needle, needle + "\n" + MEMBER, 1)
         root.write_text(text)
+
+    # On Windows, fix /dev/stdout and /dev/null in xai-proto-build if present
+    proto_build_lib = grok_build / "crates" / "build" / "xai-proto-build" / "src" / "lib.rs"
+    if sys.platform == "win32" and proto_build_lib.is_file():
+        pb_text = proto_build_lib.read_text(encoding="utf-8")
+        if "--dependency_out=/dev/stdout" in pb_text:
+            old_block = '''        for proto in protos {
+            let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+            command
+                .arg("--dependency_out=/dev/stdout")
+                .arg("--descriptor_set_out=/dev/null");'''
+            new_block = '''        for proto in protos {
+            let tmp = tempfile::TempDir::new()?;
+            let dep_file = tmp.path().join("deps.d");
+            let desc_file = tmp.path().join("desc.pbbin");
+
+            let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+            command
+                .arg(format!("--dependency_out={}", dep_file.display()))
+                .arg(format!("--descriptor_set_out={}", desc_file.display()));'''
+            pb_text = pb_text.replace(old_block, new_block, 1)
+
+            old_parse = '''            let output =
+                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+
+            let mut lines = output.lines();
+            let first_line = lines.next().context("protoc command output is empty")?;
+            let prefix = "/dev/null:";
+            let rem = first_line.strip_prefix(prefix).with_context(|| {
+                format!("protoc command output must start with /dev/null: {output:?}")
+            })?;'''
+            new_parse = '''            let output = fs::read_to_string(&dep_file).context("read dependency file")?;
+
+            let mut lines = output.lines();
+            let first_line = lines.next().context("protoc command output is empty")?;
+            let desc_str = desc_file.to_string_lossy();
+            let rem = if let Some(r) = first_line.strip_prefix(desc_str.as_ref()) {
+                r.strip_prefix(':').unwrap_or(r)
+            } else if let Some((_, r)) = first_line.split_once(':') {
+                r
+            } else {
+                first_line
+            };'''
+            pb_text = pb_text.replace(old_parse, new_parse, 1)
+            proto_build_lib.write_text(pb_text, encoding="utf-8")
+            print("patched xai-proto-build for Windows compatibility")
+
     print(f"injected {dest}")
     return 0
 
