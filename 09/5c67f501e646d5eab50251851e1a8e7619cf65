@@ -1,0 +1,14 @@
+crate/src/watch.rs
+  h_17f2fa2b92da6a 24-30,33,42,54-65,71-74,81-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "095c67f501e646d5eab50251851e1a8e7619cf65",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
