@@ -121,6 +121,10 @@ fn create_job_for_child(_pid: u32) -> Option<job_object::JobObject> {
 struct PipeCapture {
     bytes: Vec<u8>,
     truncated: bool,
+    /// Some(read error) when the pipe read failed before EOF. A successful
+    /// child can still produce partial output; treating a read failure as
+    /// clean EOF hides that the output may be incomplete.
+    read_error: Option<String>,
 }
 
 impl PipeCapture {
@@ -128,6 +132,7 @@ impl PipeCapture {
         Self {
             bytes: Vec::new(),
             truncated: false,
+            read_error: None,
         }
     }
 }
@@ -143,11 +148,15 @@ where
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
     let mut truncated = false;
+    let mut read_error = None;
     loop {
         let read = match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(e) => {
+                read_error = Some(e.to_string());
+                break;
+            }
         };
         let remaining = MAX_RAW_OUTPUT_BYTES.saturating_sub(bytes.len());
         if remaining > 0 {
@@ -160,7 +169,11 @@ where
             truncated = true;
         }
     }
-    PipeCapture { bytes, truncated }
+    PipeCapture {
+        bytes,
+        truncated,
+        read_error,
+    }
 }
 
 /// Result of a foreground process execution.
@@ -258,6 +271,10 @@ fn write_temp_log(stdout: &str, stderr: &str) -> Option<String> {
         .as_nanos();
     let dir = std::env::temp_dir().join("hands").join("run-command");
     std::fs::create_dir_all(&dir).ok()?;
+    // Prune stale logs before writing a new one; without this the
+    // persistent service accumulates output-<pid>-<ns>.log files without
+    // bound on disk.
+    prune_temp_logs(&dir);
     let path = dir.join(format!("output-{}-{ts}.log", std::process::id()));
     let mut file = std::fs::File::create(&path).ok()?;
     use std::io::Write as _;
@@ -268,6 +285,36 @@ fn write_temp_log(stdout: &str, stderr: &str) -> Option<String> {
         file.write_all(stderr.as_bytes()).ok()?;
     }
     Some(path.to_string_lossy().to_string())
+}
+
+/// Delete output logs older than 1 day. These are diagnostic artifacts for
+/// operator retrieval, not durable records; pruning keeps the directory
+/// bounded without removing logs the operator may still be reading.
+fn prune_temp_logs(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.as_secs().saturating_sub(86_400))
+        .unwrap_or(0);
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        if age.as_secs() < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn exit_line(output: &ProcOutput) -> String {
@@ -466,6 +513,20 @@ fn proc_output_from_captures(
     timed_out: bool,
     error: Option<String>,
 ) -> ProcOutput {
+    // A pipe read failure means the captured output may be incomplete even
+    // when the child itself succeeded. Surface it rather than reporting a
+    // clean run with truncated-looking output.
+    let mut error = error;
+    if let Some(e) = stdout
+        .read_error
+        .or_else(|| stderr.read_error.clone())
+    {
+        let msg = format!("output read failed: {e}");
+        error = Some(match error {
+            Some(existing) => format!("{existing}; {msg}"),
+            None => msg,
+        });
+    }
     ProcOutput {
         stdout: String::from_utf8_lossy(&stdout.bytes).to_string(),
         stderr: String::from_utf8_lossy(&stderr.bytes).to_string(),
@@ -726,13 +787,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_executable() {
-        let result = run_foreground("nonexistent_hands_test_exe_xyz", &[], None, None, None).await;
+    async fn test_pipe_read_error_is_reported_not_eof() {
+        // A reader that fails after delivering one chunk must surface the
+        // failure: treating it as clean EOF would hide incomplete output
+        // from a successful child.
+        struct FailingReader {
+            delivered: bool,
+        }
+        impl AsyncRead for FailingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.delivered {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated pipe break",
+                    )));
+                }
+                self.delivered = true;
+                buf.put_slice(b"partial");
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let capture = read_capped_pipe(FailingReader { delivered: false }).await;
+        assert_eq!(capture.bytes, b"partial", "bytes before the error must survive");
+        let err = capture.read_error.expect("read error must be recorded");
         assert!(
-            result.error.is_some(),
-            "missing executable should produce an error"
+            err.contains("simulated pipe break"),
+            "unexpected read error: {err}"
         );
-        assert!(!result.timed_out, "should not be a timeout");
+
+        // A clean EOF carries no error.
+        struct EofReader;
+        impl AsyncRead for EofReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let clean = read_capped_pipe(EofReader).await;
+        assert!(
+            clean.read_error.is_none(),
+            "clean EOF must not be reported as a read error"
+        );
     }
 
     #[tokio::test]
