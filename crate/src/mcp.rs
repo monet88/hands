@@ -280,6 +280,30 @@ mod tests {
     use std::fs;
     use crate::testenv::isolate_env;
 
+    async fn post_mcp(addr: SocketAddr, body: &Value) -> String {
+        let mut client = TcpStream::connect(addr).await.expect("connect to test server");
+        let req_body = serde_json::to_vec(body).expect("serialize req");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            req_body.len()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write req header");
+        client
+            .write_all(&req_body)
+            .await
+            .expect("write req body");
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
     #[tokio::test]
     async fn test_mcp_host_initialize_and_ping() {
         let (_lock, _guard) = isolate_env("init_ping");
@@ -393,33 +417,12 @@ mod tests {
             handle_http(stream, host_clone).await.expect("handle http");
         });
 
-        let mut client_stream = TcpStream::connect(addr).await.expect("connect to test server");
-        let req_body = serde_json::to_vec(&json!({
+        let req_body = json!({
             "jsonrpc": "2.0",
             "id": 100,
             "method": "tools/list"
-        }))
-        .expect("serialize req");
-
-        let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            req_body.len()
-        );
-        client_stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write req header");
-        client_stream
-            .write_all(&req_body)
-            .await
-            .expect("write req body");
-
-        let mut response = Vec::new();
-        client_stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        let resp_str = String::from_utf8_lossy(&response);
+        });
+        let resp_str = post_mcp(addr, &req_body).await;
 
         assert!(resp_str.contains("HTTP/1.1 200 OK"));
         assert!(resp_str.contains("\"tools\""));
@@ -453,17 +456,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "workspace_info" }
         });
-        let req_body = serde_json::to_vec(&call_msg).expect("serialize req");
-        let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            req_body.len()
-        );
-        let mut client = TcpStream::connect(addr).await.expect("connect to test server");
-        client.write_all(request.as_bytes()).await.expect("write req header");
-        client.write_all(&req_body).await.expect("write req body");
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.expect("read response");
-        let resp_str = String::from_utf8_lossy(&response);
+        let resp_str = post_mcp(addr, &call_msg).await;
         assert!(resp_str.contains("HTTP/1.1 200 OK"), "got: {resp_str}");
         let body_start = resp_str.find("\r\n\r\n").expect("header terminator") + 4;
         let http_resp: Value =
