@@ -42,6 +42,7 @@ mod job_object {
     const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
     const THREAD_SUSPEND_RESUME: u32 = 0x0002;
     const TH32CS_SNAPTHREAD: u32 = 0x00000004;
+    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
 
     #[repr(C)]
     #[allow(non_snake_case)]
@@ -80,7 +81,7 @@ mod job_object {
     impl JobObject {
         pub fn create() -> Option<Self> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle.is_null() {
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
                 return None;
             }
             Some(Self(handle))
@@ -94,7 +95,7 @@ mod job_object {
                     pid,
                 )
             };
-            if process.is_null() {
+            if process == INVALID_HANDLE_VALUE || process.is_null() {
                 return false;
             }
             let ok = unsafe { AssignProcessToJobObject(self.0, process) != 0 };
@@ -111,7 +112,7 @@ mod job_object {
     /// CREATE_SUSPENDED) so the process starts executing.
     pub fn resume_process(pid: u32) -> bool {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot.is_null() {
+        if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
             return false;
         }
         let mut entry = THREADENTRY32 {
@@ -127,13 +128,14 @@ mod job_object {
         let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
         while has_entry {
             if entry.th32OwnerProcessID == pid {
-                let thread =
-                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if !thread.is_null() {
-                    unsafe { ResumeThread(thread) };
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread != INVALID_HANDLE_VALUE && !thread.is_null() {
+                    let prev_count = unsafe { ResumeThread(thread) };
                     unsafe { CloseHandle(thread) };
-                    resumed = true;
-                    break;
+                    if prev_count != u32::MAX {
+                        resumed = true;
+                        break;
+                    }
                 }
             }
             has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
@@ -178,8 +180,8 @@ fn create_job_for_child(pid: u32) -> Option<job_object::JobObject> {
 /// without a Job Object handle. Used when job creation/assignment failed
 /// but the child was spawned suspended and must not stay frozen forever.
 #[cfg(windows)]
-fn resume_suspended_child(pid: u32) {
-    let _ = job_object::resume_process(pid);
+fn resume_suspended_child(pid: u32) -> bool {
+    job_object::resume_process(pid)
 }
 
 #[cfg(not(windows))]
@@ -187,6 +189,7 @@ fn create_job_for_child(_pid: u32) -> Option<job_object::JobObject> {
     None
 }
 
+#[derive(Clone)]
 struct PipeCapture {
     bytes: Vec<u8>,
     truncated: bool,
@@ -210,39 +213,55 @@ impl PipeCapture {
 /// Closing the read end at the memory cap would surface as BrokenPipe/EPIPE in
 /// the child and incorrectly change its exit status, so excess bytes are
 /// deliberately discarded rather than stopping the read.
-async fn read_capped_pipe<R>(mut reader: R) -> PipeCapture
+///
+/// Output is written incrementally into `capture` so that if the read task is
+/// aborted or times out, whatever partial bytes were buffered before abort
+/// are preserved.
+async fn read_capped_pipe_shared<R>(
+    mut reader: R,
+    capture: std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+) -> PipeCapture
 where
     R: AsyncRead + Unpin,
 {
-    let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
-    let mut truncated = false;
-    let mut read_error = None;
     loop {
         let read = match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(read) => read,
             Err(e) => {
-                read_error = Some(e.to_string());
+                if let Ok(mut cap) = capture.lock() {
+                    cap.read_error = Some(e.to_string());
+                }
                 break;
             }
         };
-        let remaining = MAX_RAW_OUTPUT_BYTES.saturating_sub(bytes.len());
-        if remaining > 0 {
-            let keep = remaining.min(read);
-            bytes.extend_from_slice(&chunk[..keep]);
-            if keep < read {
-                truncated = true;
+        if let Ok(mut cap) = capture.lock() {
+            let remaining = MAX_RAW_OUTPUT_BYTES.saturating_sub(cap.bytes.len());
+            if remaining > 0 {
+                let keep = remaining.min(read);
+                cap.bytes.extend_from_slice(&chunk[..keep]);
+                if keep < read {
+                    cap.truncated = true;
+                }
+            } else {
+                cap.truncated = true;
             }
-        } else {
-            truncated = true;
         }
     }
-    PipeCapture {
-        bytes,
-        truncated,
-        read_error,
-    }
+    capture
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| PipeCapture::empty())
+}
+
+#[cfg(test)]
+async fn read_capped_pipe<R>(reader: R) -> PipeCapture
+where
+    R: AsyncRead + Unpin,
+{
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+    read_capped_pipe_shared(reader, capture).await
 }
 
 /// Result of a foreground process execution.
@@ -359,6 +378,7 @@ fn write_temp_log(stdout: &str, stderr: &str) -> Option<String> {
 /// Delete output logs older than 1 day. These are diagnostic artifacts for
 /// operator retrieval, not durable records; pruning keeps the directory
 /// bounded without removing logs the operator may still be reading.
+/// Only prunes `output-*.log` files owned by this feature.
 fn prune_temp_logs(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -368,6 +388,13 @@ fn prune_temp_logs(dir: &std::path::Path) {
         .map(|now| now.as_secs().saturating_sub(86_400))
         .unwrap_or(0);
     for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("output-") || !name.ends_with(".log") {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
@@ -381,7 +408,7 @@ fn prune_temp_logs(dir: &std::path::Path) {
             continue;
         };
         if age.as_secs() < cutoff {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -586,10 +613,7 @@ fn proc_output_from_captures(
     // when the child itself succeeded. Surface it rather than reporting a
     // clean run with truncated-looking output.
     let mut error = error;
-    if let Some(e) = stdout
-        .read_error
-        .or_else(|| stderr.read_error.clone())
-    {
+    if let Some(e) = stdout.read_error.or_else(|| stderr.read_error.clone()) {
         let msg = format!("output read failed: {e}");
         error = Some(match error {
             Some(existing) => format!("{existing}; {msg}"),
@@ -606,28 +630,77 @@ fn proc_output_from_captures(
     }
 }
 
+/// Snapshot whatever partial output the shared capture buffers hold.
+/// Called only after the drain task's `JoinHandle` has been polled to
+/// completion — a completed handle must never be polled again (Tokio
+/// panics with "JoinHandle polled after completion").
+fn drain_captures_from_shares(
+    stdout_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+    stderr_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+) -> (PipeCapture, PipeCapture) {
+    let stdout = stdout_capture
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| PipeCapture::empty());
+    let stderr = stderr_capture
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| PipeCapture::empty());
+    (stdout, stderr)
+}
+
 /// Rejoin the pipe-drain task after the process tree is terminated.
 /// Killing the tree closes every pipe read end, so awaiting the drain
-/// normally completes immediately. The timeout guards pathological
-/// stragglers (a descendant that escaped the tree holding a pipe open).
+/// normally completes immediately. If the drain times out or errors,
+/// whatever partial output was buffered into `stdout_capture` and
+/// `stderr_capture` is preserved rather than dropped.
 async fn bounded_rejoin(
     drain: &mut JoinHandle<(PipeCapture, PipeCapture)>,
+    stdout_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+    stderr_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
     drain_timeout_ms: u64,
 ) -> (PipeCapture, PipeCapture) {
     let drain_timeout = Duration::from_millis(drain_timeout_ms);
     match tokio::time::timeout(drain_timeout, &mut *drain).await {
         Ok(Ok(captures)) => captures,
-        Ok(Err(_)) => (PipeCapture::empty(), PipeCapture::empty()),
-        // ponytail: abort loses partial output in the cancelled task's
-        // local buffer. The pipe is held open by a descendant that escaped
-        // the tree (race), so the data is already incomplete. Accepting
-        // empty is the bounded-safe choice over an indefinite hang.
+        Ok(Err(_)) => drain_captures_from_shares(stdout_capture, stderr_capture),
         Err(_) => {
             drain.abort();
             let _ = drain.await;
-            (PipeCapture::empty(), PipeCapture::empty())
+            let stdout = stdout_capture
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_else(|_| PipeCapture::empty());
+            let stderr = stderr_capture
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_else(|_| PipeCapture::empty());
+            (stdout, stderr)
         }
     }
+}
+
+async fn terminate_tree(
+    child: &mut tokio::process::Child,
+    job: Option<&job_object::JobObject>,
+    _child_pid: Option<u32>,
+) {
+    #[cfg(unix)]
+    if let Some(pid) = _child_pid {
+        // Kill the whole process group FIRST before killing/reaping the root.
+        // Child was spawned with process_group(0) and has NOT been
+        // reaped yet: its PGID == its PID and is active/unrecycled in
+        // the kernel. killpg(pid, SIGKILL) terminates every descendant
+        // in the group before the root is reaped.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    if let Some(j) = job {
+        j.terminate();
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 pub async fn run_foreground(
@@ -715,157 +788,161 @@ pub async fn run_foreground(
 
     // The child is suspended at this point; the Job Object was assigned
     // before any of its code ran. Resume the initial thread so the child
-    // starts executing inside the job's ownership. If resume fails
-    // (process exited before we got here), fall back to the pre-suspend
-    // behavior — the bounded drain still prevents an indefinite hang.
+    // starts executing inside the job's ownership. If resume fails,
+    // terminate and reap the child immediately rather than letting it hang
+    // until timeout.
     #[cfg(windows)]
-    if job.is_some() {
-        let _ = job_object::resume_process(child_pid.unwrap_or(0));
-    } else if let Some(pid) = child_pid {
-        // Job creation/assignment failed; the child is still suspended.
-        // Resume it directly so the command doesn't hang forever.
-        resume_suspended_child(pid);
+    {
+        let resumed = if job.is_some() {
+            job_object::resume_process(child_pid.unwrap_or(0))
+        } else if let Some(pid) = child_pid {
+            resume_suspended_child(pid)
+        } else {
+            false
+        };
+        if !resumed {
+            let _ = child.kill().await;
+            if let Some(j) = &job {
+                j.terminate();
+            }
+            let _ = child.wait().await;
+            return ProcOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: -1,
+                timed_out: false,
+                capture_truncated: false,
+                error: Some("failed to resume suspended process".to_string()),
+            };
+        }
     }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
+    let stdout_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+
+    let stdout_cap_clone = stdout_capture.clone();
+    let stderr_cap_clone = stderr_capture.clone();
+
     // Drain both pipes inside one cancellable task so the deadline covers
     // them jointly. Each reader keeps only a bounded prefix but continues
     // consuming excess bytes to EOF so the child never sees a broken pipe.
+    // Shared capture buffers preserve buffered partial output across
+    // cancellation or timeouts.
     let mut drain = tokio::spawn(async move {
         let stdout_read = async {
             match stdout {
-                Some(pipe) => read_capped_pipe(pipe).await,
+                Some(pipe) => read_capped_pipe_shared(pipe, stdout_cap_clone).await,
                 None => PipeCapture::empty(),
             }
         };
         let stderr_read = async {
             match stderr {
-                Some(pipe) => read_capped_pipe(pipe).await,
+                Some(pipe) => read_capped_pipe_shared(pipe, stderr_cap_clone).await,
                 None => PipeCapture::empty(),
             }
         };
         tokio::join!(stdout_read, stderr_read)
     });
 
-    // The overall deadline bounds the whole lifecycle: wait for the root,
-    // then drain stdout/stderr. A descendant may inherit the pipe handles
-    // and keep them open after the root exits; if the drain outlives the
-    // deadline, terminate the tree so the pipes close and the drain ends.
-    let deadline = tokio::time::Instant::now() + timeout;
-    let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
-
-    // Kill the whole process tree: the root and (on Windows) all Job
-    // Object members; on Unix the process group (killpg), then reap.
-    // If the job/group is unavailable, fall back to root-only kill; the
-    // bounded drain below prevents an indefinite hang either way.
+    // The overall deadline bounds the whole execution lifecycle.
     //
-    // `kill_group` must be true only while the root's process group is
-    // still provably owned by this child. Once the root has been reaped
-    // (child.wait() succeeded), the numeric PGID (= root PID at spawn) is
-    // stale: it may have been recycled into an unrelated process group,
-    // and killpg on it would signal that group. Root-reaped branches pass
-    // false; the timeout branch (root may still run) passes true.
-    let mut kill_tree = async |kill_group: bool| {
-        #[cfg(not(unix))]
-        let _ = kill_group;
-        let _ = child.kill().await;
-        if let Some(j) = &job {
-            j.terminate();
-        }
-        #[cfg(unix)]
-        if kill_group {
-            if let Some(pid) = child_pid {
-                // Child was spawned with process_group(0): its PGID == its
-                // PID, so killpg(pid, SIGKILL) reaches every descendant.
-                // Use the PID captured at spawn: child.id() returns None
-                // once the child has been reaped by kill().await / wait().
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-        }
-        let _ = child.wait().await;
-    };
+    // Lifecycle design:
+    // We drain stdout/stderr pipes up to the deadline BEFORE reaping the
+    // root process. While the child is unreaped (running or zombie), its PID
+    // and PGID are guaranteed un-recycled in the kernel's process table.
+    // If the drain reaches EOF within deadline, all holders of the pipes
+    // have terminated, and awaiting child.wait() reaps the root immediately.
+    // If the drain hits deadline (a runaway child or descendant holding the
+    // pipe open), terminate_tree terminates the tree and process group while the
+    // PGID is still 100% active and un-recycled, then reaps the root.
+    let deadline = tokio::time::Instant::now() + timeout;
 
-    let status = match wait_result {
-        Ok(Ok(status)) => {
-            match tokio::time::timeout_at(deadline, &mut drain).await {
-                Ok(Ok((stdout_capture, stderr_capture))) => proc_output_from_captures(
-                    stdout_capture,
-                    stderr_capture,
+    let drain_result = tokio::time::timeout_at(deadline, &mut drain).await;
+
+    resolve_drain_result(
+        drain_result,
+        deadline,
+        &mut child,
+        job.as_ref(),
+        child_pid,
+        &stdout_capture,
+        &stderr_capture,
+        &mut drain,
+    )
+    .await
+}
+
+async fn resolve_drain_result(
+    drain_result: Result<
+        Result<(PipeCapture, PipeCapture), tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >,
+    deadline: tokio::time::Instant,
+    child: &mut tokio::process::Child,
+    job: Option<&job_object::JobObject>,
+    child_pid: Option<u32>,
+    stdout_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+    stderr_capture: &std::sync::Arc<std::sync::Mutex<PipeCapture>>,
+    drain: &mut JoinHandle<(PipeCapture, PipeCapture)>,
+) -> ProcOutput {
+    match drain_result {
+        Ok(Ok((stdout_cap, stderr_cap))) => {
+            // Pipes reached EOF cleanly (all write ends closed).
+            // Await the root process exit status with whatever time remains.
+            match tokio::time::timeout_at(deadline, child.wait()).await {
+                Ok(Ok(status)) => proc_output_from_captures(
+                    stdout_cap,
+                    stderr_cap,
                     status.code().unwrap_or(-1),
                     false,
                     None,
                 ),
-                Ok(Err(_)) => ProcOutput {
-                    exit_code: status.code().unwrap_or(-1),
-                    timed_out: false,
-                    capture_truncated: false,
-                    error: Some("pipe drain task failed".to_string()),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                },
+                Ok(Err(e)) => {
+                    let wait_error = format!("process wait failed: {e}");
+                    terminate_tree(child, job, child_pid).await;
+                    proc_output_from_captures(stdout_cap, stderr_cap, -1, false, Some(wait_error))
+                }
                 Err(_elapsed) => {
-                    // Root exited but the drain hit the overall deadline
-                    // (a descendant is holding a pipe open). Terminate the
-                    // tree, then collect what the drain produced. The root
-                    // is already reaped, so killpg on its stale PGID would
-                    // be unsafe (possible PID reuse) — skip the group kill.
-                    kill_tree(false).await;
-                    let (stdout_capture, stderr_capture) =
-                        bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
-                    proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
+                    // Root process closed pipes but did not exit before deadline.
+                    terminate_tree(child, job, child_pid).await;
+                    proc_output_from_captures(stdout_cap, stderr_cap, -1, true, None)
                 }
             }
         }
-        Ok(Err(e)) => {
-            // child.wait() failed — the child may still be running. Kill
-            // the tree (group included, the child owns its PGID) to
-            // prevent zombies and close pipes, then collect whatever
-            // output arrived.
-            let wait_error = format!("process wait failed: {e}");
-            kill_tree(true).await;
-            match tokio::time::timeout_at(deadline, &mut drain).await {
-                Ok(Ok((stdout_capture, stderr_capture))) => proc_output_from_captures(
-                    stdout_capture,
-                    stderr_capture,
-                    -1,
-                    false,
-                    Some(wait_error),
-                ),
-                Ok(Err(_)) => ProcOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: -1,
-                    timed_out: false,
-                    capture_truncated: false,
-                    // Preserve the underlying wait failure instead of
-                    // replacing it with the drain task error.
-                    error: Some(format!("{wait_error}; pipe drain task failed")),
-                },
-                Err(_elapsed) => {
-                    let (stdout_capture, stderr_capture) =
-                        bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
-                    // The drain timed out; report the wait failure, not a
-                    // benign timeout. The original execution error must
-                    // not be masked as a normal timeout.
-                    proc_output_from_captures(stdout_capture, stderr_capture, -1, true, Some(wait_error))
-                }
-            }
+        Ok(Err(_)) => {
+            // Drain task failed (e.g. panicked). The JoinHandle was already
+            // polled to completion by the timeout_at above, so it must NOT be
+            // polled again (Tokio 1.52.3 panics: "JoinHandle polled after
+            // completion"). Snapshot whatever the shared captures hold.
+            terminate_tree(child, job, child_pid).await;
+            let (stdout_cap, stderr_cap) =
+                drain_captures_from_shares(&stdout_capture, &stderr_capture);
+            proc_output_from_captures(
+                stdout_cap,
+                stderr_cap,
+                -1,
+                false,
+                Some("pipe drain task failed".to_string()),
+            )
         }
         Err(_elapsed) => {
-            // Root did not exit before the deadline. The root still owns
-            // its process group, so the group kill reaches all descendants.
-            kill_tree(true).await;
-            let (stdout_capture, stderr_capture) =
-                bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
-            proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
+            // Deadline hit while draining (long-running process or descendant
+            // holding inherited pipe). Terminate tree while PGID is valid,
+            // then collect what was captured.
+            terminate_tree(child, job, child_pid).await;
+            let (stdout_cap, stderr_cap) = bounded_rejoin(
+                drain,
+                &stdout_capture,
+                &stderr_capture,
+                BOUNDED_DRAIN_TIMEOUT_MS,
+            )
+            .await;
+            proc_output_from_captures(stdout_cap, stderr_cap, -1, true, None)
         }
-    };
-
-    status
+    }
 }
 
 #[cfg(test)]
@@ -930,7 +1007,10 @@ mod tests {
             }
         }
         let capture = read_capped_pipe(FailingReader { delivered: false }).await;
-        assert_eq!(capture.bytes, b"partial", "bytes before the error must survive");
+        assert_eq!(
+            capture.bytes, b"partial",
+            "bytes before the error must survive"
+        );
         let err = capture.read_error.expect("read error must be recorded");
         assert!(
             err.contains("simulated pipe break"),
@@ -1175,7 +1255,10 @@ mod tests {
             .ok()
             .and_then(|stat| {
                 let idx = stat.rfind(')')?;
-                stat[idx + 1..].split_whitespace().next().map(str::to_string)
+                stat[idx + 1..]
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
             })
             .map(|state| state != "Z" && state != "X")
             .unwrap_or(false);
@@ -1526,6 +1609,284 @@ mod tests {
         // Must be a multiple of 3 (each 測 is 3 bytes) unless truncated to
         // empty — floor_char_boundary guarantees char alignment.
         assert_eq!(cut.len() % 3, 0, "cut preserves whole chars");
+    }
+
+    #[tokio::test]
+    async fn test_bounded_rejoin_preserves_partial_output_on_abort() {
+        let stdout_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+        let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+
+        {
+            let mut cap = stdout_capture.lock().unwrap();
+            cap.bytes.extend_from_slice(b"partial diagnostic stdout");
+        }
+        {
+            let mut cap = stderr_capture.lock().unwrap();
+            cap.bytes.extend_from_slice(b"partial diagnostic stderr");
+        }
+
+        let mut drain = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            (PipeCapture::empty(), PipeCapture::empty())
+        });
+
+        let (stdout, stderr) =
+            bounded_rejoin(&mut drain, &stdout_capture, &stderr_capture, 50).await;
+
+        assert_eq!(
+            stdout.bytes, b"partial diagnostic stdout",
+            "bounded_rejoin must preserve buffered stdout on abort"
+        );
+        assert_eq!(
+            stderr.bytes, b"partial diagnostic stderr",
+            "bounded_rejoin must preserve buffered stderr on abort"
+        );
+    }
+
+    fn set_age(path: &std::path::Path, age: std::time::Duration) {
+        let target = std::time::SystemTime::now()
+            .checked_sub(age)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(target)
+            .expect("set mtime");
+    }
+
+    #[tokio::test]
+    async fn test_drain_error_returns_error_without_repolling_consumed_handle() {
+        let stdout_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+        let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::empty()));
+
+        // A real child so terminate_tree has a valid process to kill/reap.
+        let mut child = if cfg!(windows) {
+            Command::new("cmd.exe")
+                .args(["/c", "echo hi"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cmd")
+        } else {
+            Command::new("sh")
+                .args(["-c", "echo hi"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sh")
+        };
+
+        // Drain task that panics => JoinHandle yields Err(JoinError), matching
+        // the timeout_at result shape run_foreground produces.
+        let mut drain = tokio::spawn(async {
+            panic!("simulated pipe drain failure");
+        });
+        let res = tokio::time::timeout(Duration::from_secs(5), &mut drain).await;
+        let join_err = match res {
+            Ok(Err(e)) => e,
+            _ => panic!("drain should fail with JoinError"),
+        };
+
+        // The Ok(Err) arm must snapshot the shared captures (never re-poll the
+        // consumed `drain`) and surface the drain failure as an error. If the
+        // arm is ever changed to call bounded_rejoin on the completed handle,
+        // this test panics exactly like the old run_foreground did.
+        let out = resolve_drain_result(
+            Ok(Err(join_err)),
+            tokio::time::Instant::now(),
+            &mut child,
+            None,
+            None,
+            &stdout_capture,
+            &stderr_capture,
+            &mut drain,
+        )
+        .await;
+
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pipe drain task failed"),
+            "drain failure must surface as an error, got {:?}",
+            out.error
+        );
+        assert_eq!(out.exit_code, -1);
+        assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn test_prune_temp_logs_only_deletes_feature_logs() {
+        let dir = std::env::temp_dir().join(format!(
+            "hands_prune_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        let old_other_file = dir.join("important-file.txt");
+        let old_feature_log = dir.join("output-999-888.log");
+        let recent_feature_log = dir.join("output-999-889.log");
+
+        std::fs::write(&old_other_file, "don't delete").unwrap();
+        std::fs::write(&old_feature_log, "old log").unwrap();
+        std::fs::write(&recent_feature_log, "new log").unwrap();
+
+        // Age both the unrelated file and one feature log past the 1-day
+        // cutoff. A regression that removed ANY file older than a day would
+        // delete old_other_file; a regression that ignored the age would
+        // delete recent_feature_log.
+        set_age(&old_other_file, std::time::Duration::from_secs(2 * 86_400));
+        set_age(&old_feature_log, std::time::Duration::from_secs(2 * 86_400));
+
+        prune_temp_logs(&dir);
+
+        assert!(
+            old_other_file.exists(),
+            "old non-feature file must NOT be deleted"
+        );
+        assert!(!old_feature_log.exists(), "old feature log must be deleted");
+        assert!(
+            recent_feature_log.exists(),
+            "recent feature log must NOT be deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_timeout_terminates_descendant_when_root_exits() {
+        let python =
+            crate::service::which("python").expect("Python is required by the Windows test gate");
+        let root = std::env::temp_dir().join(format!(
+            "hands_run_proc_root_exit_win_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create tree-kill fixture directory");
+        let script = root.join("spawn_child_exit.py");
+        let pid_file = root.join("child.pid");
+        std::fs::write(
+            &script,
+            "import pathlib, subprocess, sys, time\n\
+             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n\
+             pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n\
+             sys.exit(0)\n",
+        )
+        .expect("write tree-kill fixture");
+
+        let result = run_foreground(
+            python.to_str().expect("python path utf-8"),
+            &[
+                script.to_string_lossy().to_string(),
+                pid_file.to_string_lossy().to_string(),
+            ],
+            None,
+            Some(700),
+            None,
+        )
+        .await;
+        assert!(
+            result.timed_out,
+            "fixture should time out because descendant holds pipe"
+        );
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("child PID fixture should be written before exit")
+            .trim()
+            .parse()
+            .expect("child PID must be numeric");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tasklist = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist descendant probe");
+        let listing = String::from_utf8_lossy(&tasklist.stdout);
+        let still_alive = listing.contains(&format!(",\"{pid}\","));
+        if still_alive {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !still_alive,
+            "timeout when root exits must terminate descendant PID {pid}; tasklist={listing}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_timeout_terminates_descendant_when_root_exits_unix() {
+        let python = "python3";
+        let root = std::env::temp_dir().join(format!(
+            "hands_run_proc_root_exit_unix_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create unix tree-kill fixture directory");
+        let script = root.join("spawn_child_exit.py");
+        let pid_file = root.join("child.pid");
+        std::fs::write(
+            &script,
+            "import pathlib, subprocess, sys, time\n\
+             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n\
+             pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n\
+             sys.exit(0)\n",
+        )
+        .expect("write unix tree-kill fixture");
+
+        let result = run_foreground(
+            python,
+            &[
+                script.to_string_lossy().to_string(),
+                pid_file.to_string_lossy().to_string(),
+            ],
+            None,
+            Some(700),
+            None,
+        )
+        .await;
+        assert!(
+            result.timed_out,
+            "fixture should time out because descendant holds pipe"
+        );
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("child PID fixture should be written before exit")
+            .trim()
+            .parse()
+            .expect("child PID must be numeric");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let still_alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let idx = stat.rfind(')')?;
+                stat[idx + 1..]
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            })
+            .map(|state| state != "Z" && state != "X")
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !still_alive,
+            "Unix timeout when root exits must terminate descendant PID {pid} via process group kill"
+        );
     }
 
     fn extract_full_output_log_path(text: &str) -> Option<std::path::PathBuf> {
