@@ -39,6 +39,21 @@ mod job_object {
 
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_SET_QUOTA: u32 = 0x0100;
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    const TH32CS_SNAPTHREAD: u32 = 0x00000004;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct THREADENTRY32 {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ThreadID: u32,
+        th32OwnerProcessID: u32,
+        tpBasePri: i32,
+        tpDeltaPri: i32,
+        dwFlags: u32,
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -48,6 +63,11 @@ mod job_object {
         fn TerminateJobObject(hJob: HANDLE, uExitCode: u32) -> BOOL;
         fn CloseHandle(hObject: HANDLE) -> BOOL;
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: BOOL, dwProcessId: u32) -> HANDLE;
+        fn OpenThread(dwDesiredAccess: u32, bInheritHandle: BOOL, dwThreadId: u32) -> HANDLE;
+        fn ResumeThread(hThread: HANDLE) -> u32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
+        fn Thread32First(hSnapshot: HANDLE, lpte: *mut THREADENTRY32) -> BOOL;
+        fn Thread32Next(hSnapshot: HANDLE, lpte: *mut THREADENTRY32) -> BOOL;
     }
 
     // Job object handles are thread-safe; the raw HANDLE pointer is
@@ -67,7 +87,13 @@ mod job_object {
         }
 
         pub fn assign_process(&self, pid: u32) -> bool {
-            let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, 0, pid) };
+            let process = unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_SET_QUOTA | PROCESS_SUSPEND_RESUME,
+                    0,
+                    pid,
+                )
+            };
             if process.is_null() {
                 return false;
             }
@@ -79,6 +105,41 @@ mod job_object {
         pub fn terminate(&self) -> bool {
             unsafe { TerminateJobObject(self.0, 1) != 0 }
         }
+    }
+
+    /// Resume the suspended initial thread of `pid` (created via
+    /// CREATE_SUSPENDED) so the process starts executing.
+    pub fn resume_process(pid: u32) -> bool {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot.is_null() {
+            return false;
+        }
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            cntUsage: 0,
+            th32ThreadID: 0,
+            th32OwnerProcessID: 0,
+            tpBasePri: 0,
+            tpDeltaPri: 0,
+            dwFlags: 0,
+        };
+        let mut resumed = false;
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                let thread =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if !thread.is_null() {
+                    unsafe { ResumeThread(thread) };
+                    unsafe { CloseHandle(thread) };
+                    resumed = true;
+                    break;
+                }
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
+        }
+        unsafe { CloseHandle(snapshot) };
+        resumed
     }
 
     impl Drop for JobObject {
@@ -111,6 +172,14 @@ fn create_job_for_child(pid: u32) -> Option<job_object::JobObject> {
         return None;
     }
     Some(j)
+}
+
+/// Resume a suspended Windows process (created via CREATE_SUSPENDED)
+/// without a Job Object handle. Used when job creation/assignment failed
+/// but the child was spawned suspended and must not stay frozen forever.
+#[cfg(windows)]
+fn resume_suspended_child(pid: u32) {
+    let _ = job_object::resume_process(pid);
 }
 
 #[cfg(not(windows))]
@@ -601,6 +670,19 @@ pub async fn run_foreground(
         }
     }
 
+    #[cfg(windows)]
+    {
+        // Spawn the child suspended so the Job Object can be assigned
+        // BEFORE the child's first instruction runs. This closes the
+        // spawn-to-assign race: without CREATE_SUSPENDED, a child that
+        // spawns a descendant before assignment leaves that descendant
+        // outside the job, and a timeout would orphan it with the pipe
+        // handles still open.
+        // CREATE_SUSPENDED (0x4). tokio always ORs CREATE_UNICODE_ENVIRONMENT
+        // (0x400) itself, so passing only 0x4 is correct.
+        cmd.creation_flags(0x0000_0004);
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -623,12 +705,27 @@ pub async fn run_foreground(
 
     // Create Job Object for process-tree ownership (Windows). On timeout,
     // terminating the job kills all descendants, closing pipe handles.
-    // ponytail: the job is assigned after spawn, so a child that spawns a
-    // descendant before assignment escapes the job. Deterministic fix is
-    // CREATE_SUSPENDED spawn -> assign -> resume; tokio Command does not
-    // expose it. This is a known residual race, not a deterministic
-    // guarantee — descendants spawned before assignment are not owned.
+    // The child is suspended at this point (CREATE_SUSPENDED), so
+    // assigning the job before resuming guarantees the entire tree is
+    // owned by the job from the child's first instruction onward.
+    #[cfg(windows)]
     let job = child_pid.and_then(create_job_for_child);
+    #[cfg(not(windows))]
+    let job: Option<job_object::JobObject> = None;
+
+    // The child is suspended at this point; the Job Object was assigned
+    // before any of its code ran. Resume the initial thread so the child
+    // starts executing inside the job's ownership. If resume fails
+    // (process exited before we got here), fall back to the pre-suspend
+    // behavior — the bounded drain still prevents an indefinite hang.
+    #[cfg(windows)]
+    if job.is_some() {
+        let _ = job_object::resume_process(child_pid.unwrap_or(0));
+    } else if let Some(pid) = child_pid {
+        // Job creation/assignment failed; the child is still suspended.
+        // Resume it directly so the command doesn't hang forever.
+        resume_suspended_child(pid);
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -663,19 +760,30 @@ pub async fn run_foreground(
     // Object members; on Unix the process group (killpg), then reap.
     // If the job/group is unavailable, fall back to root-only kill; the
     // bounded drain below prevents an indefinite hang either way.
-    let kill_tree = async {
+    //
+    // `kill_group` must be true only while the root's process group is
+    // still provably owned by this child. Once the root has been reaped
+    // (child.wait() succeeded), the numeric PGID (= root PID at spawn) is
+    // stale: it may have been recycled into an unrelated process group,
+    // and killpg on it would signal that group. Root-reaped branches pass
+    // false; the timeout branch (root may still run) passes true.
+    let mut kill_tree = async |kill_group: bool| {
+        #[cfg(not(unix))]
+        let _ = kill_group;
         let _ = child.kill().await;
         if let Some(j) = &job {
             j.terminate();
         }
         #[cfg(unix)]
-        if let Some(pid) = child_pid {
-            // Child was spawned with process_group(0): its PGID == its
-            // PID, so killpg(pid, SIGKILL) reaches every descendant.
-            // Use the PID captured at spawn: child.id() returns None once
-            // the child has been reaped by kill().await / wait().await.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        if kill_group {
+            if let Some(pid) = child_pid {
+                // Child was spawned with process_group(0): its PGID == its
+                // PID, so killpg(pid, SIGKILL) reaches every descendant.
+                // Use the PID captured at spawn: child.id() returns None
+                // once the child has been reaped by kill().await / wait().
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
             }
         }
         let _ = child.wait().await;
@@ -702,8 +810,10 @@ pub async fn run_foreground(
                 Err(_elapsed) => {
                     // Root exited but the drain hit the overall deadline
                     // (a descendant is holding a pipe open). Terminate the
-                    // tree, then collect what the drain produced.
-                    kill_tree.await;
+                    // tree, then collect what the drain produced. The root
+                    // is already reaped, so killpg on its stale PGID would
+                    // be unsafe (possible PID reuse) — skip the group kill.
+                    kill_tree(false).await;
                     let (stdout_capture, stderr_capture) =
                         bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
                     proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
@@ -712,16 +822,18 @@ pub async fn run_foreground(
         }
         Ok(Err(e)) => {
             // child.wait() failed — the child may still be running. Kill
-            // the tree to prevent zombies and close pipes, then collect
-            // whatever output arrived.
-            kill_tree.await;
+            // the tree (group included, the child owns its PGID) to
+            // prevent zombies and close pipes, then collect whatever
+            // output arrived.
+            let wait_error = format!("process wait failed: {e}");
+            kill_tree(true).await;
             match tokio::time::timeout_at(deadline, &mut drain).await {
                 Ok(Ok((stdout_capture, stderr_capture))) => proc_output_from_captures(
                     stdout_capture,
                     stderr_capture,
                     -1,
                     false,
-                    Some(format!("process wait failed: {e}")),
+                    Some(wait_error),
                 ),
                 Ok(Err(_)) => ProcOutput {
                     stdout: String::new(),
@@ -729,18 +841,24 @@ pub async fn run_foreground(
                     exit_code: -1,
                     timed_out: false,
                     capture_truncated: false,
-                    error: Some("pipe drain task failed".to_string()),
+                    // Preserve the underlying wait failure instead of
+                    // replacing it with the drain task error.
+                    error: Some(format!("{wait_error}; pipe drain task failed")),
                 },
                 Err(_elapsed) => {
                     let (stdout_capture, stderr_capture) =
                         bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
-                    proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
+                    // The drain timed out; report the wait failure, not a
+                    // benign timeout. The original execution error must
+                    // not be masked as a normal timeout.
+                    proc_output_from_captures(stdout_capture, stderr_capture, -1, true, Some(wait_error))
                 }
             }
         }
         Err(_elapsed) => {
-            // Root did not exit before the deadline.
-            kill_tree.await;
+            // Root did not exit before the deadline. The root still owns
+            // its process group, so the group kill reaches all descendants.
+            kill_tree(true).await;
             let (stdout_capture, stderr_capture) =
                 bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
             proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
@@ -1047,12 +1165,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // killpg must have terminated the descendant (it was in the same
-        // process group as the root). Probe with kill -0; a lingering PID
-        // or zombie is a regression.
-        let still_alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|s| s.success())
+        // process group as the root). Read /proc/<pid>/stat: an absent file
+        // or a zombie state 'Z' both mean terminated. kill -0 wrongly
+        // succeeds on zombies, so it cannot prove termination.
+        // /proc/<pid>/stat is "pid (comm) state ...". comm may contain
+        // spaces/parens, so the state is the first token after the LAST
+        // ')'. Treat a missing file or state 'Z'/'X' as terminated.
+        let still_alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let idx = stat.rfind(')')?;
+                stat[idx + 1..].split_whitespace().next().map(str::to_string)
+            })
+            .map(|state| state != "Z" && state != "X")
             .unwrap_or(false);
         let _ = std::fs::remove_dir_all(&root);
         assert!(
