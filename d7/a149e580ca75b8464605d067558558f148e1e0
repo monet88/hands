@@ -1,0 +1,22 @@
+README.md
+  h_17f2fa2b92da6a 85,122
+crate/src/main.rs
+  h_17f2fa2b92da6a 264-266
+crate/src/mcp.rs
+  h_17f2fa2b92da6a 209-211
+crate/src/run_proc.rs
+  h_17f2fa2b92da6a 7,16-155,157,166-168,173,175,234-239,241-262,264-267,277,289-406,425-460,499,505-528,531-536,538-549,551-575,578-588,591-598,600,602-606,608-610,678-818,873-877,883,886,894-898,900,903,906-907,910-912,914-919,925-934,939-941,961-1142
+scripts/e2e_gate_windows.ps1
+  h_17f2fa2b92da6a 216,322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d7a149e580ca75b8464605d067558558f148e1e0",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
