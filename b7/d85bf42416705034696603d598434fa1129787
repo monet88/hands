@@ -1,0 +1,20 @@
+crate/src/doctor.rs
+  h_17f2fa2b92da6a 601,607-608,645,665-666,688-689,707-710,726-727,730
+crate/src/host.rs
+  h_17f2fa2b92da6a 420,448,536,545,882-883,899,941
+crate/src/secrets.rs
+  h_17f2fa2b92da6a 377,390
+crate/src/testenv.rs
+  h_17f2fa2b92da6a 6,13-25,27,30,34-38,61-64,74-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b7d85bf42416705034696603d598434fa1129787",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
