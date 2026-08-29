@@ -374,6 +374,7 @@ pub fn win_cred_delete() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::isolate_env;
 
     #[test]
     fn test_valid_runtime_key() {
@@ -386,6 +387,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_windows_credential_manager_roundtrip() {
+        let (_env_lock, _env) = isolate_env("secrets_credential_roundtrip");
         // Isolated test-namespace target: the production credential
         // `dev.hands.runtime-key` is never read, written, or deleted here.
         // The guard restores (or clears) the test target on every exit path,
@@ -397,9 +399,6 @@ mod tests {
         impl Drop for CleanupNamespace {
             fn drop(&mut self) {
                 let _ = win_cred_delete();
-                unsafe {
-                    std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
-                }
             }
         }
         let _cleanup = CleanupNamespace;

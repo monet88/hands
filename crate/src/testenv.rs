@@ -3,35 +3,39 @@
 //!
 //! Never referenced by production code; wired via `#[cfg(test)] mod testenv;`.
 
+use parking_lot::Mutex;
 use std::fs;
 use std::path::PathBuf;
-use parking_lot::Mutex;
 
 /// Serializes every test that mutates process-global environment variables.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// Restores `HANDS_CONFIG_DIR`, `HANDS_WORKSPACE`, and
-/// `GROK_HARNESS_WORKSPACE` on drop and removes the temp config root.
+/// Environment state shared tests may mutate while holding `TEST_LOCK`.
+const SERIALIZED_ENV_VARS: &[&str] = &[
+    "HANDS_CONFIG_DIR",
+    "HANDS_WORKSPACE",
+    "GROK_HARNESS_WORKSPACE",
+    "HANDS_TEST_CRED_NAMESPACE",
+    "CONTROL_PLANE_API_KEY",
+    "CONTROL_PLANE_TUNNEL_ID",
+    "PATH",
+];
+
+/// Restores serialized process-global env state on drop and removes the temp
+/// config root.
 pub struct EnvGuard {
-    saved_config_dir: Option<std::ffi::OsString>,
-    saved_workspace: Option<std::ffi::OsString>,
-    saved_legacy: Option<std::ffi::OsString>,
+    saved_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
     pub root: PathBuf,
 }
+
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
-            match &self.saved_config_dir {
-                Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
-                None => std::env::remove_var("HANDS_CONFIG_DIR"),
-            }
-            match &self.saved_workspace {
-                Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
-                None => std::env::remove_var("HANDS_WORKSPACE"),
-            }
-            match &self.saved_legacy {
-                Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
-                None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
+            for (name, value) in self.saved_env.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
         let _ = fs::remove_dir_all(&self.root);
@@ -54,9 +58,10 @@ pub fn isolate_env(name: &str) -> (parking_lot::MutexGuard<'static, ()>, EnvGuar
     ));
     fs::create_dir_all(&root).expect("create isolated test config dir");
     let env_guard = EnvGuard {
-        saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
-        saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
-        saved_legacy: std::env::var_os("GROK_HARNESS_WORKSPACE"),
+        saved_env: SERIALIZED_ENV_VARS
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect(),
         root: root.clone(),
     };
     unsafe {
@@ -65,4 +70,24 @@ pub fn isolate_env(name: &str) -> (parking_lot::MutexGuard<'static, ()>, EnvGuar
         std::env::remove_var("GROK_HARNESS_WORKSPACE");
     }
     (guard, env_guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_isolate_env_restores_serialized_env_state() {
+        let (_env_lock, env) = isolate_env("restore_serialized_state");
+        let expected_env = env.saved_env.clone();
+        unsafe {
+            std::env::set_var("CONTROL_PLANE_API_KEY", "sk-test-override");
+            std::env::set_var("PATH", "hands-test-path-override");
+        }
+        drop(env);
+
+        for (name, expected) in expected_env {
+            assert_eq!(std::env::var_os(name), expected, "env restore mismatch: {name}");
+        }
+    }
 }

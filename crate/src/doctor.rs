@@ -598,27 +598,18 @@ fn diagnose_with_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::isolate_env;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_doctor_report_json_schema_and_secrecy() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("hands_doc_test_1_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let ws_dir = temp_dir.join("workspace");
+        let (_env_lock, env) = isolate_env("doctor_json_schema");
+        let ws_dir = env.root.join("ws");
         fs::create_dir_all(&ws_dir).expect("create ws");
-
-        let cfg_dir = temp_dir.join("config");
-        fs::create_dir_all(&cfg_dir).expect("create cfg");
 
         let secret_key = "sk-test-secret-key-123456789012345678901234567890";
         unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg_dir.to_str().unwrap());
             std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
             std::env::set_var("CONTROL_PLANE_API_KEY", secret_key);
             std::env::set_var("CONTROL_PLANE_TUNNEL_ID", "tunnel_test123");
@@ -647,18 +638,11 @@ mod tests {
             "Secret key leaked in human report: {human}"
         );
 
-        unsafe {
-            std::env::remove_var("HANDS_CONFIG_DIR");
-            std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
-            std::env::remove_var("CONTROL_PLANE_API_KEY");
-            std::env::remove_var("CONTROL_PLANE_TUNNEL_ID");
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_doctor_missing_workspace() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let (_env_lock, _env) = isolate_env("doctor_missing_workspace");
         let nonexistent = Path::new("Z:/path/that/does/not/exist/for/sure/hands_test");
         let report = diagnose(nonexistent);
         let json = report.to_json();
@@ -678,18 +662,11 @@ mod tests {
 
     #[test]
     fn test_doctor_missing_components() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("hands_doc_test_2_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let ws_dir = temp_dir.join("workspace");
+        let (_env_lock, env) = isolate_env("doctor_missing_components");
+        let ws_dir = env.root.join("ws");
         fs::create_dir_all(&ws_dir).expect("create ws");
 
-        // Set HANDS_CONFIG_DIR to empty temp dir so no keys or configs are found
-        let cfg_dir = temp_dir.join("hands_cfg");
-        fs::create_dir_all(&cfg_dir).expect("create cfg");
         unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg_dir.to_str().unwrap());
             std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
             std::env::remove_var("CONTROL_PLANE_API_KEY");
             std::env::remove_var("CONTROL_PLANE_TUNNEL_ID");
@@ -704,31 +681,18 @@ mod tests {
         let human = report.render_human();
         assert!(human.contains("Hands Doctor"));
         assert!(human.contains("Configuration:"));
-
-        unsafe {
-            std::env::remove_var("HANDS_CONFIG_DIR");
-            std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_doctor_pinned_workspace() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("hands_doc_test_3_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let ws_dir = temp_dir.join("workspace");
+        let (_env_lock, env) = isolate_env("doctor_pinned_workspace");
+        let ws_dir = env.root.join("ws");
         fs::create_dir_all(&ws_dir).expect("create ws");
 
-        let cfg_dir = temp_dir.join("hands_cfg");
-        fs::create_dir_all(&cfg_dir).expect("create cfg");
         unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg_dir.to_str().unwrap());
             std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
         }
 
-        // Pin workspace
         let pinned_path = host::pin_workspace(&ws_dir).expect("pin ws");
         let report = diagnose(&pinned_path);
         let json = report.to_json();
@@ -736,22 +700,14 @@ mod tests {
         assert_eq!(report.workspace.pinned, true);
         assert!(report.workspace.pin.is_some());
         assert_eq!(json["workspace"]["pinned"], true);
-
-        unsafe {
-            std::env::remove_var("HANDS_CONFIG_DIR");
-            std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_doctor_not_a_directory_workspace() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("hands_doc_test_4_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).expect("create temp");
-        let file_path = temp_dir.join("file.txt");
+        let (_env_lock, env) = isolate_env("doctor_not_a_directory");
+        let fixture_dir = env.root.join("fixture");
+        fs::create_dir_all(&fixture_dir).expect("create fixture");
+        let file_path = fixture_dir.join("file.txt");
         fs::write(&file_path, "hello").expect("write file");
 
         let report = diagnose(&file_path);
@@ -763,26 +719,17 @@ mod tests {
         assert_eq!(report.ok, false);
         assert_eq!(json["workspace"]["is_dir"], false);
         assert_eq!(json["workspace"]["status"], "not_a_directory");
-
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_doctor_partial_failure_independence() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("hands_doc_test_5_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let ws_dir = temp_dir.join("workspace");
+        let (_env_lock, env) = isolate_env("doctor_partial_failure");
+        let ws_dir = env.root.join("ws");
         fs::create_dir_all(&ws_dir).expect("create ws");
 
-        let cfg_dir = temp_dir.join("hands_cfg");
-        fs::create_dir_all(&cfg_dir).expect("create cfg");
-        // Write tunnel_id file but no key
-        fs::write(cfg_dir.join("tunnel_id"), "tunnel_partial_test123\n").expect("write id");
+        fs::write(env.root.join("tunnel_id"), "tunnel_partial_test123\n").expect("write id");
 
         unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg_dir.to_str().unwrap());
             std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
             std::env::remove_var("CONTROL_PLANE_API_KEY");
             std::env::remove_var("CONTROL_PLANE_TUNNEL_ID");
@@ -791,11 +738,8 @@ mod tests {
         let report = diagnose(&ws_dir);
         let json = report.to_json();
 
-        // Workspace passes
         assert_eq!(report.workspace.exists, true);
         assert_eq!(report.workspace.status, "ok");
-
-        // Key is missing, but Tunnel ID is found
         assert_eq!(report.configuration.has_key, false);
         assert_eq!(report.configuration.has_tunnel_id, true);
         assert_eq!(
@@ -803,7 +747,6 @@ mod tests {
             Some("tunnel_partial_test123".to_string())
         );
 
-        // All checks are populated
         assert!(
             report
                 .checks
@@ -825,12 +768,6 @@ mod tests {
 
         assert_eq!(json["configuration"]["has_key"], false);
         assert_eq!(json["configuration"]["has_tunnel_id"], true);
-
-        unsafe {
-            std::env::remove_var("HANDS_CONFIG_DIR");
-            std::env::remove_var("HANDS_TEST_CRED_NAMESPACE");
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     fn deterministic_observations() -> DiagnosticObservations {

@@ -417,6 +417,7 @@ pub async fn build_bridge(cwd: PathBuf) -> Result<ToolBridge, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::isolate_env;
 
     #[test]
     #[cfg(windows)]
@@ -444,6 +445,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_cmd_path_shadowing_regression() {
+        let (_env_lock, _env) = isolate_env("host_cmd_path_shadow");
         // Create a temporary directory containing a fake shadowing cmd.ps1 and cmd.cmd
         let temp_dir =
             std::env::temp_dir().join(format!("hands_cmd_shadow_test_{}", std::process::id()));
@@ -470,10 +472,6 @@ mod tests {
             .output()
             .expect("must execute native cmd");
 
-        // Restore original PATH
-        unsafe {
-            std::env::set_var("PATH", &orig_path);
-        }
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         assert!(output.status.success(), "native cmd should succeed");
@@ -535,6 +533,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_compose_host_path() {
+        let (_env_lock, _env) = isolate_env("host_compose_path");
         compose_host_path();
         let path = std::env::var("PATH").unwrap_or_default();
         assert!(!path.is_empty(), "PATH should not be empty");
@@ -543,6 +542,7 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn test_orca_resolution_through_hands() {
+        let (_env_lock, _env) = isolate_env("host_orca_resolution");
         compose_host_path();
         let cwd = std::env::current_dir().unwrap();
         let bridge = build_bridge(cwd).await.expect("bridge should build");
@@ -879,57 +879,8 @@ mod tests {
 
     #[test]
     fn test_workspace_pin_and_resolve_with_unicode_and_spaces() {
-        // Hermetic: isolated config root; never touches the user's real pin.
-        // All workspace env overrides that affect `resolve_workspace` are
-        // snapshotted and restored on every exit path, including panics.
-        let temp_base = std::env::temp_dir().join(format!(
-            "hands_ws_test_🚀_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        ));
-        std::fs::create_dir_all(&temp_base).expect("create isolated config root");
-
-        struct EnvGuard {
-            saved_config_dir: Option<std::ffi::OsString>,
-            saved_workspace: Option<std::ffi::OsString>,
-            saved_legacy_workspace: Option<std::ffi::OsString>,
-            root: PathBuf,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.saved_config_dir {
-                        Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
-                        None => std::env::remove_var("HANDS_CONFIG_DIR"),
-                    }
-                    match &self.saved_workspace {
-                        Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
-                        None => std::env::remove_var("HANDS_WORKSPACE"),
-                    }
-                    match &self.saved_legacy_workspace {
-                        Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
-                        None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&self.root);
-            }
-        }
-        let _guard = EnvGuard {
-            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
-            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
-            saved_legacy_workspace: std::env::var_os("GROK_HARNESS_WORKSPACE"),
-            root: temp_base.clone(),
-        };
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", &temp_base);
-            std::env::remove_var("HANDS_WORKSPACE");
-            std::env::remove_var("GROK_HARNESS_WORKSPACE");
-        }
-
-        let ws_dir = temp_base.join("Sub Folder With Spaces 測試");
+        let (_env_lock, env) = isolate_env("host_workspace_pin_unicode");
+        let ws_dir = env.root.join("Sub Folder With Spaces 測試");
         std::fs::create_dir_all(&ws_dir).expect("should create test workspace directory");
 
         let pinned = pin_workspace(&ws_dir)
@@ -945,6 +896,7 @@ mod tests {
     }
     #[test]
     fn test_which_executable_discovery() {
+        let (_env_lock, _env) = isolate_env("host_which_discovery");
         let temp_dir = std::env::temp_dir().join(format!(
             "hands_which_test_{}_{}",
             std::process::id(),
@@ -974,10 +926,6 @@ mod tests {
         // Preserve comparison before destroying the fixture directory.
         let found_canon = found.as_ref().and_then(|p| p.canonicalize().ok());
         let expected_canon = fake_exe.canonicalize().ok();
-        // Restore PATH before assertions so env is clean even on failure.
-        unsafe {
-            std::env::set_var("PATH", &orig_path);
-        }
 
         assert!(
             found.is_some(),
@@ -990,6 +938,7 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn test_windows_terminal_foreground_and_bounded_output() {
+        let (_env_lock, _env) = isolate_env("host_terminal_foreground");
         compose_host_path();
         let temp_ws = std::env::temp_dir().join(format!(
             "hands_term_test_{}_{}",
