@@ -243,15 +243,20 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
             match cmd {
                 Cmd::List => {
                     let defs = bridge.tool_definitions().await;
-                    // Unify the local run_command tool and bridge tools
-                    // under one shape so the listing is homogeneous: every
-                    // entry uses the MCP `inputSchema` field.
-                    let mut tools: Vec<serde_json::Value> = vec![crate::run_proc::tool_json()];
+                    // `hands list` predates MCP tool JSON and exposes schemas
+                    // under `parameters`. Preserve that CLI contract for both
+                    // the local run_command tool and bridge-provided tools.
+                    let run_command = crate::run_proc::tool_json();
+                    let mut tools: Vec<serde_json::Value> = vec![serde_json::json!({
+                        "name": run_command["name"].clone(),
+                        "description": run_command["description"].clone(),
+                        "parameters": run_command["inputSchema"].clone(),
+                    })];
                     tools.extend(defs.into_iter().map(|d| {
                         serde_json::json!({
                             "name": d.function.name,
                             "description": d.function.description,
-                            "inputSchema": d.function.parameters,
+                            "parameters": d.function.parameters,
                         })
                     }));
                     println!(

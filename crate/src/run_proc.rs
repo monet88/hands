@@ -414,7 +414,24 @@ pub async fn handle_call(
     let explicit_workdir = arguments.get("workdir").and_then(serde_json::Value::as_str);
     let workdir = explicit_workdir.or(workspace);
     let timeout = arguments.get("timeout").and_then(serde_json::Value::as_u64);
-    let env = arguments.get("env");
+    let env = match arguments.get("env") {
+        None => None,
+        Some(value) => {
+            let Some(obj) = value.as_object() else {
+                return serde_json::json!({
+                    "content": [{ "type": "text", "text": "error: env must be an object" }],
+                    "isError": true
+                });
+            };
+            if obj.values().any(|value| !value.is_string()) {
+                return serde_json::json!({
+                    "content": [{ "type": "text", "text": "error: env must contain only string values" }],
+                    "isError": true
+                });
+            }
+            Some(value)
+        }
+    };
 
     let output = run_foreground(command, &args, workdir, timeout, env).await;
     let unbounded = render_tool_text(&output);
@@ -991,6 +1008,31 @@ mod tests {
             result.stdout.contains("works"),
             "env var should be visible, got: {}",
             result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_rejects_non_string_env_values() {
+        let arguments = serde_json::json!({
+            "command": if cfg!(windows) { "cmd.exe" } else { "sh" },
+            "args": if cfg!(windows) {
+                serde_json::json!(["/c", "echo SHOULD_NOT_RUN"])
+            } else {
+                serde_json::json!(["-c", "echo SHOULD_NOT_RUN"])
+            },
+            "env": { "HANDS_TEST_ENV": 123 }
+        });
+
+        let result = handle_call(&arguments, None).await;
+        assert_eq!(result["isError"], serde_json::Value::Bool(true));
+        let text = result["content"][0]["text"].as_str().expect("content text");
+        assert!(
+            text.contains("env must contain only string values"),
+            "unexpected validation error: {text}"
+        );
+        assert!(
+            !text.contains("SHOULD_NOT_RUN"),
+            "malformed env must be rejected before the child executes"
         );
     }
 
