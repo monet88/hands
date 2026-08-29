@@ -1,0 +1,18 @@
+crate/Cargo.toml
+  h_17f2fa2b92da6a 16
+crate/src/main.rs
+  h_17f2fa2b92da6a 246-248,254,274-280
+crate/src/run_proc.rs
+  h_17f2fa2b92da6a 94-99,390-392,397-401,404-413,462-465,474-477,500-502,504-510,540-545,548-553,585-587,593-602,635-660,662,881-944
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8317b0edf09c742c6b603b224b5b10384080c321",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
