@@ -7,26 +7,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
 
 use crate::host;
+use crate::plugin;
 use crate::ui;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "Hands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const READ_ONLY: &[&str] = &[
-    "workspace_info",
-    "read_file",
-    "grep",
-    "list_dir",
-    "glob",
-    "get_task_output",
-];
 
 pub struct McpHost {
     fallback_cwd: PathBuf,
@@ -60,6 +54,43 @@ impl McpHost {
         Ok(bridge)
     }
 
+    fn workspace_info_result(&self) -> Value {
+        let cwd = self.workspace();
+        let mut lines = vec![format!("workspace: {}", cwd.display())];
+        let recent: Vec<String> = host::read_recent()
+            .into_iter()
+            .filter(|p| p != &cwd)
+            .map(|p| p.display().to_string())
+            .collect();
+        if recent.is_empty() {
+            lines.push("recent: (none)".into());
+        } else {
+            lines.push("recent:".into());
+            for p in &recent {
+                lines.push(format!("  {p}"));
+            }
+        }
+        lines.push(
+            "Switch from chat with set_workspace({path}). Short names resolve under ~/Dev.".into(),
+        );
+        json!({
+            "content": [{ "type": "text", "text": lines.join("\n") }],
+            "structuredContent": {
+                "workspace": cwd.display().to_string(),
+                "recent": recent,
+            },
+            "isError": false
+        })
+    }
+
+    async fn switch_workspace(&self, raw: &str) -> Result<PathBuf, String> {
+        let path = host::resolve_project(raw)?;
+        let cwd = host::pin_workspace(&path)?;
+        let mut cache = self.cached.lock().await;
+        *cache = None;
+        Ok(cwd)
+    }
+
     pub async fn serve_stdio(self: Arc<Self>) -> Result<(), String> {
         let stdin = BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();
@@ -89,6 +120,47 @@ impl McpHost {
     }
 
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> Result<(), String> {
+        let warm = Arc::clone(&self);
+        tokio::spawn(async move {
+            if let Err(e) = warm.bridge().await {
+                eprintln!("warmup: {e}");
+            }
+        });
+        #[cfg(unix)]
+        {
+            let sock = host::mcp_socket();
+            if let Some(parent) = sock.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&sock);
+            let uds = UnixListener::bind(&sock)
+                .map_err(|e| format!("bind {}: {e}", sock.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+            }
+            eprintln!("MCP uds  {}", sock.display());
+            let host_u = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    match uds.accept().await {
+                        Ok((stream, _)) => {
+                            let host = Arc::clone(&host_u);
+                            tokio::spawn(async move {
+                                let (r, w) = stream.into_split();
+                                if let Err(e) =
+                                    handle_connection(BufReader::new(r), w, host).await
+                                {
+                                    eprintln!("uds: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!("uds accept: {e}"),
+                    }
+                }
+            });
+        }
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| format!("bind {addr}: {e}"))?;
@@ -101,7 +173,8 @@ impl McpHost {
                 .map_err(|e| format!("accept: {e}"))?;
             let host = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = handle_http(stream, host).await {
+                let (r, w) = stream.into_split();
+                if let Err(e) = handle_connection(BufReader::new(r), w, host).await {
                     eprintln!("http: {e}");
                 }
             });
@@ -120,6 +193,10 @@ impl McpHost {
             "ping" => Ok(json!({})),
             "tools/list" => self.tools_list().await,
             "tools/call" => self.tools_call(params).await,
+            "skills/list" => Ok(plugin::skills_list()),
+            "skills/get" => plugin::skills_get(&params),
+            "resources/list" => Ok(plugin::resources_list()),
+            "resources/read" => plugin::resources_read(&params),
             other => Err((
                 -32601,
                 format!("method not found: {other}"),
@@ -140,34 +217,39 @@ impl McpHost {
             .unwrap_or(PROTOCOL_VERSION);
         json!({
             "protocolVersion": client_version,
-            "capabilities": { "tools": { "listChanged": false } },
+            "capabilities": plugin::initialize_capabilities(),
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
             },
-            "instructions": format!(
-                "Hands: unofficial local coding tools for ChatGPT. No model. \
-                 Workspace is set on the machine with `hands use` or the config UI. \
-                 Call workspace_info first (now {}). \
-                 Then read_file/grep/glob/list_dir, write/search_replace/apply_patch to edit, \
-                 todo_write for plans, run_terminal_cmd to test (background + kill_task/get_task_output). \
-                 After each edit, rerun the failing check.",
-                self.workspace().display()
+            "instructions": plugin::initialize_instructions(
+                &self.workspace().display().to_string()
             ),
         })
     }
 
     async fn tools_list(&self) -> Result<Value, (i64, String, Value)> {
-        let mut tools = vec![json!({
-            "name": "workspace_info",
-            "description": "Return the active local workspace root. Call this before other tools if the user switched repos with hands use.",
-            "inputSchema": { "type": "object", "properties": {} },
-            "annotations": {
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "openWorldHint": false,
-            }
-        })];
+        let mut tools = vec![
+            plugin::tool_descriptor(
+                "workspace_info",
+                "Use this when you need the active local workspace root and recently used folders. Call before other tools if the workspace might have changed.",
+                json!({ "type": "object", "properties": {} }),
+            ),
+            plugin::tool_descriptor(
+                "set_workspace",
+                "Use this when the user wants another repo, including while they are not at the machine. Pins the active workspace. Accepts an absolute path, ~/path, or a short name resolved under ~/Dev (e.g. bunko).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to pin: absolute, ~/…, or folder name under ~/Dev"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            ),
+        ];
         let defs = self
             .bridge()
             .await
@@ -176,17 +258,8 @@ impl McpHost {
             .await;
         tools.extend(defs.into_iter().map(|d| {
             let name = d.function.name;
-            let read_only = READ_ONLY.contains(&name.as_str());
-            json!({
-                "name": name,
-                "description": d.function.description.unwrap_or_default(),
-                "inputSchema": d.function.parameters,
-                "annotations": {
-                    "readOnlyHint": read_only,
-                    "destructiveHint": !read_only,
-                    "openWorldHint": false,
-                }
-            })
+            let description = d.function.description.unwrap_or_default();
+            plugin::tool_descriptor(&name, &description, d.function.parameters)
         }));
         Ok(json!({ "tools": tools }))
     }
@@ -197,14 +270,30 @@ impl McpHost {
             .and_then(Value::as_str)
             .ok_or((-32602, "tools/call requires name".into(), Value::Null))?;
         if name == "workspace_info" {
-            let cwd = self.workspace();
-            return Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!("workspace: {}", cwd.display())
-                }],
-                "isError": false
-            }));
+            return Ok(self.workspace_info_result());
+        }
+        if name == "set_workspace" {
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "set_workspace requires path".into(), Value::Null))?;
+            return match self.switch_workspace(path).await {
+                Ok(cwd) => Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("workspace pinned: {}\nLater tools use this folder until set_workspace is called again.", cwd.display())
+                    }],
+                    "structuredContent": {
+                        "workspace": cwd.display().to_string()
+                    },
+                    "isError": false
+                })),
+                Err(e) => Ok(json!({
+                    "content": [{ "type": "text", "text": e }],
+                    "isError": true
+                })),
+            };
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         let call_id = format!(
@@ -251,94 +340,147 @@ async fn write_line(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<(),
     Ok(())
 }
 
-async fn handle_http(mut stream: TcpStream, host: Arc<McpHost>) -> Result<(), String> {
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
-    let mut header_buf = Vec::new();
+async fn handle_connection<R, W>(
+    mut reader: BufReader<R>,
+    mut writer: W,
+    host: Arc<McpHost>,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
+        let mut header_buf = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Ok(());
+            }
+            header_buf.extend_from_slice(line.as_bytes());
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if header_buf.len() > 64 * 1024 {
+                write_http(&mut writer, 431, "text/plain", b"headers too large", false)
+                    .await?;
+                return Ok(());
+            }
+        }
+        let header_text = String::from_utf8_lossy(&header_buf);
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("/");
+        let version = parts.next().unwrap_or("HTTP/1.1");
+
+        let mut content_length = 0usize;
+        let mut accept = String::new();
+        let mut connection = String::new();
+        for line in lines {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let k = k.trim();
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("accept") {
+                accept = v.to_string();
+            } else if k.eq_ignore_ascii_case("connection") {
+                connection = v.to_string();
+            }
+        }
+        let keep = if connection.eq_ignore_ascii_case("close") {
+            false
+        } else if connection.eq_ignore_ascii_case("keep-alive") {
+            true
+        } else {
+            version.eq_ignore_ascii_case("HTTP/1.1")
+        };
+
+        if content_length > 8 * 1024 * 1024 {
+            write_http(&mut writer, 413, "text/plain", b"body too large", false).await?;
             return Ok(());
         }
-        header_buf.extend_from_slice(line.as_bytes());
-        if line == "\r\n" || line == "\n" {
-            break;
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| format!("body: {e}"))?;
         }
-        if header_buf.len() > 64 * 1024 {
-            return write_http(&mut writer, 431, "text/plain", b"headers too large").await;
-        }
-    }
-    let header_text = String::from_utf8_lossy(&header_buf);
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
 
-    let mut content_length = 0usize;
-    let mut accept = String::new();
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
+        let path_only = path.split('?').next().unwrap_or(path);
+        if method == "GET" && (path_only == "/health" || path_only == "/healthz") {
+            write_http(&mut writer, 200, "text/plain", b"ok", keep).await?;
+            if !keep {
+                return Ok(());
+            }
             continue;
-        };
-        let k = k.trim();
-        let v = v.trim();
-        if k.eq_ignore_ascii_case("content-length") {
-            content_length = v.parse().unwrap_or(0);
-        } else if k.eq_ignore_ascii_case("accept") {
-            accept = v.to_string();
         }
-    }
-
-    if content_length > 8 * 1024 * 1024 {
-        return write_http(&mut writer, 413, "text/plain", b"body too large").await;
-    }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| format!("body: {e}"))?;
-    }
-
-    let path_only = path.split('?').next().unwrap_or(path);
-    if method == "GET" && (path_only == "/health" || path_only == "/healthz") {
-        return write_http(&mut writer, 200, "text/plain", b"ok").await;
-    }
-    if let Some((status, ctype, payload)) = ui::route(method, path_only, &body) {
-        return write_http(&mut writer, status, ctype, &payload).await;
-    }
-    if method != "POST" || path_only != "/mcp" {
-        return write_http(&mut writer, 404, "text/plain", b"not found").await;
-    }
-    let resp = match serde_json::from_slice::<Value>(&body) {
-        Ok(msg) => host
-            .handle_rpc(msg)
-            .await
-            .unwrap_or_else(|| json!({"jsonrpc": "2.0", "id": null, "result": {}})),
-        Err(e) => rpc_error(Value::Null, -32700, format!("parse error: {e}")),
-    };
-
-    let payload = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
-    if accept.contains("text/event-stream") && !accept.contains("application/json") {
-        let mut sse = Vec::from("event: message\ndata: ");
-        sse.extend_from_slice(&payload);
-        sse.extend_from_slice(b"\n\n");
-        write_http(&mut writer, 200, "text/event-stream", &sse).await
-    } else {
-        write_http(&mut writer, 200, "application/json", &payload).await
+        if path_only.contains("/.well-known/")
+            || (method == "GET" && path_only == "/" && !accept.to_lowercase().contains("text/html"))
+        {
+            write_http(
+                &mut writer,
+                404,
+                "application/json",
+                br#"{"error":"not_found"}"#,
+                keep,
+            )
+            .await?;
+            if !keep {
+                return Ok(());
+            }
+            continue;
+        }
+        if let Some((status, ctype, payload)) = ui::route(method, path_only, &body) {
+            write_http(&mut writer, status, ctype, &payload, keep).await?;
+            if !keep {
+                return Ok(());
+            }
+            continue;
+        }
+        if method != "POST" || path_only != "/mcp" {
+            write_http(&mut writer, 404, "text/plain", b"not found", keep).await?;
+            if !keep {
+                return Ok(());
+            }
+            continue;
+        }
+        let resp = match serde_json::from_slice::<Value>(&body) {
+            Ok(msg) => host
+                .handle_rpc(msg)
+                .await
+                .unwrap_or_else(|| json!({"jsonrpc": "2.0", "id": null, "result": {}})),
+            Err(e) => rpc_error(Value::Null, -32700, format!("parse error: {e}")),
+        };
+        let payload = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+        if accept.contains("text/event-stream") && !accept.contains("application/json") {
+            let mut sse = Vec::from("event: message\ndata: ");
+            sse.extend_from_slice(&payload);
+            sse.extend_from_slice(b"\n\n");
+            write_http(&mut writer, 200, "text/event-stream", &sse, keep).await?;
+        } else {
+            write_http(&mut writer, 200, "application/json", &payload, keep).await?;
+        }
+        if !keep {
+            return Ok(());
+        }
     }
 }
 
-async fn write_http(
-    writer: &mut tokio::net::tcp::WriteHalf<'_>,
+async fn write_http<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     status: u16,
     content_type: &str,
     body: &[u8],
+    keep_alive: bool,
 ) -> Result<(), String> {
     let reason = match status {
         200 => "OK",
@@ -348,8 +490,13 @@ async fn write_http(
         431 => "Request Header Fields Too Large",
         _ => "Error",
     };
+    let conn = if keep_alive {
+        "keep-alive"
+    } else {
+        "close"
+    };
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {conn}\r\n\r\n",
         body.len()
     );
     writer

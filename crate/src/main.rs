@@ -2,6 +2,7 @@
 
 mod host;
 mod mcp;
+mod plugin;
 mod secrets;
 mod service;
 mod setup;
@@ -155,7 +156,8 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         }
         Cmd::Watch => watch::run(),
         Cmd::Use { dir } => {
-            let cwd = host::pin_workspace(&dir)?;
+            let path = host::resolve_project(&dir.to_string_lossy())?;
+            let cwd = host::pin_workspace(&path)?;
             println!("{}", cwd.display());
             match service::ensure() {
                 Ok(true) => {

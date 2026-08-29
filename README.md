@@ -49,11 +49,20 @@ Scripts: `hands status --json`.
 
 Plugin name in ChatGPT: **Hands**.
 
+ChatGPT, not Hands, shows Confirm. MCP cannot turn that off.
+
+- Reads auto-run (`readOnlyHint`).
+- File edits are routine (`destructiveHint: false`) — auto under **Important actions**.
+- Shell / kill still confirm unless you opt in.
+
+**Unattended coding:** first write prompt → **Always allow**, or **Settings → Apps → Hands → Never ask**. New chats keep that app setting. Developer Mode “remember for this conversation” dies on a new chat.
+
 ## Tools
 
 | Tool | Role |
 |---|---|
-| `workspace_info` | current pin |
+| `workspace_info` | current pin + recent |
+| `set_workspace` | pin another folder (works from ChatGPT, including away) |
 | `read_file` | read |
 | `grep` | search contents |
 | `list_dir` | tree |
@@ -62,7 +71,7 @@ Plugin name in ChatGPT: **Hands**.
 | `write` | create / overwrite |
 | `apply_patch` | multi-hunk patch |
 | `todo_write` | task list |
-| `run_terminal_cmd` | tests / git / shell (background ok) |
+| `run_terminal_cmd` | tests / git / shell; long FG auto-backgrounds |
 | `get_task_output` | poll background job |
 | `kill_task` | stop background job |
 

@@ -18,4 +18,6 @@ MCP stdio (what tunnel-client launches): `hands` with no args.
 
 Config UI: `hands config` → http://127.0.0.1:8787/
 
+After Scan tools: ChatGPT **Settings → Apps → Hands → Never ask** (or **Always allow** on the first write) so coding does not stop on Confirm. Developer Mode remembers approve only for that conversation.
+
 Do not commit API keys. Not an official OpenAI or xAI product.

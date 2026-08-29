@@ -47,6 +47,10 @@ pub fn workspace_file() -> PathBuf {
     config_dir().join("workspace")
 }
 
+pub fn mcp_socket() -> PathBuf {
+    config_dir().join("mcp.sock")
+}
+
 /// Copy `~/.config/grok-harness` once if the new dir is empty.
 pub fn migrate_from_legacy() {
     let dest = config_dir();
@@ -88,7 +92,84 @@ pub fn pin_workspace(dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     std::fs::write(workspace_file(), format!("{}\n", cwd.display()))
         .map_err(|e| format!("write workspace pin: {e}"))?;
+    push_recent(&cwd);
     Ok(cwd)
+}
+
+fn recent_file() -> PathBuf {
+    config_dir().join("recent")
+}
+
+pub fn read_recent() -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(recent_file()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let p = PathBuf::from(line.trim());
+        if p.is_dir() && !out.contains(&p) {
+            out.push(p);
+        }
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out
+}
+
+fn push_recent(cwd: &Path) {
+    let mut items = read_recent();
+    items.retain(|p| p != cwd);
+    items.insert(0, cwd.to_path_buf());
+    items.truncate(20);
+    let body: String = items
+        .iter()
+        .map(|p| format!("{}\n", p.display()))
+        .collect();
+    let _ = std::fs::write(recent_file(), body);
+}
+
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    if raw == "~" {
+        return home_dir();
+    }
+    PathBuf::from(raw)
+}
+
+/// Resolve a path or short name (`bunko`, `~/Dev/bunko`) to an existing directory.
+pub fn resolve_project(raw: &str) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("empty path".into());
+    }
+    let expanded = expand_tilde(raw);
+    if expanded.is_dir() {
+        return dunce::canonicalize(&expanded).map_err(|e| e.to_string());
+    }
+    let mut tried = vec![expanded.clone()];
+    if !expanded.is_absolute() {
+        let name = Path::new(raw);
+        tried.push(home_dir().join(name));
+        tried.push(home_dir().join("Dev").join(name));
+        tried.push(home_dir().join("dev").join(name));
+        if let Some(pin) = read_pinned_workspace() {
+            tried.push(pin.join(name));
+            if let Some(parent) = pin.parent() {
+                tried.push(parent.join(name));
+            }
+        }
+    }
+    for c in &tried {
+        if c.is_dir() {
+            return dunce::canonicalize(c).map_err(|e| e.to_string());
+        }
+    }
+    Err(format!(
+        "not a directory: {raw}. Try an absolute path or a folder name under ~/Dev."
+    ))
 }
 
 /// Active workspace: env → pin file → `--cwd`/process cwd.
@@ -121,7 +202,9 @@ fn allowlist() -> ToolServerConfig {
             ToolConfig::from(&OpenCodeWriteTool),
             ToolConfig::from(&ApplyPatchTool),
             ToolConfig::from(&TodoWriteTool),
-            ToolConfig::from(&BashTool),
+            ToolConfig::from(&BashTool)
+                .with_param("enabled_background", true)
+                .with_param("auto_background_on_timeout", true),
             ToolConfig::from(&TaskOutputTool),
             ToolConfig::from(&KillTaskTool),
         ],

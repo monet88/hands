@@ -15,8 +15,12 @@ use crate::host;
 
 pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
+pub const MCP_LISTEN: &str = "127.0.0.1:8787";
+pub const MCP_BASE: &str = "http://127.0.0.1:8787";
 pub const PROFILE: &str = "hands";
 const LABEL: &str = "dev.hands.tunnel";
+#[cfg(target_os = "macos")]
+const MCP_LABEL: &str = "dev.hands.mcp";
 #[cfg(target_os = "macos")]
 const WATCH_LABEL: &str = "dev.hands.watch";
 const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
@@ -34,6 +38,23 @@ pub fn ready() -> bool {
     ureq_get(&format!("{HEALTH_BASE}/readyz"))
         .ok()
         .is_some_and(|s| s == "ready")
+}
+
+pub fn mcp_ready() -> bool {
+    ureq_get(&format!("{MCP_BASE}/healthz"))
+        .ok()
+        .is_some_and(|s| s == "ok")
+}
+
+fn wait_mcp(timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if mcp_ready() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    mcp_ready()
 }
 
 pub fn wait_ready(timeout: Duration) -> bool {
@@ -87,6 +108,10 @@ pub fn enable() -> Result<(), String> {
     let client = tunnel_client_bin()?;
     write_profile(&key, &harness, &tunnel_id)?;
     write_wrapper(&client)?;
+    install_mcp()?;
+    if !wait_mcp(Duration::from_secs(8)) {
+        return Err(format!("MCP HTTP not up on {MCP_BASE}"));
+    }
     install_supervisor()?;
     let _ = install_watch();
     if wait_ready(Duration::from_secs(15)) {
@@ -111,6 +136,8 @@ pub fn start() -> Result<(), String> {
     if !installed() {
         return enable();
     }
+    let _ = install_mcp();
+    let _ = wait_mcp(Duration::from_secs(8));
     start_supervisor()?;
     if wait_ready(Duration::from_secs(15)) {
         eprintln!("tunnel ready  {HEALTH_BASE}/ui");
@@ -237,7 +264,8 @@ fn write_profile(key: &Path, harness: &Path, tunnel_id: &str) -> Result<(), Stri
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let key_path = key.display().to_string();
-    let harness = harness.display().to_string();
+    let sock = host::mcp_socket().display().to_string();
+    let _harness = harness.display().to_string();
     let yaml = format!(
         r#"config_version: 1
 control_plane:
@@ -252,9 +280,11 @@ log:
   level: warn
   format: json
 mcp:
-  commands:
+  startup_wait_timeout: 30s
+  server_urls:
     - channel: main
-      command: "{harness}"
+      url: "http://127.0.0.1/mcp"
+      unix_socket: "{sock}"
 "#
     );
     fs::write(&path, yaml).map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -273,22 +303,22 @@ fn write_wrapper(client: &Path) -> Result<(), String> {
     let dir = host::config_dir();
     fs::create_dir_all(dir.join("logs")).map_err(|e| format!("mkdir logs: {e}"))?;
     let path = wrapper_path();
+    let sock = host::mcp_socket();
     let client = client.display();
-    // Long-poll is the wait-for-request. Do not busy-loop. Only block idle
-    // sleep so the radio stays up. On AC also block system sleep (clamshell).
-    // On battery, lid-close may sleep — no VPS/iPhone required.
+    // Long-poll is the wait-for-request. MCP is HTTP-over-UDS, not stdio.
     let body = format!(
         r#"#!/bin/sh
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 CLIENT="{client}"
-set -- "$CLIENT" run --profile {PROFILE} --log.level=warn --control-plane.poll-timeout=60s
-mode="${{HANDS_CAFFEINATE:-${{GROK_HARNESS_CAFFEINATE:-auto}}}}"
+SOCK="{}"
+set -- "$CLIENT" run --profile {PROFILE} --log.level=warn --control-plane.poll-timeout=60s \
+  --mcp.startup-wait-timeout=30s \
+  --mcp.server-url "url=http://127.0.0.1/mcp,channel=main,unix-socket=$SOCK"
+# -is always. macOS ignores -s on battery; watch kickstarts on AC so -s
+# is taken while plugged in. Frozen -i from a battery start allowed lid-sleep.
+mode="${{HANDS_CAFFEINATE:-${{GROK_HARNESS_CAFFEINATE:-is}}}}"
 if [ "$mode" = "auto" ]; then
-  if command -v pmset >/dev/null 2>&1 && pmset -g ps 2>/dev/null | grep -q "AC Power"; then
-    mode=is
-  else
-    mode=i
-  fi
+  mode=is
 fi
 if [ -x /usr/bin/caffeinate ] && [ "$mode" != "off" ]; then
   exec /usr/bin/caffeinate -"$mode" -- "$@"
@@ -297,7 +327,8 @@ if command -v systemd-inhibit >/dev/null 2>&1; then
   exec systemd-inhibit --what=idle --who=hands --why="ChatGPT MCP tunnel" --mode=block "$@"
 fi
 exec "$@"
-"#
+"#,
+        sock.display()
     );
     fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
@@ -309,6 +340,12 @@ exec "$@"
 }
 
 fn harness_bin() -> Result<PathBuf, String> {
+    if let Some(home) = dirs::home_dir() {
+        let local = home.join(".local/bin/hands");
+        if local.is_file() {
+            return Ok(dunce::canonicalize(&local).unwrap_or(local));
+        }
+    }
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     Ok(dunce::canonicalize(&exe).unwrap_or(exe))
 }
@@ -415,6 +452,7 @@ fn install_supervisor() -> Result<(), String> {
     fs::write(&plist, xml).map_err(|e| format!("write {}: {e}", plist.display()))?;
     stop_unmanaged();
     let target = gui_target();
+    let _ = launchctl(&["disable", &format!("{target}/{LEGACY_LABEL}")]);
     let _ = launchctl(&["bootout", &target, LEGACY_LABEL]);
     let legacy_plist = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -467,8 +505,72 @@ fn stop_supervisor() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn uninstall_supervisor() -> Result<(), String> {
     stop_supervisor()?;
+    let _ = uninstall_mcp();
     let _ = uninstall_watch();
     let plist = plist_path();
+    if plist.exists() {
+        fs::remove_file(&plist).map_err(|e| format!("rm {}: {e}", plist.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mcp_plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/LaunchAgents")
+        .join(format!("{MCP_LABEL}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn install_mcp() -> Result<(), String> {
+    let hands = harness_bin()?;
+    let plist = mcp_plist_path();
+    if let Some(parent) = plist.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let out = log_dir().join("mcp.out");
+    let err = log_dir().join("mcp.err");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{MCP_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>--http</string>
+    <string>--port</string>
+    <string>8787</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>3</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&hands.display().to_string()),
+        xml_escape(&out.display().to_string()),
+        xml_escape(&err.display().to_string()),
+    );
+    fs::write(&plist, xml).map_err(|e| format!("write {}: {e}", plist.display()))?;
+    let target = gui_target();
+    let _ = launchctl(&["bootout", &target, MCP_LABEL]);
+    let _ = launchctl(&["bootstrap", &target, &plist.display().to_string()]);
+    let _ = launchctl(&["enable", &format!("{target}/{MCP_LABEL}")]);
+    let _ = launchctl(&["kickstart", "-k", &format!("{target}/{MCP_LABEL}")]);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_mcp() -> Result<(), String> {
+    let target = gui_target();
+    let _ = launchctl(&["bootout", &target, MCP_LABEL]);
+    let plist = mcp_plist_path();
     if plist.exists() {
         fs::remove_file(&plist).map_err(|e| format!("rm {}: {e}", plist.display()))?;
     }
@@ -577,6 +679,54 @@ WantedBy=default.target
 }
 
 #[cfg(target_os = "linux")]
+fn mcp_unit_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/systemd/user/hands-mcp.service")
+}
+
+#[cfg(target_os = "linux")]
+fn install_mcp() -> Result<(), String> {
+    let hands = harness_bin()?;
+    let unit = mcp_unit_path();
+    if let Some(parent) = unit.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let body = format!(
+        r#"[Unit]
+Description=Hands MCP HTTP
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={bin} --http --port 8787
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"#,
+        bin = hands.display()
+    );
+    fs::write(&unit, body).map_err(|e| format!("write {}: {e}", unit.display()))?;
+    run_ok("systemctl", &["--user", "daemon-reload"])?;
+    run_ok("systemctl", &["--user", "enable", "--now", "hands-mcp.service"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_mcp() -> Result<(), String> {
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "hands-mcp.service"])
+        .status();
+    let unit = mcp_unit_path();
+    if unit.exists() {
+        fs::remove_file(&unit).map_err(|e| format!("rm {}: {e}", unit.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn watch_unit_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -644,6 +794,7 @@ fn uninstall_supervisor() -> Result<(), String> {
         .args(["--user", "disable", "--now", "hands-tunnel.service"])
         .status();
     let _ = uninstall_watch();
+    let _ = uninstall_mcp();
     stop_unmanaged();
     let unit = unit_path();
     if unit.exists() {
@@ -677,6 +828,16 @@ fn uninstall_supervisor() -> Result<(), String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn install_watch() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn install_mcp() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn uninstall_mcp() -> Result<(), String> {
     Ok(())
 }
 

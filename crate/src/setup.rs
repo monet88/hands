@@ -68,6 +68,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         eprintln!();
         eprintln!("tunnel id (copied): {id}");
         eprintln!("ChatGPT → chatgpt.com/plugins → Developer mode → Tunnel → paste → Scan tools");
+        eprintln!("Skip confirm: first write → Always allow, or Settings → Apps → Hands → Never ask");
     }
     Ok(())
 }
