@@ -239,27 +239,10 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         Cmd::McpStdio => mcp::McpHost::new(fallback).serve_stdio().await,
         Cmd::McpHttp { addr } => mcp::McpHost::new(fallback).serve_http(addr).await,
         Cmd::List | Cmd::Call { .. } => {
-            let cwd = host::resolve_workspace(&fallback);
-            let bridge = host::build_bridge(cwd).await?;
+            let engine = tool_engine::ToolEngine::new(fallback);
             match cmd {
                 Cmd::List => {
-                    let defs = bridge.tool_definitions().await;
-                    // `hands list` predates MCP tool JSON and exposes schemas
-                    // under `parameters`. Preserve that CLI contract for both
-                    // the local run_command tool and bridge-provided tools.
-                    let run_command = crate::run_proc::tool_json();
-                    let mut tools: Vec<serde_json::Value> = vec![serde_json::json!({
-                        "name": run_command["name"].clone(),
-                        "description": run_command["description"].clone(),
-                        "parameters": run_command["inputSchema"].clone(),
-                    })];
-                    tools.extend(defs.into_iter().map(|d| {
-                        serde_json::json!({
-                            "name": d.function.name,
-                            "description": d.function.description,
-                            "parameters": d.function.parameters,
-                        })
-                    }));
+                    let tools = engine.list_tools_cli().await?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({ "tools": tools }))
@@ -269,31 +252,64 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                 }
                 Cmd::Call { tool, args_json } => {
                     let params = resolve_json_argument(args_json)?;
-                    if tool == crate::run_proc::TOOL_NAME {
-                        let ws = host::resolve_workspace(&fallback);
-                        let ws_str = ws.to_string_lossy().to_string();
-                        let result = crate::run_proc::handle_call(&params, Some(&ws_str)).await;
-                        println!(
-                            "{}",
-                            result["content"][0]["text"].as_str().unwrap_or_default()
-                        );
-                        // Propagate the tool's isError so the CLI exits
-                        // non-zero when the process could not be launched.
-                        return if result["isError"].as_bool().unwrap_or(false) {
-                            Err("run_command failed".to_string())
-                        } else {
-                            Ok(())
-                        };
+                    let result = engine.call_tool(&tool, params).await?;
+                    for content in &result.content {
+                        match content {
+                            tool_engine::ToolContent::Text { text } => {
+                                println!("{text}");
+                            }
+                        }
                     }
-                    let result = bridge
-                        .call(&tool, params, "hands-1")
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    println!("{}", result.prompt_text);
-                    Ok(())
+                    if result.is_error {
+                        Err(format!("{tool} failed"))
+                    } else {
+                        Ok(())
+                    }
                 }
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_json_argument_raw_json() {
+        let val = resolve_json_argument(r#"{"key": "value"}"#.to_string()).unwrap();
+        assert_eq!(val["key"], "value");
+    }
+
+    #[test]
+    fn test_resolve_json_argument_bom_stripping() {
+        let raw = format!("\u{feff}{{\"key\": \"value\"}}");
+        let val = resolve_json_argument(raw).unwrap();
+        assert_eq!(val["key"], "value");
+    }
+
+    #[test]
+    fn test_resolve_json_argument_file_and_at_file() {
+        let temp_dir = std::env::temp_dir().join(format!("hands_arg_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("test_payload.json");
+        std::fs::write(&file_path, r#"{"file_key": 42}"#).unwrap();
+
+        // Direct path
+        let val1 = resolve_json_argument(file_path.to_str().unwrap().to_string()).unwrap();
+        assert_eq!(val1["file_key"], 42);
+
+        // @path syntax
+        let val2 = resolve_json_argument(format!("@{}", file_path.display())).unwrap();
+        assert_eq!(val2["file_key"], 42);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_json_argument_invalid_json() {
+        let err = resolve_json_argument("invalid {json".to_string()).unwrap_err();
+        assert!(err.contains("invalid json args:"));
     }
 }

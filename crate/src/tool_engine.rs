@@ -1,4 +1,4 @@
-//! Unified tool execution engine behind MCP.
+//! Unified tool execution engine behind MCP and CLI.
 //!
 //! Owns bridge lifecycle, Workspace-aware bridge caching, virtual tool
 //! injection (e.g. `workspace_info`), native tools (e.g. `run_command`),
@@ -153,6 +153,25 @@ impl ToolEngine {
         Ok(tools)
     }
 
+    /// Adapter for `hands list` CLI output.
+    ///
+    /// Preserves the legacy CLI contract where tool schemas are exposed
+    /// under `parameters` instead of MCP's `inputSchema`.
+    pub async fn list_tools_cli(&self) -> Result<Vec<Value>, String> {
+        let mcp_tools = self.list_tools().await?;
+        let cli_tools = mcp_tools
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "name": t.get("name").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("inputSchema").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        Ok(cli_tools)
+    }
+
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallResult, String> {
         if name == "workspace_info" {
             let cwd = self.workspace();
@@ -281,6 +300,54 @@ mod tests {
         let ws_tool = tools.iter().find(|t| t["name"] == "workspace_info").unwrap();
         assert_eq!(ws_tool["annotations"]["readOnlyHint"], true);
         assert_eq!(ws_tool["annotations"]["destructiveHint"], false);
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_cli_parameters_contract() {
+        let (_lock, _guard) = isolate_env("list_cli");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir);
+        let cli_tools = engine.list_tools_cli().await.expect("list_tools_cli should succeed");
+
+        let names: Vec<&str> = cli_tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+
+        assert!(names.contains(&"workspace_info"), "CLI must include workspace_info");
+        assert!(names.contains(&"run_command"), "CLI must include run_command");
+        assert!(names.contains(&"read_file"), "CLI must include read_file");
+
+        for tool in &cli_tools {
+            assert!(
+                tool.get("parameters").is_some(),
+                "CLI tool definition must have 'parameters' field: {tool:?}"
+            );
+            assert!(
+                tool.get("inputSchema").is_none(),
+                "CLI tool definition must NOT have 'inputSchema' field: {tool:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_and_mcp_listing_tool_names_parity() {
+        let (_lock, _guard) = isolate_env("parity_list");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir);
+        let mcp_tools = engine.list_tools().await.expect("list_tools should succeed");
+        let cli_tools = engine.list_tools_cli().await.expect("list_tools_cli should succeed");
+
+        assert_eq!(mcp_tools.len(), cli_tools.len(), "Tool count must match between MCP and CLI");
+        for (mcp, cli) in mcp_tools.iter().zip(cli_tools.iter()) {
+            assert_eq!(mcp["name"], cli["name"], "Tool name parity check");
+            assert_eq!(mcp["description"], cli["description"], "Tool description parity check");
+            assert_eq!(mcp["inputSchema"], cli["parameters"], "Schema content parity check");
+        }
     }
 
     #[tokio::test]
