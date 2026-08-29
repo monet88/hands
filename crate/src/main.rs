@@ -162,6 +162,31 @@ fn resolve_json_argument(raw: String) -> Result<serde_json::Value, String> {
     serde_json::from_str(trimmed).map_err(|e| format!("invalid json args: {e}"))
 }
 
+/// Execute a CLI `hands call` invocation via `ToolEngine`, rendering stdout
+/// text and returning an error if execution failed.
+async fn run_call_cli(
+    engine: &tool_engine::ToolEngine,
+    tool: &str,
+    args_json: String,
+) -> Result<String, String> {
+    let params = resolve_json_argument(args_json)?;
+    let result = engine.call_tool(tool, params).await?;
+    let mut rendered = Vec::new();
+    for content in &result.content {
+        match content {
+            tool_engine::ToolContent::Text { text } => {
+                rendered.push(text.as_str());
+            }
+        }
+    }
+    let output = rendered.join("\n");
+    if result.is_error {
+        Err(output)
+    } else {
+        Ok(output)
+    }
+}
+
 async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
     match cmd {
         Cmd::Setup { open_ui } => {
@@ -251,20 +276,9 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                     Ok(())
                 }
                 Cmd::Call { tool, args_json } => {
-                    let params = resolve_json_argument(args_json)?;
-                    let result = engine.call_tool(&tool, params).await?;
-                    for content in &result.content {
-                        match content {
-                            tool_engine::ToolContent::Text { text } => {
-                                println!("{text}");
-                            }
-                        }
-                    }
-                    if result.is_error {
-                        Err(format!("{tool} failed"))
-                    } else {
-                        Ok(())
-                    }
+                    let output = run_call_cli(&engine, &tool, args_json).await?;
+                    println!("{output}");
+                    Ok(())
                 }
                 _ => unreachable!(),
             }
@@ -311,5 +325,55 @@ mod tests {
     fn test_resolve_json_argument_invalid_json() {
         let err = resolve_json_argument("invalid {json".to_string()).unwrap_err();
         assert!(err.contains("invalid json args:"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_call_parity_with_mcp_engine() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hands_cli_call_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let sample_file = temp_dir.join("cli_test.txt");
+        std::fs::write(&sample_file, "content for cli call test").unwrap();
+
+        let engine = tool_engine::ToolEngine::new(temp_dir.clone());
+
+        // 1. Virtual tool: workspace_info
+        let cli_ws = run_call_cli(&engine, "workspace_info", "{}".to_string())
+            .await
+            .expect("CLI workspace_info call succeeds");
+        let mcp_ws = engine
+            .call_tool("workspace_info", serde_json::json!({}))
+            .await
+            .expect("MCP workspace_info call succeeds");
+        assert_eq!(cli_ws, mcp_ws.content[0].text());
+
+        // 2. Bridge tool: read_file
+        let args_str = format!("{{\"target_file\": \"cli_test.txt\"}}");
+        let cli_read = run_call_cli(&engine, "read_file", args_str)
+            .await
+            .expect("CLI read_file call succeeds");
+        let mcp_read = engine
+            .call_tool(
+                "read_file",
+                serde_json::json!({ "target_file": "cli_test.txt" }),
+            )
+            .await
+            .expect("MCP read_file call succeeds");
+        assert_eq!(cli_read, mcp_read.content[0].text());
+        assert!(cli_read.contains("content for cli call test"));
+
+        // 3. Error case: unknown tool returns Err containing shaped error message directly
+        let err = run_call_cli(&engine, "nonexistent_tool_abc", "{}".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("Tool not found: nonexistent_tool_abc") || err.contains("not found"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

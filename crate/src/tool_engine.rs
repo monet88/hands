@@ -33,6 +33,15 @@ pub enum ToolContent {
     Text { text: String },
 }
 
+impl ToolContent {
+    #[cfg(test)]
+    pub fn text(&self) -> &str {
+        match self {
+            ToolContent::Text { text } => text.as_str(),
+        }
+    }
+}
+
 impl ToolCallResult {
     pub fn text(text: impl Into<String>, is_error: bool) -> Self {
         Self {
