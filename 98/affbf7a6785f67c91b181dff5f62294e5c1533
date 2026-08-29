@@ -1,0 +1,22 @@
+crate/Cargo.toml
+  h_17f2fa2b92da6a 9-11
+crate/src/main.rs
+  h_17f2fa2b92da6a 12-13,296
+crate/src/mcp.rs
+  h_17f2fa2b92da6a 281,429-482
+crate/src/testenv.rs
+  h_17f2fa2b92da6a 1-68
+crate/src/tool_engine.rs
+  h_17f2fa2b92da6a 215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "98affbf7a6785f67c91b181dff5f62294e5c1533",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
