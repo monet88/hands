@@ -4,60 +4,27 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use xai_grok_tools::bridge::ToolBridge;
 
-use crate::host;
+use crate::tool_engine::ToolEngine;
 use crate::ui;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "Hands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const READ_ONLY: &[&str] = &[
-    "workspace_info",
-    "read_file",
-    "grep",
-    "list_dir",
-    "glob",
-    "get_task_output",
-];
-
 pub struct McpHost {
-    fallback_cwd: PathBuf,
-    cached: Mutex<Option<(PathBuf, ToolBridge)>>,
-    call_seq: AtomicU64,
+    engine: Arc<ToolEngine>,
 }
 
 impl McpHost {
     pub fn new(fallback_cwd: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            fallback_cwd,
-            cached: Mutex::new(None),
-            call_seq: AtomicU64::new(1),
+            engine: Arc::new(ToolEngine::new(fallback_cwd)),
         })
-    }
-
-    fn workspace(&self) -> PathBuf {
-        host::resolve_workspace(&self.fallback_cwd)
-    }
-
-    async fn bridge(&self) -> Result<ToolBridge, String> {
-        let cwd = self.workspace();
-        let mut cache = self.cached.lock().await;
-        if let Some((path, bridge)) = cache.as_ref()
-            && path == &cwd
-        {
-            return Ok(bridge.clone());
-        }
-        let bridge = host::build_bridge(cwd.clone()).await?;
-        *cache = Some((cwd, bridge.clone()));
-        Ok(bridge)
     }
 
     pub async fn serve_stdio(self: Arc<Self>) -> Result<(), String> {
@@ -144,43 +111,17 @@ impl McpHost {
                  Then read_file/grep/glob/list_dir, write/search_replace/apply_patch to edit, \
                  todo_write for plans, run_terminal_cmd to test (background + kill_task/get_task_output). \
                  After each edit, rerun the failing check.",
-                self.workspace().display()
+                self.engine.workspace().display()
             ),
         })
     }
 
     async fn tools_list(&self) -> Result<Value, (i64, String, Value)> {
-        let mut tools = vec![json!({
-            "name": "workspace_info",
-            "description": "Return the active local workspace root. Call this before other tools if the user switched repos with hands use.",
-            "inputSchema": { "type": "object", "properties": {} },
-            "annotations": {
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "openWorldHint": false,
-            }
-        })];
-        tools.push(crate::run_proc::tool_json());
-        let defs = self
-            .bridge()
+        let tools = self
+            .engine
+            .list_tools()
             .await
-            .map_err(|e| (-32603, e, Value::Null))?
-            .tool_definitions()
-            .await;
-        tools.extend(defs.into_iter().map(|d| {
-            let name = d.function.name;
-            let read_only = READ_ONLY.contains(&name.as_str());
-            json!({
-                "name": name,
-                "description": d.function.description.unwrap_or_default(),
-                "inputSchema": d.function.parameters,
-                "annotations": {
-                    "readOnlyHint": read_only,
-                    "destructiveHint": !read_only,
-                    "openWorldHint": false,
-                }
-            })
-        }));
+            .map_err(|e| (-32603, e, Value::Null))?;
         Ok(json!({ "tools": tools }))
     }
 
@@ -190,39 +131,13 @@ impl McpHost {
             "tools/call requires name".into(),
             Value::Null,
         ))?;
-        if name == "workspace_info" {
-            let cwd = self.workspace();
-            return Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!(
-                        "workspace: {}\nsource_git_sha: {}",
-                        cwd.display(),
-                        crate::build_provenance::SOURCE_GIT_SHA
-                    )
-                }],
-                "isError": false
-            }));
-        }
-        if name == crate::run_proc::TOOL_NAME {
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            let ws = self.workspace();
-            let ws_str = ws.to_string_lossy().to_string();
-            return Ok(crate::run_proc::handle_call(&arguments, Some(&ws_str)).await);
-        }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-        let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
-        let bridge = self.bridge().await.map_err(|e| (-32603, e, Value::Null))?;
-        match bridge.call(name, arguments, &call_id).await {
-            Ok(result) => Ok(json!({
-                "content": [{ "type": "text", "text": result.prompt_text }],
-                "isError": false
-            })),
-            Err(e) => Ok(json!({
-                "content": [{ "type": "text", "text": e.to_string() }],
-                "isError": true
-            })),
-        }
+        let result = self
+            .engine
+            .call_tool(name, arguments)
+            .await
+            .map_err(|e| (-32603, e, Value::Null))?;
+        Ok(result.to_value())
     }
 }
 
@@ -357,4 +272,213 @@ async fn write_http(
     writer.write_all(body).await.map_err(|e| e.to_string())?;
     writer.flush().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex as StdMutex;
+
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct EnvGuard {
+        saved_config_dir: Option<std::ffi::OsString>,
+        saved_workspace: Option<std::ffi::OsString>,
+        saved_legacy: Option<std::ffi::OsString>,
+        root: PathBuf,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.saved_config_dir {
+                    Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
+                    None => std::env::remove_var("HANDS_CONFIG_DIR"),
+                }
+                match &self.saved_workspace {
+                    Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
+                    None => std::env::remove_var("HANDS_WORKSPACE"),
+                }
+                match &self.saved_legacy {
+                    Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
+                    None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn isolate_env(name: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+        let guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "hands_mcp_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create isolated test config dir");
+        let env_guard = EnvGuard {
+            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
+            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
+            saved_legacy: std::env::var_os("GROK_HARNESS_WORKSPACE"),
+            root: root.clone(),
+        };
+        unsafe {
+            std::env::set_var("HANDS_CONFIG_DIR", &root);
+            std::env::remove_var("HANDS_WORKSPACE");
+            std::env::remove_var("GROK_HARNESS_WORKSPACE");
+        }
+        (guard, env_guard)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_host_initialize_and_ping() {
+        let (_lock, _guard) = isolate_env("init_ping");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let ping_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        });
+        let ping_resp = host.handle_rpc(ping_msg).await.expect("ping response");
+        assert_eq!(ping_resp["id"], 1);
+        assert_eq!(ping_resp["result"], json!({}));
+
+        let init_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18"
+            }
+        });
+        let init_resp = host.handle_rpc(init_msg).await.expect("init response");
+        assert_eq!(init_resp["id"], 2);
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "Hands");
+        assert_eq!(init_resp["result"]["protocolVersion"], "2025-06-18");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_host_tools_list_and_call() {
+        let (_lock, _guard) = isolate_env("list_call");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let list_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list"
+        });
+        let list_resp = host.handle_rpc(list_msg).await.expect("tools/list response");
+        assert_eq!(list_resp["id"], 3);
+        assert!(list_resp["result"]["tools"].as_array().is_some());
+
+        let call_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_info"
+            }
+        });
+        let call_resp = host.handle_rpc(call_msg).await.expect("tools/call response");
+        assert_eq!(call_resp["id"], 4);
+        assert_eq!(call_resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_host_tools_call_missing_name_returns_error_code() {
+        let (_lock, _guard) = isolate_env("missing_name");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let call_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {}
+        });
+        let call_resp = host.handle_rpc(call_msg).await.expect("tools/call response");
+        assert_eq!(call_resp["id"], 5);
+        assert_eq!(call_resp["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_host_tools_call_unknown_tool_returns_is_error() {
+        let (_lock, _guard) = isolate_env("unknown_tool");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let call_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "unknown_tool_test"
+            }
+        });
+        let call_resp = host.handle_rpc(call_msg).await.expect("tools/call response");
+        assert_eq!(call_resp["id"], 6);
+        assert_eq!(call_resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_http_serve_smoke() {
+        let (_lock, _guard) = isolate_env("http_smoke");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+
+        let host = McpHost::new(ws_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let host_clone = Arc::clone(&host);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            handle_http(stream, host_clone).await.expect("handle http");
+        });
+
+        let mut client_stream = TcpStream::connect(addr).await.expect("connect to test server");
+        let req_body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/list"
+        }))
+        .expect("serialize req");
+
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            req_body.len()
+        );
+        client_stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write req header");
+        client_stream
+            .write_all(&req_body)
+            .await
+            .expect("write req body");
+
+        let mut response = Vec::new();
+        client_stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let resp_str = String::from_utf8_lossy(&response);
+
+        assert!(resp_str.contains("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("\"tools\""));
+
+        let _ = server_task.await;
+    }
 }

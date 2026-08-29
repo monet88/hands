@@ -9,6 +9,7 @@ mod run_proc;
 mod secrets;
 mod service;
 mod setup;
+mod tool_engine;
 mod ui;
 mod watch;
 
