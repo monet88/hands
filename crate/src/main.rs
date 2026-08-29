@@ -181,7 +181,8 @@ async fn run_call_cli(
     }
     let output = rendered.join("\n");
     if result.is_error {
-        Err(output)
+        let err_msg = output.strip_prefix("error: ").unwrap_or(&output);
+        Err(err_msg.to_string())
     } else {
         Ok(output)
     }
@@ -289,6 +290,63 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex as StdMutex;
+
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct EnvGuard {
+        saved_config_dir: Option<std::ffi::OsString>,
+        saved_workspace: Option<std::ffi::OsString>,
+        saved_legacy: Option<std::ffi::OsString>,
+        root: PathBuf,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.saved_config_dir {
+                    Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
+                    None => std::env::remove_var("HANDS_CONFIG_DIR"),
+                }
+                match &self.saved_workspace {
+                    Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
+                    None => std::env::remove_var("HANDS_WORKSPACE"),
+                }
+                match &self.saved_legacy {
+                    Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
+                    None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn isolate_env(name: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+        let guard = TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "hands_main_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create isolated test config dir");
+        let env_guard = EnvGuard {
+            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
+            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
+            saved_legacy: std::env::var_os("GROK_HARNESS_WORKSPACE"),
+            root: root.clone(),
+        };
+        unsafe {
+            std::env::set_var("HANDS_CONFIG_DIR", &root);
+            std::env::remove_var("HANDS_WORKSPACE");
+            std::env::remove_var("GROK_HARNESS_WORKSPACE");
+        }
+        (guard, env_guard)
+    }
 
     #[test]
     fn test_resolve_json_argument_raw_json() {
@@ -329,17 +387,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_call_parity_with_mcp_engine() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "hands_cli_call_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let (_lock, _env_guard) = isolate_env("cli_parity");
+        let temp_dir = _env_guard.root.join("ws");
+        fs::create_dir_all(&temp_dir).unwrap();
         let sample_file = temp_dir.join("cli_test.txt");
-        std::fs::write(&sample_file, "content for cli call test").unwrap();
+        fs::write(&sample_file, "content for cli call test").unwrap();
 
         let engine = tool_engine::ToolEngine::new(temp_dir.clone());
 
@@ -374,6 +426,21 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Tool not found: nonexistent_tool_abc") || err.contains("not found"));
 
-        let _ = std::fs::remove_dir_all(temp_dir);
+        // 4. Native tool: run_command error case (spawn failure normalized without double 'error:' prefix)
+        let native_err_args = serde_json::json!({
+            "command": "nonexistent_executable_12345_xyz"
+        })
+        .to_string();
+        let native_err = run_call_cli(&engine, "run_command", native_err_args)
+            .await
+            .unwrap_err();
+        assert!(
+            native_err.starts_with("failed to spawn:"),
+            "run_call_cli must strip leading 'error: ' to prevent double 'error: error:' in CLI output, got: {native_err}"
+        );
+        assert!(
+            native_err.contains("exit: -1 (error)"),
+            "error response must retain exit status, got: {native_err}"
+        );
     }
 }
