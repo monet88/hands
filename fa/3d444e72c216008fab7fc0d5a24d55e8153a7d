@@ -1,0 +1,16 @@
+crate/src/main.rs
+  h_17f2fa2b92da6a 246-254,259
+crate/src/run_proc.rs
+  h_17f2fa2b92da6a 417-434,1014-1038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fa3d444e72c216008fab7fc0d5a24d55e8153a7d",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
