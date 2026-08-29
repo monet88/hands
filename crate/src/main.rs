@@ -5,6 +5,7 @@ mod doctor;
 mod host;
 mod host_env;
 mod mcp;
+mod run_proc;
 mod secrets;
 mod service;
 mod setup;
@@ -242,16 +243,22 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
             match cmd {
                 Cmd::List => {
                     let defs = bridge.tool_definitions().await;
-                    let tools: Vec<serde_json::Value> = defs
-                        .into_iter()
-                        .map(|d| {
-                            serde_json::json!({
-                                "name": d.function.name,
-                                "description": d.function.description,
-                                "parameters": d.function.parameters,
-                            })
+                    // `hands list` predates MCP tool JSON and exposes schemas
+                    // under `parameters`. Preserve that CLI contract for both
+                    // the local run_command tool and bridge-provided tools.
+                    let run_command = crate::run_proc::tool_json();
+                    let mut tools: Vec<serde_json::Value> = vec![serde_json::json!({
+                        "name": run_command["name"].clone(),
+                        "description": run_command["description"].clone(),
+                        "parameters": run_command["inputSchema"].clone(),
+                    })];
+                    tools.extend(defs.into_iter().map(|d| {
+                        serde_json::json!({
+                            "name": d.function.name,
+                            "description": d.function.description,
+                            "parameters": d.function.parameters,
                         })
-                        .collect();
+                    }));
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({ "tools": tools }))
@@ -261,6 +268,22 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                 }
                 Cmd::Call { tool, args_json } => {
                     let params = resolve_json_argument(args_json)?;
+                    if tool == crate::run_proc::TOOL_NAME {
+                        let ws = host::resolve_workspace(&fallback);
+                        let ws_str = ws.to_string_lossy().to_string();
+                        let result = crate::run_proc::handle_call(&params, Some(&ws_str)).await;
+                        println!(
+                            "{}",
+                            result["content"][0]["text"].as_str().unwrap_or_default()
+                        );
+                        // Propagate the tool's isError so the CLI exits
+                        // non-zero when the process could not be launched.
+                        return if result["isError"].as_bool().unwrap_or(false) {
+                            Err("run_command failed".to_string())
+                        } else {
+                            Ok(())
+                        };
+                    }
                     let result = bridge
                         .call(&tool, params, "hands-1")
                         .await

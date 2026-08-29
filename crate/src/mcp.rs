@@ -160,6 +160,7 @@ impl McpHost {
                 "openWorldHint": false,
             }
         })];
+        tools.push(crate::run_proc::tool_json());
         let defs = self
             .bridge()
             .await
@@ -202,6 +203,12 @@ impl McpHost {
                 }],
                 "isError": false
             }));
+        }
+        if name == crate::run_proc::TOOL_NAME {
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let ws = self.workspace();
+            let ws_str = ws.to_string_lossy().to_string();
+            return Ok(crate::run_proc::handle_call(&arguments, Some(&ws_str)).await);
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
