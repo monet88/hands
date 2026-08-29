@@ -1,0 +1,14 @@
+crate/src/run_proc.rs
+  h_17f2fa2b92da6a 42-56,66-70,90-96,110-144,177-184,673-685,708-711,713-728,763-772,778-786,813-816,825-829,836,844-846,851-854,859-861,1168-1180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9641651d749af9e676366949ee9692476d295d5b",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
