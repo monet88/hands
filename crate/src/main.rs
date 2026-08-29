@@ -261,7 +261,9 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                 Cmd::Call { tool, args_json } => {
                     let params = resolve_json_argument(args_json)?;
                     if tool == crate::run_proc::TOOL_NAME {
-                        let result = crate::run_proc::handle_call(&params).await;
+                        let ws = host::resolve_workspace(&fallback);
+                        let ws_str = ws.to_string_lossy().to_string();
+                        let result = crate::run_proc::handle_call(&params, Some(&ws_str)).await;
                         println!(
                             "{}",
                             result["content"][0]["text"].as_str().unwrap_or_default()

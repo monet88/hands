@@ -213,7 +213,7 @@ function Validate-ChatGPTEvidence {
     if ($evidence.connected_via_chatgpt_web -ne $true -or $evidence.scan_succeeded -ne $true) {
         throw "ChatGPT Web connection/tool scan was not proven by the evidence file."
     }
-    foreach ($required in @("workspace_info", "read_file", "write", "run_terminal_cmd", "get_task_output", "kill_task")) {
+    foreach ($required in @("workspace_info", "read_file", "write", "run_terminal_cmd", "run_command", "get_task_output", "kill_task")) {
         if (@($evidence.tool_names) -notcontains $required) {
             throw "ChatGPT evidence tool scan is missing '$required'."
         }
@@ -319,7 +319,7 @@ try {
     Start-McpSession
     $list = Invoke-McpRpc "tools/list" @{}
     $toolNames = @($list.tools | ForEach-Object { $_.name })
-    foreach ($required in @("workspace_info", "read_file", "write", "run_terminal_cmd", "get_task_output", "kill_task")) {
+    foreach ($required in @("workspace_info", "read_file", "write", "run_terminal_cmd", "run_command", "get_task_output", "kill_task")) {
         if ($toolNames -notcontains $required) { throw "Persistent MCP tool list is missing '$required'." }
     }
 

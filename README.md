@@ -82,7 +82,7 @@ Opens http://127.0.0.1:8787/ to view status and update API keys.
 2. Enable **Developer mode**.
 3. Choose Connection **Tunnel**.
 4. Paste your Tunnel ID (`tunnel_...`) and click **Scan tools**.
-5. The plugin **Hands** will be discovered with 12 local coding tools.
+5. The plugin **Hands** will be discovered with 13 local coding tools.
 
 ---
 
@@ -119,6 +119,7 @@ ChatGPT will automatically execute all tools in the pinned folder starting from 
 | `glob` | Find | Find files matching glob patterns |
 | `search_replace` | Edit | Replace unique code chunks in files |
 | `write` | Create | Write or overwrite files |
+| `apply_patch` | Edit | Apply unified diffs to files |
 | `todo_write` | Tasks | Manage task checklist |
 | `run_terminal_cmd` | Execution | Run tests, build scripts, shell commands |
 | `run_command` | Execution | Run a native CLI directly with an argv vector, no shell |
