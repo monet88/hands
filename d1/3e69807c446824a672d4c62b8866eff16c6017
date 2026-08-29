@@ -1,0 +1,16 @@
+CODING_STANDARDS.md
+  h_17f2fa2b92da6a 1-212
+crate/src/mcp.rs
+  h_17f2fa2b92da6a 283-306,420,424-425,459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d13e69807c446824a672d4c62b8866eff16c6017",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
