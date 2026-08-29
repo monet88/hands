@@ -91,6 +91,12 @@ mod job_object {
 #[cfg(not(windows))]
 mod job_object {
     pub struct JobObject;
+
+    impl JobObject {
+        pub fn terminate(&self) -> bool {
+            false
+        }
+    }
 }
 
 /// Create a Job Object and assign the child process to it.
@@ -381,16 +387,30 @@ pub async fn handle_call(
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let args: Vec<String> = arguments
+    // Reject non-string argv elements up front instead of silently dropping
+    // them: a dropped argument changes the command the caller asked for.
+    let args: Result<Vec<String>, String> = arguments
         .get("args")
         .and_then(serde_json::Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "args must contain only strings".to_string())
+                })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| Ok(Vec::new()));
+    let args = match args {
+        Ok(v) => v,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{ "type": "text", "text": format!("error: {e}") }],
+                "isError": true
+            });
+        }
+    };
     let explicit_workdir = arguments.get("workdir").and_then(serde_json::Value::as_str);
     let workdir = explicit_workdir.or(workspace);
     let timeout = arguments.get("timeout").and_then(serde_json::Value::as_u64);
@@ -439,9 +459,10 @@ fn proc_output_from_captures(
     }
 }
 
-/// Rejoin the pipe-drain task with a bounded wait. After the tree is
-/// killed the pipes close promptly; the timeout guards stragglers so the
-/// request can never hang.
+/// Rejoin the pipe-drain task after the process tree is terminated.
+/// Killing the tree closes every pipe read end, so awaiting the drain
+/// normally completes immediately. The timeout guards pathological
+/// stragglers (a descendant that escaped the tree holding a pipe open).
 async fn bounded_rejoin(
     drain: &mut JoinHandle<(PipeCapture, PipeCapture)>,
     drain_timeout_ms: u64,
@@ -450,6 +471,10 @@ async fn bounded_rejoin(
     match tokio::time::timeout(drain_timeout, &mut *drain).await {
         Ok(Ok(captures)) => captures,
         Ok(Err(_)) => (PipeCapture::empty(), PipeCapture::empty()),
+        // ponytail: abort loses partial output in the cancelled task's
+        // local buffer. The pipe is held open by a descendant that escaped
+        // the tree (race), so the data is already incomplete. Accepting
+        // empty is the bounded-safe choice over an indefinite hang.
         Err(_) => {
             drain.abort();
             let _ = drain.await;
@@ -472,7 +497,17 @@ pub async fn run_foreground(
     cmd.args(args);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Null stdin: the child must never inherit Hands' own stdin (the MCP
+    // JSON-RPC transport when running as a stdio server). A child reading
+    // stdin could consume protocol traffic or block forever.
     cmd.stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        // Place the child in its own process group so a timeout can kill
+        // the whole tree (killpg) instead of only the root process.
+        // PGID == child PID, so killpg(child_pid, SIGKILL) reaches all.
+        cmd.process_group(0);
+    }
 
     if let Some(dir) = workdir {
         cmd.current_dir(dir);
@@ -502,9 +537,20 @@ pub async fn run_foreground(
         }
     };
 
+    // Capture the PID immediately after spawn. Tokio's Child::id() returns
+    // None after the child is reaped (kill().await / wait().await), but the
+    // process group ID equals the original PID on Unix, so the tree kill
+    // must use the value captured here, before any reap.
+    let child_pid = child.id();
+
     // Create Job Object for process-tree ownership (Windows). On timeout,
     // terminating the job kills all descendants, closing pipe handles.
-    let job = child.id().and_then(create_job_for_child);
+    // ponytail: the job is assigned after spawn, so a child that spawns a
+    // descendant before assignment escapes the job. Deterministic fix is
+    // CREATE_SUSPENDED spawn -> assign -> resume; tokio Command does not
+    // expose it. This is a known residual race, not a deterministic
+    // guarantee — descendants spawned before assignment are not owned.
+    let job = child_pid.and_then(create_job_for_child);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -536,12 +582,23 @@ pub async fn run_foreground(
     let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
 
     // Kill the whole process tree: the root and (on Windows) all Job
-    // Object members, then reap. On non-Windows only the root is killed;
-    // the bounded drain below prevents an indefinite hang.
+    // Object members; on Unix the process group (killpg), then reap.
+    // If the job/group is unavailable, fall back to root-only kill; the
+    // bounded drain below prevents an indefinite hang either way.
     let kill_tree = async {
         let _ = child.kill().await;
         if let Some(j) = &job {
             j.terminate();
+        }
+        #[cfg(unix)]
+        if let Some(pid) = child_pid {
+            // Child was spawned with process_group(0): its PGID == its
+            // PID, so killpg(pid, SIGKILL) reaches every descendant.
+            // Use the PID captured at spawn: child.id() returns None once
+            // the child has been reaped by kill().await / wait().await.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
         }
         let _ = child.wait().await;
     };
@@ -575,29 +632,34 @@ pub async fn run_foreground(
                 }
             }
         }
-        Ok(Err(e)) => match tokio::time::timeout_at(deadline, &mut drain).await {
-            Ok(Ok((stdout_capture, stderr_capture))) => proc_output_from_captures(
-                stdout_capture,
-                stderr_capture,
-                -1,
-                false,
-                Some(format!("process wait failed: {e}")),
-            ),
-            Ok(Err(_)) => ProcOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: false,
-                capture_truncated: false,
-                error: Some("pipe drain task failed".to_string()),
-            },
-            Err(_elapsed) => {
-                kill_tree.await;
-                let (stdout_capture, stderr_capture) =
-                    bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
-                proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
+        Ok(Err(e)) => {
+            // child.wait() failed — the child may still be running. Kill
+            // the tree to prevent zombies and close pipes, then collect
+            // whatever output arrived.
+            kill_tree.await;
+            match tokio::time::timeout_at(deadline, &mut drain).await {
+                Ok(Ok((stdout_capture, stderr_capture))) => proc_output_from_captures(
+                    stdout_capture,
+                    stderr_capture,
+                    -1,
+                    false,
+                    Some(format!("process wait failed: {e}")),
+                ),
+                Ok(Err(_)) => ProcOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: -1,
+                    timed_out: false,
+                    capture_truncated: false,
+                    error: Some("pipe drain task failed".to_string()),
+                },
+                Err(_elapsed) => {
+                    let (stdout_capture, stderr_capture) =
+                        bounded_rejoin(&mut drain, BOUNDED_DRAIN_TIMEOUT_MS).await;
+                    proc_output_from_captures(stdout_capture, stderr_capture, -1, true, None)
+                }
             }
-        },
+        }
         Err(_elapsed) => {
             // Root did not exit before the deadline.
             kill_tree.await;
@@ -813,6 +875,70 @@ mod tests {
         assert!(
             !still_alive,
             "timeout must terminate descendant PID {pid}; tasklist={listing}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_timeout_terminates_descendant_process_unix() {
+        // Unix regression: the process group kill (killpg) must terminate
+        // descendants, not just the root. The root spawns a grandchild that
+        // writes its PID to a file and keeps the inherited stdout pipe open;
+        // on timeout the whole group must die and the PID must no longer
+        // be alive.
+        let python = "python3";
+        let root = std::env::temp_dir().join(format!(
+            "hands_run_proc_tree_unix_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create unix tree-kill fixture directory");
+        let script = root.join("spawn_child.py");
+        let pid_file = root.join("child.pid");
+        std::fs::write(
+            &script,
+            "import pathlib, subprocess, sys, time\n\
+             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n\
+             pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n\
+             time.sleep(30)\n",
+        )
+        .expect("write unix tree-kill fixture");
+
+        let result = run_foreground(
+            python,
+            &[
+                script.to_string_lossy().to_string(),
+                pid_file.to_string_lossy().to_string(),
+            ],
+            None,
+            Some(700),
+            None,
+        )
+        .await;
+        assert!(result.timed_out, "fixture root should time out");
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("child PID fixture should be written before timeout")
+            .trim()
+            .parse()
+            .expect("child PID must be numeric");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // killpg must have terminated the descendant (it was in the same
+        // process group as the root). Probe with kill -0; a lingering PID
+        // or zombie is a regression.
+        let still_alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !still_alive,
+            "Unix timeout must terminate descendant PID {pid} via process group kill"
         );
     }
 
