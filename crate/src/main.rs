@@ -9,6 +9,8 @@ mod run_proc;
 mod secrets;
 mod service;
 mod setup;
+#[cfg(test)]
+mod testenv;
 mod tool_engine;
 mod ui;
 mod watch;
@@ -291,62 +293,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex as StdMutex;
-
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
-
-    struct EnvGuard {
-        saved_config_dir: Option<std::ffi::OsString>,
-        saved_workspace: Option<std::ffi::OsString>,
-        saved_legacy: Option<std::ffi::OsString>,
-        root: PathBuf,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.saved_config_dir {
-                    Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
-                    None => std::env::remove_var("HANDS_CONFIG_DIR"),
-                }
-                match &self.saved_workspace {
-                    Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
-                    None => std::env::remove_var("HANDS_WORKSPACE"),
-                }
-                match &self.saved_legacy {
-                    Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
-                    None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn isolate_env(name: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
-        let guard = TEST_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "hands_main_test_{}_{}_{}",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("create isolated test config dir");
-        let env_guard = EnvGuard {
-            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
-            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
-            saved_legacy: std::env::var_os("GROK_HARNESS_WORKSPACE"),
-            root: root.clone(),
-        };
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", &root);
-            std::env::remove_var("HANDS_WORKSPACE");
-            std::env::remove_var("GROK_HARNESS_WORKSPACE");
-        }
-        (guard, env_guard)
-    }
+    use crate::testenv::isolate_env;
 
     #[test]
     fn test_resolve_json_argument_raw_json() {

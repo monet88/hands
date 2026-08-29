@@ -278,62 +278,7 @@ async fn write_http(
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex as StdMutex;
-
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
-
-    struct EnvGuard {
-        saved_config_dir: Option<std::ffi::OsString>,
-        saved_workspace: Option<std::ffi::OsString>,
-        saved_legacy: Option<std::ffi::OsString>,
-        root: PathBuf,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.saved_config_dir {
-                    Some(v) => std::env::set_var("HANDS_CONFIG_DIR", v),
-                    None => std::env::remove_var("HANDS_CONFIG_DIR"),
-                }
-                match &self.saved_workspace {
-                    Some(v) => std::env::set_var("HANDS_WORKSPACE", v),
-                    None => std::env::remove_var("HANDS_WORKSPACE"),
-                }
-                match &self.saved_legacy {
-                    Some(v) => std::env::set_var("GROK_HARNESS_WORKSPACE", v),
-                    None => std::env::remove_var("GROK_HARNESS_WORKSPACE"),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn isolate_env(name: &str) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
-        let guard = TEST_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "hands_mcp_test_{}_{}_{}",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("create isolated test config dir");
-        let env_guard = EnvGuard {
-            saved_config_dir: std::env::var_os("HANDS_CONFIG_DIR"),
-            saved_workspace: std::env::var_os("HANDS_WORKSPACE"),
-            saved_legacy: std::env::var_os("GROK_HARNESS_WORKSPACE"),
-            root: root.clone(),
-        };
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", &root);
-            std::env::remove_var("HANDS_WORKSPACE");
-            std::env::remove_var("GROK_HARNESS_WORKSPACE");
-        }
-        (guard, env_guard)
-    }
+    use crate::testenv::isolate_env;
 
     #[tokio::test]
     async fn test_mcp_host_initialize_and_ping() {
@@ -478,6 +423,60 @@ mod tests {
 
         assert!(resp_str.contains("HTTP/1.1 200 OK"));
         assert!(resp_str.contains("\"tools\""));
+
+        let _ = server_task.await;
+    }
+
+    /// Locks HTTP-facing dispatch parity: a raw POST /mcp tools/call must
+    /// produce the same JSON-RPC result as the shared `handle_rpc` dispatch
+    /// (stdio serves the exact same function per line, so both transports
+    /// route to the same ToolEngine behavior).
+    #[tokio::test]
+    async fn test_mcp_http_dispatch_matches_handle_rpc_parity() {
+        let (_lock, _guard) = isolate_env("http_parity");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+
+        let host = McpHost::new(ws_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let host_clone = Arc::clone(&host);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            handle_http(stream, host_clone).await.expect("handle http");
+        });
+
+        let call_msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "workspace_info" }
+        });
+        let req_body = serde_json::to_vec(&call_msg).expect("serialize req");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            req_body.len()
+        );
+        let mut client = TcpStream::connect(addr).await.expect("connect to test server");
+        client.write_all(request.as_bytes()).await.expect("write req header");
+        client.write_all(&req_body).await.expect("write req body");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read response");
+        let resp_str = String::from_utf8_lossy(&response);
+        assert!(resp_str.contains("HTTP/1.1 200 OK"), "got: {resp_str}");
+        let body_start = resp_str.find("\r\n\r\n").expect("header terminator") + 4;
+        let http_resp: Value =
+            serde_json::from_str(resp_str[body_start..].trim()).expect("parse http json-rpc body");
+
+        let rpc_resp = host.handle_rpc(call_msg).await.expect("handle_rpc response");
+
+        assert_eq!(http_resp["id"], rpc_resp["id"]);
+        assert_eq!(
+            http_resp["result"], rpc_resp["result"],
+            "HTTP dispatch must produce identical engine behavior as shared dispatch"
+        );
+        assert_eq!(http_resp["result"]["isError"], false);
 
         let _ = server_task.await;
     }

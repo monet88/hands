@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "Unofficial ChatGPT plugin: local coding tools over MCP. No model."
 publish = false
 
+[dev-dependencies]
+parking_lot = { workspace = true }
+
 [[bin]]
 name = "hands"
 path = "src/main.rs"
