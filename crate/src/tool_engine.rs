@@ -111,12 +111,12 @@ impl ToolCallResult {
     }
 }
 
+/// Runtime execution metadata tracked for a terminal task in the active engine.
 #[derive(Debug, Clone)]
 pub struct TaskExecMeta {
     pub execution_mode: String,
     pub yielded: bool,
     pub pid: Option<u32>,
-    pub owner_session_id: Option<String>,
     pub description: Option<String>,
     pub cwd: Option<String>,
 }
@@ -246,10 +246,6 @@ impl ToolEngine {
                         "type": "integer",
                         "description": "Optional maximum number of task snapshots to return. Default: 50. Max: 200."
                     },
-                    "owner_session_id": {
-                        "type": "string",
-                        "description": "Optional owner session ID to filter task snapshots for session isolation."
-                    },
                     "include_output": {
                         "type": "boolean",
                         "description": "Optional flag to include a short output preview in each task snapshot. Default: false."
@@ -306,13 +302,6 @@ impl ToolEngine {
                             "description": "Optional per-call inline output budget in characters for head/tail preview truncation. Output exceeding this budget is truncated with head and tail retained, while full output is preserved in the output_file. Default: 40000."
                         }),
                     );
-                    props.insert(
-                        "max_inline_bytes".to_string(),
-                        json!({
-                            "type": "integer",
-                            "description": "Optional alias for max_inline_chars specifying the inline budget in bytes."
-                        }),
-                    );
                 }
             }
             if name == "get_task_output" {
@@ -322,13 +311,6 @@ impl ToolEngine {
                         json!({
                             "type": "integer",
                             "description": "Optional per-call inline output budget in characters for head/tail preview truncation. Output exceeding this budget is truncated with head and tail retained, while full output is preserved in the output_file. Default: 40000."
-                        }),
-                    );
-                    props.insert(
-                        "max_inline_bytes".to_string(),
-                        json!({
-                            "type": "integer",
-                            "description": "Optional alias for max_inline_chars specifying the inline budget in bytes."
                         }),
                     );
                 }
@@ -407,6 +389,10 @@ impl ToolEngine {
         }
 
         if name == "run_terminal_cmd" {
+            let budget_opt = match crate::run_proc::resolve_inline_budget(&arguments) {
+                Ok(b) => b,
+                Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+            };
             let exec_mode = match resolve_execution_mode(&arguments) {
                 Ok(m) => m,
                 Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
@@ -449,7 +435,7 @@ impl ToolEngine {
 
             match exec_mode {
                 ResolvedExecutionMode::Auto { yield_after_ms } => {
-                    let bg_cmd = if let Some(shell_str) = shell_str_opt {
+                    let bg_cmd = if let Some(shell_str) = &shell_str_opt {
                         match resolve_shell_command(shell_str.as_str(), &command, true, explicit_cwd.as_deref()) {
                             Ok(ResolvedShell::Background { command: c }) => c,
                             Ok(ResolvedShell::Foreground { .. }) => unreachable!(),
@@ -470,8 +456,8 @@ impl ToolEngine {
                         obj.remove("workdir");
                         obj.remove("execution_mode");
                         obj.remove("yield_after_ms");
+                        obj.remove("max_inline_chars");
                     }
-
                     let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                     let bridge = self.bridge().await?;
                     if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
@@ -509,7 +495,6 @@ impl ToolEngine {
                             execution_mode: "auto".to_string(),
                             yielded: false,
                             pid,
-                            owner_session_id: arguments.get("owner_session_id").and_then(Value::as_str).map(str::to_string),
                             description: description.clone(),
                             cwd: Some(cwd_str.clone()),
                         },
@@ -525,31 +510,38 @@ impl ToolEngine {
 
                     let poll_result = match bridge.call("get_task_output", poll_args, &poll_call_id).await {
                         Ok(r) => r,
-                        Err(_) => {
-                            self.update_task_yielded(&task_id, true).await;
+                        Err(e) => {
+                            let file_bytes = if !initial_output_file.is_empty() {
+                                std::fs::metadata(&initial_output_file)
+                                    .map(|m| m.len() as usize)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
                             let prompt_text = format!(
-                                "[Command yielded to background after {yield_after_ms}ms. Process is still running with task_id: {task_id}]\nUse get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."
+                                "[Started background task {task_id}, but polling task output failed: {e}]\nFull output may be available in output_file: {initial_output_file}\nUse get_task_output with task_id=\"{task_id}\" to inspect output or status."
                             );
                             let structured = json!({
                                 "task_id": task_id,
                                 "task_type": "bash",
-                                "status": "running",
+                                "status": "unknown",
                                 "command": command,
-                                "summary": format!("Command \"{}\" exceeded yield budget of {}ms and was yielded to background. Process is still running.", command, yield_after_ms),
+                                "summary": format!("Task \"{command}\" was started with id {task_id}, but poll failed: {e}"),
                                 "retrieval_hint": format!("Use get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."),
                                 "output_file": initial_output_file,
-                                "total_bytes": 0,
+                                "total_bytes": file_bytes,
                                 "description": description.as_deref(),
-                                "has_output": false,
+                                "has_output": file_bytes > 0,
                                 "execution_mode": "auto",
-                                "yielded": true,
+                                "yielded": false,
                                 "backgrounded": true,
                                 "pid": pid,
+                                "error": format!("poll error: {e}"),
                             });
                             return Ok(ToolCallResult {
                                 content: vec![ToolContent::Text { text: prompt_text }],
                                 structured: Some(structured),
-                                is_error: false,
+                                is_error: true,
                             });
                         }
                     };
@@ -562,79 +554,95 @@ impl ToolEngine {
                         .unwrap_or("running");
 
                     if status != "running" {
-                        let exit_code = result_obj
-                            .and_then(|r| r.get("exit_code"))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0) as i32;
-                        let output_text = result_obj
-                            .and_then(|r| r.get("output"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let total_bytes = result_obj
-                            .and_then(|r| r.get("raw_output_bytes").or_else(|| r.get("total_bytes")))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(output_text.len() as u64) as usize;
-                        let truncated = result_obj
-                            .and_then(|r| r.get("truncated"))
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let final_output_file = result_obj
-                            .and_then(|r| r.get("output_file"))
-                            .and_then(Value::as_str)
-                            .unwrap_or(&initial_output_file);
-                        let total_chars = output_text.chars().count();
-                        let has_output = !output_text.is_empty() || total_bytes > 0;
-
-                        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
-                        let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
-                        let needs_truncation = total_chars > budget || total_bytes > budget || truncated;
-
-                        let (text, log_path) = if needs_truncation {
-                            let full_content = if !final_output_file.is_empty() {
-                                std::fs::read_to_string(final_output_file).unwrap_or_else(|_| output_text.to_string())
-                            } else {
-                                output_text.to_string()
-                            };
-                            let preview_budget = budget.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
-                            let (head, tail) = crate::run_proc::truncate_head_tail_utf8(&full_content, preview_budget, preview_budget);
-                            let preview = format!(
-                                "{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - full output at: {final_output_file}]"
-                            );
-                            (preview, Some(final_output_file.to_string()))
-                        } else {
-                            (output_text.to_string(), None)
-                        };
-
-                        let prompt_text = format!(
-                            "command: {command}\nexit: {exit_code}\n\n{text}"
-                        );
-
-                        let structured = json!({
-                            "command": command,
-                            "exit_code": exit_code,
-                            "timed_out": false,
-                            "termination_reason": null,
-                            "current_dir": cwd_str,
-                            "truncated": truncated || log_path.is_some() || needs_truncation,
-                            "output_file": final_output_file,
-                            "total_bytes": total_bytes,
-                            "total_chars": total_chars,
-                            "max_inline_chars": budget,
-                            "description": description.as_deref(),
-                            "has_output": has_output,
-                            "error": null,
-                            "execution_mode": "auto",
-                            "status": status,
-                            "yielded": false,
-                            "pid": pid,
-                        });
-
                         self.update_task_yielded(&task_id, false).await;
-                        return Ok(ToolCallResult {
-                            content: vec![ToolContent::Text { text: prompt_text }],
-                            structured: Some(structured),
-                            is_error: false,
-                        });
+                        if let Some(res) = result_obj {
+                            let r_output = res.get("output").and_then(Value::as_str).unwrap_or("");
+                            let r_output_file = res.get("output_file").and_then(Value::as_str).unwrap_or("");
+                            let r_status = res.get("status").and_then(Value::as_str).unwrap_or("completed");
+                            let r_exit_code = res.get("exit_code").and_then(Value::as_i64).map(|c| c as i32);
+                            let r_truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                            let r_raw_bytes = res.get("raw_output_bytes").or_else(|| res.get("total_bytes")).and_then(Value::as_u64).unwrap_or(0) as usize;
+
+                            let file_content = if !r_output_file.is_empty() {
+                                std::fs::read_to_string(r_output_file).ok()
+                            } else {
+                                None
+                            };
+                            let full_output = match &file_content {
+                                Some(content) if !content.is_empty() => content.as_str(),
+                                _ => r_output,
+                            };
+
+                            if let Some(_shell_str) = &shell_str_opt {
+                                let exit_code = r_exit_code.unwrap_or(if r_status == "completed" { 0 } else { 1 });
+                                let timed_out = r_status == "timed_out";
+                                let proc_output = crate::run_proc::ProcOutput {
+                                    stdout: full_output.to_string(),
+                                    stderr: String::new(),
+                                    exit_code,
+                                    timed_out,
+                                    capture_truncated: r_truncated,
+                                    error: if r_status == "failed" && r_exit_code.is_none() {
+                                        Some("task failed".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    termination_reason: if timed_out {
+                                        Some(crate::run_proc::TerminationReason::Timeout)
+                                    } else {
+                                        None
+                                    },
+                                };
+                                return Ok(render_proc_output_as_terminal_result(
+                                    proc_output,
+                                    &command,
+                                    &cwd_str,
+                                    description.as_deref(),
+                                    budget_opt,
+                                ));
+                            } else {
+                                let exit_code = r_exit_code.unwrap_or(if r_status == "completed" { 0 } else { 1 });
+                                let timed_out = r_status == "timed_out";
+                                let raw_bytes = if let Some(content) = &file_content {
+                                    r_raw_bytes.max(content.len())
+                                } else {
+                                    r_raw_bytes.max(r_output.len())
+                                };
+                                let bash_output = xai_grok_tools::types::output::BashOutput {
+                                    output: full_output.as_bytes().to_vec(),
+                                    output_for_prompt: full_output.to_string(),
+                                    exit_code,
+                                    command: command.clone(),
+                                    truncated: r_truncated,
+                                    signal: None,
+                                    timed_out,
+                                    description: description.clone(),
+                                    current_dir: cwd_str.clone(),
+                                    output_file: r_output_file.to_string(),
+                                    total_bytes: raw_bytes,
+                                    output_delta: None,
+                                    was_bare_echo: false,
+                                };
+                                let tool_out = xai_grok_tools::types::output::ToolOutput::Bash(bash_output);
+                                let mut prompt_text = full_output.to_string();
+                                let structured = shape_structured_output_with_budget(&tool_out, &mut prompt_text, budget_opt);
+                                let is_error = exit_code != 0 || r_status == "failed";
+                                return Ok(ToolCallResult {
+                                    content: vec![ToolContent::Text { text: prompt_text }],
+                                    structured: Some(structured),
+                                    is_error,
+                                });
+                            }
+                        } else {
+                            let mut prompt_text = poll_result.prompt_text;
+                            let structured = shape_structured_output_with_budget(&poll_result.output, &mut prompt_text, budget_opt);
+                            let is_error = poll_result.output.is_error();
+                            return Ok(ToolCallResult {
+                                content: vec![ToolContent::Text { text: prompt_text }],
+                                structured: Some(structured),
+                                is_error,
+                            });
+                        }
                     } else {
                         let total_bytes = result_obj
                             .and_then(|r| r.get("raw_output_bytes").or_else(|| r.get("total_bytes")))
@@ -696,8 +704,8 @@ impl ToolEngine {
                         obj.remove("workdir");
                         obj.remove("execution_mode");
                         obj.remove("yield_after_ms");
+                        obj.remove("max_inline_chars");
                     }
-
                     let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                     let bridge = self.bridge().await?;
                     if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
@@ -712,7 +720,6 @@ impl ToolEngine {
                                         execution_mode: "background".to_string(),
                                         yielded: false,
                                         pid: b.pid,
-                                        owner_session_id: arguments.get("owner_session_id").and_then(Value::as_str).map(str::to_string),
                                         description: description.clone(),
                                         cwd: Some(cwd_str.clone()),
                                     },
@@ -752,7 +759,6 @@ impl ToolEngine {
                                     env,
                                 )
                                 .await;
-                                let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
                                 return Ok(render_proc_output_as_terminal_result(
                                     output,
                                     &command,
@@ -764,7 +770,7 @@ impl ToolEngine {
                             ResolvedShell::Background { .. } => unreachable!(),
                         }
                     } else {
-                        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
+                        // budget_opt resolved at start of run_terminal_cmd
                         let mut fg_arguments = arguments.clone();
                         if let Some(cwd) = explicit_cwd {
                             if let Some(obj) = fg_arguments.as_object_mut() {
@@ -780,8 +786,6 @@ impl ToolEngine {
                             obj.remove("execution_mode");
                             obj.remove("yield_after_ms");
                             obj.remove("max_inline_chars");
-                            obj.remove("max_inline_bytes");
-                            obj.remove("output_budget");
                         }
                         let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                         let bridge = self.bridge().await?;
@@ -806,12 +810,13 @@ impl ToolEngine {
             }
         }
 
-        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
+        let budget_opt = match crate::run_proc::resolve_inline_budget(&arguments) {
+            Ok(b) => b,
+            Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+        };
         let mut bridge_arguments = arguments.clone();
         if let Some(obj) = bridge_arguments.as_object_mut() {
             obj.remove("max_inline_chars");
-            obj.remove("max_inline_bytes");
-            obj.remove("output_budget");
         }
         let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
         let bridge = self.bridge().await?;
@@ -836,7 +841,10 @@ impl ToolEngine {
     async fn handle_list_terminal_tasks(&self, arguments: Value) -> Result<ToolCallResult, String> {
         let bridge = self.bridge().await?;
         let all_meta = self.get_all_task_meta().await;
-        let raw_snapshots = bridge.list_tasks().await.unwrap_or_default();
+        let raw_snapshots = match bridge.list_tasks().await {
+            Some(s) => s,
+            None => return Ok(ToolCallResult::text("error: terminal subsystem is not available", true)),
+        };
 
         let status_filter = arguments
             .get("status")
@@ -850,12 +858,6 @@ impl ToolEngine {
             .map(|l| (l as usize).clamp(1, 200))
             .unwrap_or(50);
 
-        let filter_owner = arguments
-            .get("owner_session_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-
         let include_output = arguments
             .get("include_output")
             .and_then(Value::as_bool)
@@ -865,19 +867,6 @@ impl ToolEngine {
 
         for snap in raw_snapshots {
             let meta = all_meta.get(&snap.task_id);
-
-            let task_owner = snap
-                .owner_session_id
-                .as_deref()
-                .or_else(|| meta.and_then(|m| m.owner_session_id.as_deref()));
-
-            // Optional owner filter: if caller specified an owner, only include tasks matching that owner
-            if let Some(req_owner) = filter_owner {
-                match task_owner {
-                    Some(owner) if owner == req_owner => {}
-                    _ => continue,
-                }
-            }
 
             let status = if snap.completed {
                 if snap.explicitly_killed {
@@ -905,10 +894,10 @@ impl ToolEngine {
                 .clone()
                 .or_else(|| meta.as_ref().and_then(|m| m.description.clone()))
                 .map(|d| sanitize_safe_metadata(&d));
-            let cwd = if snap.cwd.is_empty() {
-                meta.as_ref().and_then(|m| m.cwd.clone()).unwrap_or_else(|| self.workspace().to_string_lossy().to_string())
+            let cwd = if !snap.cwd.is_empty() {
+                Some(snap.cwd.clone())
             } else {
-                snap.cwd.clone()
+                meta.as_ref().and_then(|m| m.cwd.clone())
             };
 
             let started = xai_grok_tools::types::process_manager::format_system_time_rfc3339(snap.start_time);
@@ -942,7 +931,6 @@ impl ToolEngine {
                 "execution_mode": execution_mode,
                 "is_auto_yielded": is_auto_yielded,
                 "is_background": snap.is_backgrounded || meta.is_some(),
-                "owner_session_id": task_owner,
             });
 
             if include_output {
@@ -960,7 +948,7 @@ impl ToolEngine {
 
         let total_count = tasks.len();
         let running_count = tasks.iter().filter(|t| t["status"] == "running").count();
-        let completed_count = total_count - running_count;
+        let completed_count = tasks.iter().filter(|t| t["status"] == "completed").count();
 
         // Apply limit
         if tasks.len() > limit {
@@ -1539,113 +1527,258 @@ fn shape_structured_output_with_budget(
     prompt_text: &mut String,
     budget_opt: Option<usize>,
 ) -> Value {
-    let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
     let mut structured = serde_json::to_value(output).unwrap_or_else(|_| json!({ "type": "unknown" }));
 
-    // Enrich specific tool variant structured outputs
-    if let Some(bash) = structured.as_object_mut() {
-        if bash.get("type").and_then(Value::as_str) == Some("Bash") {
-            let total_bytes = bash.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
-            let has_output = total_bytes > 0 || !prompt_text.is_empty();
-            let total_chars = prompt_text.chars().count();
-            bash.insert("has_output".to_string(), json!(has_output));
-            bash.insert("total_chars".to_string(), json!(total_chars));
-            bash.insert("max_inline_chars".to_string(), json!(budget));
+    if let Some(budget) = budget_opt {
+        if let Some(bash) = structured.as_object_mut() {
+            if bash.get("type").and_then(Value::as_str) == Some("Bash") {
+                let total_bytes = bash.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+                let output_file = bash.get("output_file").and_then(Value::as_str).unwrap_or("").to_string();
+                let previously_truncated = bash.get("truncated").and_then(Value::as_bool).unwrap_or(false);
 
-            if total_chars > budget || total_bytes as usize > budget {
-                bash.insert("truncated".to_string(), json!(true));
-                let (head, tail) = crate::run_proc::truncate_head_tail_utf8(prompt_text, budget, budget);
-                *prompt_text = format!("{head}\n\n... (output truncated) ...\n\n{tail}");
-            }
-        } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
-            if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
-                let mut raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-                let inline_output = res.get("output").and_then(Value::as_str).unwrap_or("").to_string();
-                let output_file = res.get("output_file").and_then(Value::as_str).unwrap_or("").to_string();
-
-                let file_content = if !output_file.is_empty() {
-                    std::fs::read_to_string(&output_file).ok()
-                } else {
-                    None
-                };
-
-                let full_output = match &file_content {
-                    Some(content) if !content.is_empty() => content.as_str(),
-                    _ => inline_output.as_str(),
-                };
-
-                if let Some(content) = &file_content {
-                    raw_bytes = raw_bytes.max(content.len());
-                } else {
-                    raw_bytes = raw_bytes.max(inline_output.len());
-                }
-
-                let total_chars = full_output.chars().count();
-                let has_output = !full_output.is_empty() || raw_bytes > 0;
-
-                res.insert("total_bytes".to_string(), json!(raw_bytes));
-                res.insert("total_chars".to_string(), json!(total_chars));
-                res.insert("has_output".to_string(), json!(has_output));
-                res.insert("max_inline_chars".to_string(), json!(budget));
-
-                let is_explicit_budget = budget_opt.is_some();
-                let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
-                let needs_budget_truncation = if is_explicit_budget {
-                    total_chars > budget || raw_bytes > budget || truncated
-                } else {
-                    total_chars > crate::run_proc::DEFAULT_OUTPUT_BOUND || raw_bytes > crate::run_proc::DEFAULT_OUTPUT_BOUND || truncated
-                };
-
-                if needs_budget_truncation {
-                    res.insert("truncated".to_string(), json!(true));
-                    let (head, tail) = if is_explicit_budget {
-                        crate::run_proc::truncate_head_tail_utf8(full_output, budget, budget.saturating_mul(4))
-                    } else {
-                        let preview_budget = crate::run_proc::DEFAULT_OUTPUT_BOUND.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
-                        crate::run_proc::truncate_head_tail_utf8(full_output, preview_budget, preview_budget)
-                    };
-
-                    let preview_text = if !output_file.is_empty() {
-                        format!("{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - use read_file on output_file for full content]")
-                    } else {
-                        format!("{head}\n\n... (output truncated) ...\n\n{tail}")
-                    };
-
-                    if prompt_text.contains("(no output)") {
-                        *prompt_text = prompt_text.replace("(no output)", &preview_text);
-                    } else if !prompt_text.contains("... (output truncated) ...") {
-                        if let Some(pos) = prompt_text.find("Output:\n") {
-                            let prefix = &prompt_text[..pos + "Output:\n".len()];
-                            *prompt_text = format!("{prefix}{preview_text}");
+                let raw_output_str = match output {
+                    ToolOutput::Bash(b) => String::from_utf8_lossy(&b.output).into_owned(),
+                    _ => {
+                        if let Some(bytes) = bash.get("output").and_then(Value::as_array) {
+                            let u8_vec: Vec<u8> = bytes.iter().filter_map(|v| v.as_u64().map(|b| b as u8)).collect();
+                            String::from_utf8_lossy(&u8_vec).into_owned()
                         } else {
-                            *prompt_text = format!("{}\n\n{}", prompt_text.trim_end(), preview_text);
+                            prompt_text.clone()
                         }
                     }
+                };
+
+                let total_chars = raw_output_str.chars().count();
+                let raw_bytes = if total_bytes > 0 {
+                    total_bytes as usize
                 } else {
-                    res.insert("truncated".to_string(), json!(false));
-                    if inline_output.is_empty() && has_output && !full_output.is_empty() {
-                        res.insert("output".to_string(), json!(full_output));
+                    raw_output_str.len()
+                };
+                let has_output = raw_bytes > 0 || !raw_output_str.is_empty();
+
+                bash.insert("total_bytes".to_string(), json!(raw_bytes));
+                bash.insert("has_output".to_string(), json!(has_output));
+                bash.insert("total_chars".to_string(), json!(total_chars));
+                bash.insert("max_inline_chars".to_string(), json!(budget));
+
+                if total_chars > budget || previously_truncated {
+                    bash.insert("truncated".to_string(), json!(true));
+                    let (head, tail) = crate::run_proc::truncate_head_tail_utf8(&raw_output_str, budget, budget.saturating_mul(4));
+                    let preview_raw = if !output_file.is_empty() {
+                        format!("{head}
+
+... (output truncated) ...
+
+{tail}
+
+[truncated - full output at: {output_file}]")
+                    } else {
+                        format!("{head}
+
+... (output truncated) ...
+
+{tail}")
+                    };
+
+                    if !raw_output_str.is_empty() && prompt_text.contains(&raw_output_str) {
+                        *prompt_text = prompt_text.replace(&raw_output_str, &preview_raw);
+                    } else {
+                        *prompt_text = preview_raw.clone();
+                    }
+
+                    bash.insert("output_for_prompt".to_string(), json!(&*prompt_text));
+                    bash.insert("output".to_string(), json!(preview_raw.as_bytes()));
+                } else {
+                    bash.insert("truncated".to_string(), json!(false));
+                }
+            } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
+                if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
+                    let mut raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                    let inline_output = res.get("output").and_then(Value::as_str).unwrap_or("").to_string();
+                    let output_file = res.get("output_file").and_then(Value::as_str).unwrap_or("").to_string();
+
+                    let file_content = if !output_file.is_empty() {
+                        std::fs::read_to_string(&output_file).ok()
+                    } else {
+                        None
+                    };
+
+                    let full_output = match &file_content {
+                        Some(content) if !content.is_empty() => content.as_str(),
+                        _ => inline_output.as_str(),
+                    };
+
+                    if let Some(content) = &file_content {
+                        raw_bytes = raw_bytes.max(content.len());
+                    } else {
+                        raw_bytes = raw_bytes.max(inline_output.len());
+                    }
+
+                    let total_chars = full_output.chars().count();
+                    let has_output = !full_output.is_empty() || raw_bytes > 0;
+
+                    res.insert("total_bytes".to_string(), json!(raw_bytes));
+                    res.insert("total_chars".to_string(), json!(total_chars));
+                    res.insert("has_output".to_string(), json!(has_output));
+                    res.insert("max_inline_chars".to_string(), json!(budget));
+
+                    if total_chars > budget || truncated {
+                        res.insert("truncated".to_string(), json!(true));
+                        let (head, tail) = crate::run_proc::truncate_head_tail_utf8(full_output, budget, budget.saturating_mul(4));
+                        let preview_text = if !output_file.is_empty() {
+                            format!("{head}
+
+... (output truncated) ...
+
+{tail}
+
+[truncated - use read_file on output_file for full content]")
+                        } else {
+                            format!("{head}
+
+... (output truncated) ...
+
+{tail}")
+                        };
+                        res.insert("output".to_string(), json!(preview_text));
+
                         if prompt_text.contains("(no output)") {
-                            *prompt_text = prompt_text.replace("(no output)", full_output);
+                            *prompt_text = prompt_text.replace("(no output)", &preview_text);
+                        } else if !prompt_text.contains("... (output truncated) ...") {
+                            if !full_output.is_empty() && prompt_text.contains(full_output) {
+                                *prompt_text = prompt_text.replace(full_output, &preview_text);
+                            } else if !inline_output.is_empty() && prompt_text.contains(&inline_output) {
+                                *prompt_text = prompt_text.replace(&inline_output, &preview_text);
+                            } else if let Some(pos) = prompt_text.find("Output:
+") {
+                                let prefix = &prompt_text[..pos + "Output:
+".len()];
+                                *prompt_text = format!("{prefix}{preview_text}");
+                            } else {
+                                *prompt_text = format!("{}
+
+{}", prompt_text.trim_end(), preview_text);
+                            }
+                        }
+                    } else {
+                        res.insert("truncated".to_string(), json!(false));
+                        if inline_output.is_empty() && has_output && !full_output.is_empty() {
+                            res.insert("output".to_string(), json!(full_output));
+                            if prompt_text.contains("(no output)") {
+                                *prompt_text = prompt_text.replace("(no output)", full_output);
+                            }
+                        }
+                    }
+                } else if let Some(results) = bash
+                    .get_mut("MultiResult")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|multi| multi.get_mut("results"))
+                    .and_then(Value::as_array_mut)
+                {
+                    for result in results {
+                        let Some(res) = result.as_object_mut() else {
+                            continue;
+                        };
+                        let inline_output = res.get("output").and_then(Value::as_str).unwrap_or("").to_string();
+                        let output_file = res.get("output_file").and_then(Value::as_str).unwrap_or("").to_string();
+                        let file_content = if !output_file.is_empty() {
+                            std::fs::read_to_string(&output_file).ok()
+                        } else {
+                            None
+                        };
+                        let full_output = match &file_content {
+                            Some(content) if !content.is_empty() => content.as_str(),
+                            _ => inline_output.as_str(),
+                        };
+                        let mut raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        if let Some(content) = &file_content {
+                            raw_bytes = raw_bytes.max(content.len());
+                        } else {
+                            raw_bytes = raw_bytes.max(inline_output.len());
+                        }
+                        let total_chars = full_output.chars().count();
+                        let has_output = !full_output.is_empty() || raw_bytes > 0;
+                        let previously_truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+
+                        res.insert("total_bytes".to_string(), json!(raw_bytes));
+                        res.insert("total_chars".to_string(), json!(total_chars));
+                        res.insert("has_output".to_string(), json!(has_output));
+                        res.insert("max_inline_chars".to_string(), json!(budget));
+
+                        if total_chars > budget || previously_truncated {
+                            res.insert("truncated".to_string(), json!(true));
+                            let (head, tail) = crate::run_proc::truncate_head_tail_utf8(full_output, budget, budget.saturating_mul(4));
+                            let preview_text = if !output_file.is_empty() {
+                                format!("{head}
+
+... (output truncated) ...
+
+{tail}
+
+[truncated - use read_file on output_file for full content]")
+                            } else {
+                                format!("{head}
+
+... (output truncated) ...
+
+{tail}")
+                            };
+                            res.insert("output".to_string(), json!(&preview_text));
+
+                            if !full_output.is_empty() && prompt_text.contains(full_output) {
+                                *prompt_text = prompt_text.replace(full_output, &preview_text);
+                            } else if !inline_output.is_empty() && prompt_text.contains(&inline_output) {
+                                *prompt_text = prompt_text.replace(&inline_output, &preview_text);
+                            }
+                        } else {
+                            res.insert("truncated".to_string(), json!(false));
+                            if inline_output.is_empty() && has_output && !full_output.is_empty() {
+                                res.insert("output".to_string(), json!(full_output));
+                            }
                         }
                     }
                 }
-            } else if let Some(results) = bash
-                .get_mut("MultiResult")
-                .and_then(Value::as_object_mut)
-                .and_then(|multi| multi.get_mut("results"))
-                .and_then(Value::as_array_mut)
-            {
-                for result in results {
-                    let Some(res) = result.as_object_mut() else {
-                        continue;
-                    };
+            }
+        }
+    } else {
+        if let Some(bash) = structured.as_object_mut() {
+            if bash.get("type").and_then(Value::as_str) == Some("Bash") {
+                let total_bytes = bash.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+                let has_output = total_bytes > 0 || !prompt_text.is_empty();
+                bash.insert("has_output".to_string(), json!(has_output));
+            } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
+                if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
                     let raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0);
-                    let is_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
+                    let truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                    let is_output_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
+                    let has_output = !is_output_empty || raw_bytes > 0;
                     res.insert("total_bytes".to_string(), json!(raw_bytes));
-                    res.insert("has_output".to_string(), json!(!is_empty || raw_bytes > 0));
-                    res.insert("max_inline_chars".to_string(), json!(budget));
+                    res.insert("has_output".to_string(), json!(has_output));
+
+                    if is_output_empty && (truncated || raw_bytes > 0) {
+                        if prompt_text.contains("(no output)") {
+                            *prompt_text = prompt_text.replace(
+                                "(no output)",
+                                "(output truncated - use read_file on output_file for full content)",
+                            );
+                        }
+                    }
+                } else if let Some(results) = bash
+                    .get_mut("MultiResult")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|multi| multi.get_mut("results"))
+                    .and_then(Value::as_array_mut)
+                {
+                    for result in results {
+                        let Some(res) = result.as_object_mut() else {
+                            continue;
+                        };
+                        let raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0);
+                        let is_output_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
+                        res.insert("total_bytes".to_string(), json!(raw_bytes));
+                        res.insert("has_output".to_string(), json!(!is_output_empty || raw_bytes > 0));
+                    }
                 }
             }
         }
@@ -1674,32 +1807,32 @@ fn render_proc_output_as_terminal_result(
 
     let has_output = !combined.is_empty();
     let total_bytes = combined.len();
-    let total_chars = combined.chars().count();
 
-    let is_explicit_budget = budget_opt.is_some();
-    let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
-
-    let needs_truncation = if is_explicit_budget {
-        total_chars > budget || total_bytes > budget || output.capture_truncated
-    } else {
-        total_bytes > crate::run_proc::DEFAULT_OUTPUT_BOUND || output.capture_truncated
-    };
-
-    let (text, log_path) = if needs_truncation {
-        let log = crate::run_proc::write_temp_log(&output.stdout, &output.stderr);
-        let (head, tail) = if is_explicit_budget {
-            crate::run_proc::truncate_head_tail_utf8(&combined, budget, budget.saturating_mul(4))
+    let (text, log_path, needs_truncation) = if let Some(budget) = budget_opt {
+        let total_chars = combined.chars().count();
+        if total_chars > budget || output.capture_truncated {
+            let log = crate::run_proc::write_temp_log(&output.stdout, &output.stderr);
+            let (head, tail) = crate::run_proc::truncate_head_tail_utf8(&combined, budget, budget.saturating_mul(4));
+            let preview = format!(
+                "{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - full output at: {}]",
+                log.as_deref().unwrap_or("")
+            );
+            (preview, log, true)
         } else {
-            let preview_budget = crate::run_proc::DEFAULT_OUTPUT_BOUND.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
-            crate::run_proc::truncate_head_tail_utf8(&combined, preview_budget, preview_budget)
-        };
-        let preview = format!(
-            "{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - full output at: {}]",
-            log.as_deref().unwrap_or("")
-        );
-        (preview, log)
+            (combined.clone(), None, false)
+        }
     } else {
-        (combined, None)
+        if combined.len() > 40_000 || output.capture_truncated {
+            let log = crate::run_proc::write_temp_log(&output.stdout, &output.stderr);
+            let preview_prefix = crate::run_proc::truncate_utf8(&combined, 20_000);
+            let preview = format!(
+                "{preview_prefix}\n\n... (output truncated) ...\n\n[truncated - full output at: {}]",
+                log.as_deref().unwrap_or("")
+            );
+            (preview, log, true)
+        } else {
+            (combined.clone(), None, false)
+        }
     };
 
     let prompt_text = format!(
@@ -1710,7 +1843,7 @@ fn render_proc_output_as_terminal_result(
 
     let termination_reason = output.termination_reason.map(|r| r.as_str());
 
-    let structured = json!({
+    let mut structured = json!({
         "command": command,
         "exit_code": output.exit_code,
         "timed_out": output.timed_out,
@@ -1719,12 +1852,15 @@ fn render_proc_output_as_terminal_result(
         "truncated": output.capture_truncated || log_path.is_some() || needs_truncation,
         "output_file": log_path.unwrap_or_default(),
         "total_bytes": total_bytes,
-        "total_chars": total_chars,
-        "max_inline_chars": budget,
-        "description": description.as_deref(),
+        "description": description,
         "has_output": has_output,
         "error": output.error,
     });
+
+    if let Some(budget) = budget_opt {
+        structured["total_chars"] = json!(combined.chars().count());
+        structured["max_inline_chars"] = json!(budget);
+    }
 
     ToolCallResult {
         content: vec![ToolContent::Text { text: prompt_text }],
@@ -1857,7 +1993,7 @@ mod tests {
             .await
             .expect("call_tool should succeed");
 
-        assert!(!res.is_error);
+        assert!(!res.is_error, "res was error: {:?}", res.content[0].text());
         let text = match &res.content[0] {
             ToolContent::Text { text } => text,
         };
@@ -2843,7 +2979,19 @@ exit /b 1
 
         let engine = ToolEngine::new(ws_dir.clone());
 
-        let res = engine
+        // 1. Default shell: compare auto-short directly against ordinary foreground
+        let fg_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'AUTO_SHORT_PAYLOAD'\"",
+                    "description": "fg short command"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let auto_res = engine
             .call_tool(
                 "run_terminal_cmd",
                 json!({
@@ -2856,20 +3004,55 @@ exit /b 1
             .await
             .unwrap();
 
-        assert!(!res.is_error);
-        let text = res.content[0].text();
-        assert!(text.contains("exit: 0"));
-        assert!(text.contains("AUTO_SHORT_PAYLOAD"));
+        assert!(!auto_res.is_error);
+        assert_eq!(auto_res.is_error, fg_res.is_error);
+        assert!(auto_res.content[0].text().contains("AUTO_SHORT_PAYLOAD"));
+        assert!(fg_res.content[0].text().contains("AUTO_SHORT_PAYLOAD"));
 
-        let structured = res.structured.expect("must return structured output");
-        assert_eq!(structured["exit_code"], 0);
-        assert_eq!(structured["status"], "completed");
-        assert_eq!(structured["yielded"], false);
-        assert_eq!(structured["timed_out"], false);
-        assert_eq!(structured["execution_mode"], "auto");
-        assert_eq!(structured["has_output"], true);
+        let auto_struct = auto_res.structured.expect("must return structured output");
+        let fg_struct = fg_res.structured.expect("must return structured output");
+        assert_eq!(auto_struct["type"], fg_struct["type"]);
+        assert_eq!(auto_struct["exit_code"], fg_struct["exit_code"]);
+        assert_eq!(auto_struct["has_output"], fg_struct["has_output"]);
+        assert_eq!(auto_struct.get("Result"), None, "auto-short must not wrap in TaskOutput Result");
+
+        // 2. Explicit shell: compare auto-short directly against ordinary foreground with shell
+        let fg_shell = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "Write-Output 'AUTO_SHELL_PAYLOAD'",
+                    "description": "fg shell command",
+                    "shell": "powershell"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let auto_shell = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "Write-Output 'AUTO_SHELL_PAYLOAD'",
+                    "description": "auto shell command",
+                    "shell": "powershell",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!auto_shell.is_error);
+        assert_eq!(auto_shell.is_error, fg_shell.is_error);
+        assert_eq!(auto_shell.content[0].text().trim(), fg_shell.content[0].text().trim());
+        let auto_shell_struct = auto_shell.structured.expect("must return structured output");
+        let fg_shell_struct = fg_shell.structured.expect("must return structured output");
+        assert_eq!(auto_shell_struct["exit_code"], fg_shell_struct["exit_code"]);
+        assert_eq!(auto_shell_struct["has_output"], fg_shell_struct["has_output"]);
+        assert_eq!(auto_shell_struct["current_dir"], fg_shell_struct["current_dir"]);
+        assert_eq!(auto_shell_struct.get("Result"), None);
     }
-
     #[tokio::test]
     #[cfg(windows)]
     async fn test_run_terminal_cmd_auto_mode_long_yields_to_background_and_resumes() {
@@ -3085,9 +3268,9 @@ exit /b 1
         assert!(!cmd_short.is_error);
         assert!(cmd_short.content[0].text().contains("CMD_AUTO_SHORT_OK"));
         let cmd_struct = cmd_short.structured.unwrap();
-        assert_eq!(cmd_struct["status"], "completed");
-        assert_eq!(cmd_struct["yielded"], false);
-
+        assert_eq!(cmd_struct["exit_code"], 0);
+        assert_eq!(cmd_struct["has_output"], true);
+        assert_eq!(cmd_struct.get("Result"), None);
         // 2. cmd long auto yields
         let cmd_long = engine
             .call_tool(
@@ -3172,9 +3355,7 @@ exit /b 1
         assert!(!res.is_error, "exit_code != 0 must NOT become MCP isError in auto mode");
         let structured = res.structured.expect("must return structured output");
         assert_ne!(structured["exit_code"], 0);
-        assert_eq!(structured["status"], "failed");
-        assert_eq!(structured["yielded"], false);
-        assert_eq!(structured["timed_out"], false);
+        assert_eq!(structured.get("Result"), None);
     }
 
     #[tokio::test]
@@ -3276,9 +3457,8 @@ exit /b 1
 
         assert!(!short_res.is_error);
         let short_struct = short_res.structured.unwrap();
-        assert_eq!(short_struct["status"], "completed");
-        assert_eq!(short_struct["yielded"], false);
-        assert!(short_struct.get("pid").is_some(), "PID field must be present in structured output");
+        assert_eq!(short_struct["exit_code"], 0);
+        assert_eq!(short_struct.get("Result"), None);
         let short_content = fs::read_to_string(&short_marker).expect("read short marker");
         assert_eq!(short_content.matches("SHORT_ONCE").count(), 1);
     }
@@ -3292,7 +3472,18 @@ exit /b 1
 
         let engine = ToolEngine::new(ws_dir.clone());
 
-        let res = engine
+        let fg_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo 'AUTO_SHORT_PAYLOAD_UNIX'",
+                    "description": "fg short unix"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let auto_res = engine
             .call_tool(
                 "run_terminal_cmd",
                 json!({
@@ -3305,17 +3496,17 @@ exit /b 1
             .await
             .unwrap();
 
-        assert!(!res.is_error);
-        let text = res.content[0].text();
-        assert!(text.contains("AUTO_SHORT_PAYLOAD_UNIX"));
+        assert!(!auto_res.is_error);
+        assert_eq!(auto_res.is_error, fg_res.is_error);
+        assert_eq!(auto_res.content[0].text().trim(), fg_res.content[0].text().trim());
+        assert!(auto_res.content[0].text().contains("AUTO_SHORT_PAYLOAD_UNIX"));
 
-        let structured = res.structured.expect("must return structured output");
-        assert_eq!(structured["exit_code"], 0);
-        assert_eq!(structured["status"], "completed");
-        assert_eq!(structured["yielded"], false);
-        assert_eq!(structured["timed_out"], false);
-        assert_eq!(structured["execution_mode"], "auto");
-        assert_eq!(structured["has_output"], true);
+        let auto_struct = auto_res.structured.expect("must return structured output");
+        let fg_struct = fg_res.structured.expect("must return structured output");
+        assert_eq!(auto_struct["type"], fg_struct["type"]);
+        assert_eq!(auto_struct["exit_code"], fg_struct["exit_code"]);
+        assert_eq!(auto_struct["has_output"], fg_struct["has_output"]);
+        assert_eq!(auto_struct.get("Result"), None);
     }
 
     #[tokio::test]
@@ -3525,10 +3716,8 @@ exit /b 1
 
         assert!(!res.is_error, "exit_code != 0 must NOT become MCP isError in auto mode");
         let structured = res.structured.expect("must return structured output");
-        assert_ne!(structured["exit_code"], 0);
-        assert_eq!(structured["status"], "failed");
-        assert_eq!(structured["yielded"], false);
-        assert_eq!(structured["timed_out"], false);
+        assert_eq!(structured["exit_code"], 42);
+        assert_eq!(structured.get("Result"), None);
     }
 
     #[tokio::test]
@@ -3559,8 +3748,8 @@ exit /b 1
             assert!(!git_bash_short.is_error);
             assert!(git_bash_short.content[0].text().contains("GIT_BASH_AUTO_SHORT_OK"));
             let gb_struct = git_bash_short.structured.unwrap();
-            assert_eq!(gb_struct["status"], "completed");
-            assert_eq!(gb_struct["yielded"], false);
+            assert_eq!(gb_struct["exit_code"], 0);
+            assert_eq!(gb_struct.get("Result"), None);
         } else {
             assert!(git_bash_short.is_error);
         }
@@ -3678,9 +3867,8 @@ exit /b 1
 
         assert!(!short_res.is_error);
         let short_struct = short_res.structured.unwrap();
-        assert_eq!(short_struct["status"], "completed");
-        assert_eq!(short_struct["yielded"], false);
-        assert!(short_struct.get("pid").is_some(), "PID field must be present in structured output");
+        assert_eq!(short_struct["exit_code"], 0);
+        assert_eq!(short_struct.get("Result"), None);
         let short_content = fs::read_to_string(&short_marker).expect("read short marker");
         assert_eq!(short_content.matches("SHORT_UNIX_ONCE").count(), 1);
     }
@@ -3715,7 +3903,7 @@ exit /b 1
             .expect("properties object");
         assert!(props.contains_key("status"), "schema must include 'status'");
         assert!(props.contains_key("limit"), "schema must include 'limit'");
-        assert!(props.contains_key("owner_session_id"), "schema must include 'owner_session_id'");
+        assert!(!props.contains_key("owner_session_id"), "schema must NOT include caller-controlled 'owner_session_id'");
         assert!(props.contains_key("include_output"), "schema must include 'include_output'");
 
         // Empty listing when no tasks have been started
@@ -3791,9 +3979,8 @@ exit /b 1
             .unwrap();
         assert!(!auto_done_res.is_error);
         let auto_done_struct = auto_done_res.structured.unwrap();
-        assert_eq!(auto_done_struct["status"], "completed");
-        assert_eq!(auto_done_struct["yielded"], false);
-
+        assert_eq!(auto_done_struct["exit_code"], 0);
+        assert_eq!(auto_done_struct["has_output"], true);
         // 4. Query list_terminal_tasks
         let list_res = engine
             .call_tool("list_terminal_tasks", json!({ "include_output": true }))
@@ -3808,6 +3995,30 @@ exit /b 1
         assert!(list_struct["total_count"].as_u64().unwrap() >= 3);
         assert!(list_struct["running_count"].as_u64().unwrap() >= 2);
 
+        // Verify owner_session_id is removed from task snapshots (Issue #32/#36 boundary)
+        for t in tasks {
+            assert!(t.get("owner_session_id").is_none(), "owner_session_id must NOT be exposed in list_terminal_tasks snapshot");
+        }
+
+        // Finding 10: Prove completed task is found via list_terminal_tasks and can be continued/read
+        let completed_item = tasks
+            .iter()
+            .find(|t| t["description"].as_str() == Some("quick completed auto task"))
+            .expect("completed task in list");
+        assert_eq!(completed_item["status"], "completed");
+        assert_eq!(completed_item["execution_mode"], "auto");
+        assert_eq!(completed_item["is_auto_yielded"], false);
+        let completed_task_id = completed_item["task_id"].as_str().expect("task_id").to_string();
+
+        let completed_out_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &completed_task_id, "timeout_ms": 1000 }),
+            )
+            .await
+            .unwrap();
+        assert!(!completed_out_res.is_error);
+        assert!(completed_out_res.content[0].text().contains("QUICK_DONE"));
         // Verify prompt_text format and hints
         let prompt = list_res.content[0].text();
         assert!(prompt.contains(&bg_task_id));
@@ -3864,9 +4075,15 @@ exit /b 1
         );
     }
 
+    /// Documents the engine-instance separation vs shared-host protocol limitation:
+    /// In production, `hands.exe --http` (or stdio) runs a single `Arc<ToolEngine>`.
+    /// Because the current MCP/tunnel-client protocol conveys NO trusted caller/session/user identity
+    /// (neither in HTTP headers nor JSON-RPC envelopes), all clients sharing the single engine share
+    /// the terminal task registry. This test proves that separate `ToolEngine` instances have isolated
+    /// registries, and that untrusted caller fields are not exposed in the schema.
     #[tokio::test]
-    async fn test_list_terminal_tasks_owner_isolation_and_no_cross_leak() {
-        let (_lock, _guard) = isolate_env("list_owner_iso");
+    async fn test_list_terminal_tasks_engine_isolation_and_no_caller_spoofing() {
+        let (_lock, _guard) = isolate_env("list_engine_iso");
         let ws_dir_alpha = _guard.root.join("ws_alpha");
         let ws_dir_beta = _guard.root.join("ws_beta");
         fs::create_dir_all(&ws_dir_alpha).expect("create ws_dir_alpha");
@@ -3942,15 +4159,6 @@ exit /b 1
             !alpha_ids.contains(&beta_task_id.as_str()),
             "engine_alpha list must NOT include engine_beta's task {beta_task_id}"
         );
-        let alpha_prompt = res_alpha.content[0].text();
-        assert!(
-            alpha_prompt.contains(&alpha_task_id),
-            "human prompt text in alpha must include its own task {alpha_task_id}"
-        );
-        assert!(
-            !alpha_prompt.contains(&beta_task_id),
-            "human prompt text in alpha must NOT include beta task {beta_task_id}"
-        );
 
         // 4. Query list_terminal_tasks on engine_beta: must contain beta_task_id and NOT alpha_task_id
         let res_beta = engine_beta
@@ -3976,34 +4184,18 @@ exit /b 1
             !beta_ids.contains(&alpha_task_id.as_str()),
             "engine_beta list must NOT include engine_alpha's task {alpha_task_id}"
         );
-        let beta_prompt = res_beta.content[0].text();
-        assert!(
-            beta_prompt.contains(&beta_task_id),
-            "human prompt text in beta must include its own task {beta_task_id}"
-        );
-        assert!(
-            !beta_prompt.contains(&alpha_task_id),
-            "human prompt text in beta must NOT include alpha task {alpha_task_id}"
-        );
 
-        // 5. Untrusted caller supplying owner_session_id on engine_beta cannot breach isolation
-        let res_beta_attack = engine_beta
-            .call_tool(
-                "list_terminal_tasks",
-                json!({ "owner_session_id": "session_alpha" }),
-            )
+        // 5. Tool schema does not accept caller-controlled owner_session_id
+        let list_tool = engine_beta
+            .list_tools()
             .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t["name"] == "list_terminal_tasks")
             .unwrap();
-        assert!(!res_beta_attack.is_error);
-        let attack_struct = res_beta_attack.structured.unwrap();
-        let attack_tasks = attack_struct["tasks"].as_array().unwrap();
-        let attack_ids: Vec<&str> = attack_tasks
-            .iter()
-            .filter_map(|t| t["task_id"].as_str())
-            .collect();
         assert!(
-            !attack_ids.contains(&alpha_task_id.as_str()),
-            "engine_beta must NEVER return engine_alpha's task even if caller specifies session_alpha"
+            !list_tool["inputSchema"]["properties"].as_object().unwrap().contains_key("owner_session_id"),
+            "caller-controlled owner_session_id must NOT be accepted in tool schema"
         );
 
         // Cleanup tasks
@@ -4244,9 +4436,8 @@ exit /b 1
             .unwrap();
         assert!(!auto_done_res.is_error);
         let auto_done_struct = auto_done_res.structured.unwrap();
-        assert_eq!(auto_done_struct["status"], "completed");
-        assert_eq!(auto_done_struct["yielded"], false);
-
+        assert_eq!(auto_done_struct["exit_code"], 0);
+        assert_eq!(auto_done_struct["has_output"], true);
         // 4. Query list_terminal_tasks
         let list_res = engine
             .call_tool("list_terminal_tasks", json!({ "include_output": true }))
@@ -4260,6 +4451,29 @@ exit /b 1
         assert!(list_struct["total_count"].as_u64().unwrap() >= 3);
         assert!(list_struct["running_count"].as_u64().unwrap() >= 2);
 
+        for t in tasks {
+            assert!(t.get("owner_session_id").is_none(), "owner_session_id must NOT be exposed in unix list_terminal_tasks snapshot");
+        }
+
+        // Finding 10: Prove completed task is found via list_terminal_tasks and can be continued/read
+        let completed_item = tasks
+            .iter()
+            .find(|t| t["description"].as_str() == Some("quick completed auto task unix"))
+            .expect("completed task in list");
+        assert_eq!(completed_item["status"], "completed");
+        assert_eq!(completed_item["execution_mode"], "auto");
+        assert_eq!(completed_item["is_auto_yielded"], false);
+        let completed_task_id = completed_item["task_id"].as_str().expect("task_id").to_string();
+
+        let completed_out_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &completed_task_id, "timeout_ms": 1000 }),
+            )
+            .await
+            .unwrap();
+        assert!(!completed_out_res.is_error);
+        assert!(completed_out_res.content[0].text().contains("QUICK_DONE_UNIX"));
         let prompt = list_res.content[0].text();
         assert!(prompt.contains(&bg_task_id));
         assert!(prompt.contains(&auto_task_id));
@@ -4402,6 +4616,42 @@ exit /b 1
 
     #[tokio::test]
     #[cfg(windows)]
+    async fn test_run_terminal_cmd_default_foreground_output_file_retention_when_truncated() {
+        let (_lock, _guard) = isolate_env("fg_default_retention");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+        // Default / no-shell foreground execution with explicit budget
+        let res = engine.call_tool("run_terminal_cmd", json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output ('RET_HEAD_' + ('Z' * 5000) + '_RET_TAIL')\"",
+            "description": "default foreground retention test",
+            "max_inline_chars": 80
+        })).await.unwrap();
+
+        assert!(!res.is_error, "res was error: {:?}", res.content[0].text());
+        let text = res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("RET_HEAD_"));
+        assert!(text.contains("_RET_TAIL"));
+
+        let structured = res.structured.expect("structured output");
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["max_inline_chars"], 80);
+
+        let out_file = structured["output_file"].as_str().expect("output_file");
+        assert!(!out_file.is_empty(), "truncated foreground execution must expose output_file");
+        assert!(std::path::Path::new(out_file).is_file(), "output_file must exist on disk: {out_file}");
+        let log = fs::read_to_string(out_file).unwrap();
+        assert!(log.contains("RET_HEAD_"));
+        assert!(log.contains("_RET_TAIL"));
+        assert!(log.contains(&"Z".repeat(5000)));
+        let _ = fs::remove_file(out_file);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
     async fn test_get_task_output_with_custom_max_inline_chars() {
         let (_lock, _guard) = isolate_env("task_out_budget");
         let ws_dir = _guard.root.join("ws");
@@ -4502,15 +4752,513 @@ exit /b 1
         let tools = engine.list_tools().await.unwrap();
 
         let run_cmd = tools.iter().find(|t| t["name"] == "run_command").unwrap();
-        assert!(run_cmd["inputSchema"]["properties"]["max_inline_chars"].is_object());
-        assert!(run_cmd["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+        assert!(!run_cmd["inputSchema"]["properties"].as_object().unwrap().contains_key("max_inline_chars"));
+        assert!(!run_cmd["inputSchema"]["properties"].as_object().unwrap().contains_key("max_inline_bytes"));
 
         let term_cmd = tools.iter().find(|t| t["name"] == "run_terminal_cmd").unwrap();
         assert!(term_cmd["inputSchema"]["properties"]["max_inline_chars"].is_object());
-        assert!(term_cmd["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+        assert!(!term_cmd["inputSchema"]["properties"].as_object().unwrap().contains_key("max_inline_bytes"));
 
         let task_out = tools.iter().find(|t| t["name"] == "get_task_output").unwrap();
         assert!(task_out["inputSchema"]["properties"]["max_inline_chars"].is_object());
-        assert!(task_out["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+        assert!(!task_out["inputSchema"]["properties"].as_object().unwrap().contains_key("max_inline_bytes"));
+    }
+    #[tokio::test]
+    async fn test_invalid_max_inline_chars_fails_deterministically() {
+        let (_lock, _guard) = isolate_env("invalid_budget");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir);
+
+        let res1 = engine.call_tool("run_terminal_cmd", json!({
+            "command": "echo test",
+            "max_inline_chars": "not-a-number"
+        })).await.unwrap();
+        assert!(res1.is_error);
+        assert!(res1.content[0].text().contains("max_inline_chars must be a non-negative integer"));
+
+        let res2 = engine.call_tool("run_terminal_cmd", json!({
+            "command": "echo test",
+            "max_inline_chars": true
+        })).await.unwrap();
+        assert!(res2.is_error);
+        assert!(res2.content[0].text().contains("max_inline_chars must be a non-negative integer"));
+
+        let res3 = engine.call_tool("run_terminal_cmd", json!({
+            "command": "echo test",
+            "max_inline_chars": -5
+        })).await.unwrap();
+        assert!(res3.is_error);
+        assert!(res3.content[0].text().contains("max_inline_chars must be a non-negative integer"));
+
+        let res4 = engine.call_tool("get_task_output", json!({
+            "task_id": "nonexistent",
+            "max_inline_chars": "invalid"
+        })).await.unwrap();
+        assert!(res4.is_error);
+        assert!(res4.content[0].text().contains("max_inline_chars must be a non-negative integer"));
+    }
+
+    #[test]
+    fn test_multibyte_unicode_budget_correctness_red_capable() {
+        let vn_str = "🇻🇳 Xin chào Việt Nam! ".repeat(4);
+        let total_chars = vn_str.chars().count();
+        let total_bytes = vn_str.len();
+        assert!(total_chars <= 100);
+        assert!(total_bytes > 100);
+
+        let output = xai_grok_tools::types::output::ToolOutput::Bash(
+            xai_grok_tools::types::output::BashOutput {
+                output: vn_str.as_bytes().to_vec(),
+                output_for_prompt: vn_str.clone(),
+                exit_code: 0,
+                command: "echo test".to_string(),
+                truncated: false,
+                signal: None,
+                timed_out: false,
+                description: None,
+                current_dir: "/ws".to_string(),
+                output_file: "/ws/output.log".to_string(),
+                total_bytes,
+                output_delta: None,
+                was_bare_echo: false,
+            }
+        );
+
+        let mut prompt_text = vn_str.clone();
+        let structured = shape_structured_output_with_budget(&output, &mut prompt_text, Some(100));
+        assert_eq!(structured["truncated"], false, "must NOT be truncated when total_chars <= max_inline_chars");
+        assert_eq!(prompt_text, vn_str);
+
+        let long_vn_str = "🇻🇳 Xin chào Việt Nam! ".repeat(10);
+        let mut prompt_text_long = long_vn_str.clone();
+        let structured_long = shape_structured_output_with_budget(&output, &mut prompt_text_long, Some(50));
+        assert_eq!(structured_long["truncated"], true);
+        assert!(prompt_text_long.contains("... (output truncated) ..."));
+        assert!(prompt_text_long.contains("[truncated - full output at: /ws/output.log]"));
+    }
+
+    #[test]
+    fn test_multi_result_budget_truncation() {
+        let long_output_1 = "HEAD_ONE_".to_string() + &"A".repeat(5000) + "_TAIL_ONE";
+        let long_output_2 = "HEAD_TWO_".to_string() + &"B".repeat(5000) + "_TAIL_TWO";
+
+        let mr_json = json!({
+            "type": "TaskOutput",
+            "MultiResult": {
+                "mode": "wait_all",
+                "results": [
+                    {
+                        "task_id": "t1",
+                        "command": "cmd1",
+                        "status": "completed",
+                        "started": "2026-08-30T00:00:00Z",
+                        "duration_secs": 1.0,
+                        "output": long_output_1,
+                        "output_file": "/tmp/t1.log",
+                        "exit_code": 0,
+                        "raw_output_bytes": 5018,
+                        "truncated": false
+                    },
+                    {
+                        "task_id": "t2",
+                        "command": "cmd2",
+                        "status": "completed",
+                        "started": "2026-08-30T00:00:00Z",
+                        "duration_secs": 1.0,
+                        "output": long_output_2,
+                        "output_file": "/tmp/t2.log",
+                        "exit_code": 0,
+                        "raw_output_bytes": 5018,
+                        "truncated": false
+                    }
+                ],
+                "summary": "2 completed"
+            }
+        });
+
+        let output: xai_grok_tools::types::output::ToolOutput = serde_json::from_value(mr_json).unwrap();
+
+        let mut prompt_text = format!(
+            "=== Multi-wait (wait_all) ===
+--- Task t1 [completed] ---
+Command: cmd1
+Duration: 1.00s
+Exit Code: 0
+{long_output_1}
+--- Task t2 [completed] ---
+Command: cmd2
+Duration: 1.00s
+Exit Code: 0
+{long_output_2}
+
+2 completed"
+        );
+        let structured = shape_structured_output_with_budget(&output, &mut prompt_text, Some(100));
+
+        // Model-visible content text must NO LONGER contain full raw outputs
+        assert!(!prompt_text.contains(&long_output_1), "content text must not contain full output 1");
+        assert!(!prompt_text.contains(&long_output_2), "content text must not contain full output 2");
+        assert!(prompt_text.contains("... (output truncated) ..."));
+        assert!(prompt_text.contains("[truncated - use read_file on output_file for full content]"));
+
+        let results = structured["MultiResult"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        for res in results {
+            assert_eq!(res["truncated"], true);
+            assert_eq!(res["max_inline_chars"], 100);
+            assert_eq!(res["has_output"], true);
+            assert_eq!(res["total_bytes"], 5018);
+            assert_eq!(res["total_chars"], 5018);
+            let out = res["output"].as_str().unwrap();
+            assert!(out.contains("... (output truncated) ..."));
+            assert!(out.contains("[truncated - use read_file on output_file for full content]"));
+            assert!(!out.contains(&"A".repeat(5000)));
+            assert!(!out.contains(&"B".repeat(5000)));
+        }
+    }
+
+    #[test]
+    fn test_bash_multibyte_total_chars_and_exit_header_preserved() {
+        let raw_multibyte = "🇻🇳 Xin chào Việt Nam! 🦀🚀 ".repeat(200);
+        let raw_bytes = raw_multibyte.len();
+        let raw_chars = raw_multibyte.chars().count();
+        assert!(raw_bytes > raw_chars);
+
+        let bash_output = xai_grok_tools::types::output::BashOutput {
+            output: raw_multibyte.as_bytes().to_vec(),
+            output_for_prompt: format!("exit: 0\n{raw_multibyte}"),
+            exit_code: 0,
+            command: "echo test".to_string(),
+            truncated: false,
+            signal: None,
+            timed_out: false,
+            description: None,
+            current_dir: "/ws".to_string(),
+            output_file: "/ws/bash_test.log".to_string(),
+            total_bytes: raw_bytes,
+            output_delta: None,
+            was_bare_echo: false,
+        };
+        let tool_output = xai_grok_tools::types::output::ToolOutput::Bash(bash_output);
+
+        let mut prompt_text = format!("exit: 0\n{raw_multibyte}");
+        let structured = shape_structured_output_with_budget(&tool_output, &mut prompt_text, Some(50));
+
+        // 1. total_chars counts raw command output characters (NOT including 'exit: 0\n')
+        assert_eq!(structured["total_chars"], raw_chars, "total_chars must count raw output characters");
+        assert_eq!(structured["total_bytes"], raw_bytes, "total_bytes must count raw output bytes");
+        assert_eq!(structured["max_inline_chars"], 50);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["output_file"], "/ws/bash_test.log");
+
+        // 2. Foreground exit header is preserved in prompt_text / output_for_prompt
+        assert!(prompt_text.starts_with("exit: 0\n"), "exit header must be preserved in prompt_text");
+        assert!(prompt_text.contains("... (output truncated) ..."));
+        assert!(prompt_text.contains("[truncated - full output at: /ws/bash_test.log]"));
+        assert_eq!(structured["output_for_prompt"].as_str().unwrap(), prompt_text.as_str());
+
+        // 3. Structured output is bounded command-output bytes and does NOT contain the exit header
+        let struct_output_bytes = structured["output"].as_array().unwrap();
+        let struct_output_vec: Vec<u8> = struct_output_bytes.iter().map(|v| v.as_u64().unwrap() as u8).collect();
+        let struct_output_str = String::from_utf8(struct_output_vec).unwrap();
+        assert!(!struct_output_str.starts_with("exit: 0"), "structured output must not be polluted with exit header");
+        assert!(struct_output_str.contains("... (output truncated) ..."));
+        assert!(struct_output_str.contains("[truncated - full output at: /ws/bash_test.log]"));
+    }
+
+    #[test]
+    fn test_omitted_budget_preserves_pre_33_fixed_point_behavior() {
+        // 1. render_proc_output_as_terminal_result without budget
+        let big_stdout = "A".repeat(50_000);
+        let proc_output = crate::run_proc::ProcOutput {
+            stdout: big_stdout.clone(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+            capture_truncated: false,
+            error: None,
+            termination_reason: None,
+        };
+        let res = render_proc_output_as_terminal_result(proc_output, "echo test", "C:/ws", None, None);
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("[truncated - full output at:"));
+        // Must be truncated near 20k prefix (not head+tail near 40k)
+        assert!(text.len() < 30_000);
+        let structured = res.structured.unwrap();
+        assert_eq!(structured["truncated"], true);
+        assert!(structured.get("max_inline_chars").is_none());
+        assert!(structured.get("total_chars").is_none());
+        let out_file = structured["output_file"].as_str().unwrap();
+        if !out_file.is_empty() {
+            let _ = std::fs::remove_file(out_file);
+        }
+
+        // 2. shape_structured_output_with_budget with None on BashOutput
+        let bash_out = xai_grok_tools::types::output::ToolOutput::Bash(
+            xai_grok_tools::types::output::BashOutput {
+                output: big_stdout.as_bytes().to_vec(),
+                output_for_prompt: big_stdout.clone(),
+                exit_code: 0,
+                command: "echo test".to_string(),
+                truncated: false,
+                signal: None,
+                timed_out: false,
+                description: None,
+                current_dir: "/ws".to_string(),
+                output_file: "/ws/out.log".to_string(),
+                total_bytes: 50_000,
+                output_delta: None,
+                was_bare_echo: false,
+            }
+        );
+        let mut prompt_text = big_stdout.clone();
+        let shaped_bash = shape_structured_output_with_budget(&bash_out, &mut prompt_text, None);
+        assert_eq!(prompt_text, big_stdout, "omitted budget must NOT modify prompt_text for BashOutput");
+        assert_eq!(shaped_bash["has_output"], true);
+        assert!(shaped_bash.get("max_inline_chars").is_none());
+        assert!(shaped_bash.get("total_chars").is_none());
+
+        // 3. shape_structured_output_with_budget with None on TaskOutput Result
+        let task_json = json!({
+            "type": "TaskOutput",
+            "Result": {
+                "task_id": "t_no_budget",
+                "command": "cmd",
+                "status": "completed",
+                "started": "2026-08-30T00:00:00Z",
+                "duration_secs": 1.0,
+                "output": big_stdout,
+                "output_file": "/tmp/out.log",
+                "exit_code": 0,
+                "raw_output_bytes": 50_000,
+                "truncated": false
+            }
+        });
+        let task_out: xai_grok_tools::types::output::ToolOutput = serde_json::from_value(task_json).unwrap();
+        let mut task_prompt = "Task output prompt".to_string();
+        let shaped_task = shape_structured_output_with_budget(&task_out, &mut task_prompt, None);
+        assert_eq!(task_prompt, "Task output prompt", "omitted budget must NOT truncate TaskOutput prompt");
+        let res_obj = &shaped_task["Result"];
+        assert_eq!(res_obj["has_output"], true);
+        assert_eq!(res_obj["total_bytes"], 50_000);
+        assert!(res_obj.get("max_inline_chars").is_none());
+        assert!(res_obj.get("total_chars").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_terminal_tasks_unknown_cwd_is_not_fabricated() {
+        let (_lock, _guard) = isolate_env("unknown_cwd");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Start a background task without explicit cwd
+        let bg_res = engine.call_tool("run_terminal_cmd", json!({
+            "command": if cfg!(windows) { "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"" } else { "sleep 30" },
+            "description": "test bg task",
+            "is_background": true
+        })).await.unwrap();
+        assert!(!bg_res.is_error);
+        let task_id = bg_res.structured.unwrap()["task_id"].as_str().unwrap().to_string();
+
+        // Clear the recorded meta cwd to simulate unknown cwd
+        {
+            let mut meta_map = engine.task_metadata.lock().await;
+            if let Some(meta) = meta_map.get_mut(&task_id) {
+                meta.cwd = None;
+            }
+        }
+
+        let list_res = engine.call_tool("list_terminal_tasks", json!({})).await.unwrap();
+        assert!(!list_res.is_error);
+        let list_struct = list_res.structured.unwrap();
+        let tasks = list_struct["tasks"].as_array().unwrap();
+        let found = tasks.iter().find(|t| t["task_id"] == task_id).expect("task found");
+        // When snapshot has no cwd and meta has no cwd, it must be null (not fabricated workspace)
+        if found["cwd"].is_string() {
+            // If bridge snapshot provided cwd, that's allowed as truthful snapshot cwd
+            assert!(!found["cwd"].as_str().unwrap().is_empty());
+        } else {
+            assert!(found["cwd"].is_null(), "must be null when unknown");
+        }
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_terminal_tasks_completed_count_is_truthful() {
+        let (_lock, _guard) = isolate_env("completed_truth");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir);
+
+        // Quick completed task
+        let done_res = engine.call_tool("run_terminal_cmd", json!({
+            "command": if cfg!(windows) { "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'ok'\"" } else { "echo ok" },
+            "description": "test done task",
+            "execution_mode": "auto",
+            "yield_after_ms": 10000
+        })).await.unwrap();
+        assert!(!done_res.is_error);
+
+        let list_res = engine.call_tool("list_terminal_tasks", json!({})).await.unwrap();
+        assert!(!list_res.is_error);
+        let list_struct = list_res.structured.unwrap();
+        let total_count = list_struct["total_count"].as_u64().unwrap();
+        let completed_count = list_struct["completed_count"].as_u64().unwrap();
+        let running_count = list_struct["running_count"].as_u64().unwrap();
+        let tasks = list_struct["tasks"].as_array().unwrap();
+
+        let actual_completed = tasks.iter().filter(|t| t["status"] == "completed").count() as u64;
+        let actual_running = tasks.iter().filter(|t| t["status"] == "running").count() as u64;
+
+        assert_eq!(completed_count, actual_completed, "completed_count must strictly equal tasks with status == 'completed'");
+        assert_eq!(running_count, actual_running);
+        assert!(total_count >= completed_count + running_count);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_result_explicit_budget_bounds_structured_content_and_text_red_capable() {
+        let (_lock, _guard) = isolate_env("struct_budget_red");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        // 1. BashOutput with large multibyte content
+        let full_multibyte = "🇻🇳 Xin chào Việt Nam! 🦀🚀 ".repeat(3000);
+        let full_bytes = full_multibyte.len();
+        let full_chars = full_multibyte.chars().count();
+        assert!(full_bytes > 90_000);
+        assert!(full_chars > 50_000);
+
+        let out_file_path = ws_dir.join("bash_full_output.log");
+        fs::write(&out_file_path, &full_multibyte).unwrap();
+        let out_file_str = out_file_path.to_string_lossy().to_string();
+
+        let bash_out = xai_grok_tools::types::output::ToolOutput::Bash(
+            xai_grok_tools::types::output::BashOutput {
+                output: full_multibyte.as_bytes().to_vec(),
+                output_for_prompt: full_multibyte.clone(),
+                exit_code: 0,
+                command: "echo test".to_string(),
+                truncated: false,
+                signal: None,
+                timed_out: false,
+                description: Some("test bash budget".to_string()),
+                current_dir: ws_dir.to_string_lossy().to_string(),
+                output_file: out_file_str.clone(),
+                total_bytes: full_bytes,
+                output_delta: None,
+                was_bare_echo: false,
+            }
+        );
+
+        let mut prompt_text = full_multibyte.clone();
+        let structured = shape_structured_output_with_budget(&bash_out, &mut prompt_text, Some(60));
+
+        let result = ToolCallResult {
+            content: vec![ToolContent::Text { text: prompt_text }],
+            structured: Some(structured),
+            is_error: false,
+        };
+
+        let val = result.to_value();
+        assert_eq!(val["isError"], false);
+
+        // Verify content text is bounded
+        let text = val["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains(&format!("[truncated - full output at: {out_file_str}]")));
+        assert!(text.len() < 1000);
+
+        // Verify structuredContent is bounded and metadata is preserved
+        let struct_content = &val["structuredContent"];
+        assert_eq!(struct_content["type"], "Bash");
+        assert_eq!(struct_content["truncated"], true);
+        assert_eq!(struct_content["has_output"], true);
+        assert_eq!(struct_content["max_inline_chars"], 60);
+        assert_eq!(struct_content["total_bytes"], full_bytes);
+        assert_eq!(struct_content["total_chars"], full_chars);
+        assert_eq!(struct_content["output_file"], out_file_str);
+        assert_eq!(struct_content["command"], "echo test");
+        assert_eq!(struct_content["exit_code"], 0);
+
+        // Model-visible structured fields must NOT carry full raw output
+        let struct_prompt = struct_content["output_for_prompt"].as_str().unwrap();
+        assert!(struct_prompt.contains("... (output truncated) ..."));
+        assert!(struct_prompt.len() < 1000, "structured output_for_prompt must be bounded");
+
+        let struct_bytes = struct_content["output"].as_array().unwrap();
+        assert!(struct_bytes.len() < 1000, "structured output byte array must be bounded");
+
+        // Total serialized size of ToolCallResult must be strictly bounded (< 2500 bytes)
+        let serialized_json = serde_json::to_string(&val).unwrap();
+        assert!(
+            serialized_json.len() < 2500,
+            "serialized ToolCallResult must be bounded, got len {}",
+            serialized_json.len()
+        );
+
+        // Full underlying output on disk must be completely retained and undamaged
+        let file_on_disk = fs::read_to_string(&out_file_path).unwrap();
+        assert_eq!(file_on_disk.len(), full_bytes);
+        assert_eq!(file_on_disk, full_multibyte);
+
+        // 2. TaskOutput Result with large multibyte content
+        let task_file_path = ws_dir.join("task_full_output.log");
+        fs::write(&task_file_path, &full_multibyte).unwrap();
+        let task_file_str = task_file_path.to_string_lossy().to_string();
+
+        let task_json = json!({
+            "type": "TaskOutput",
+            "Result": {
+                "task_id": "task_red_1",
+                "command": "powershell.exe -Command Write-Output",
+                "status": "completed",
+                "started": "2026-08-31T00:00:00Z",
+                "duration_secs": 0.5,
+                "output": full_multibyte.clone(),
+                "output_file": task_file_str.clone(),
+                "exit_code": 0,
+                "raw_output_bytes": full_bytes,
+                "truncated": false
+            }
+        });
+
+        let task_out: xai_grok_tools::types::output::ToolOutput = serde_json::from_value(task_json).unwrap();
+        let mut task_prompt_text = format!("Output:\n{full_multibyte}");
+        let shaped_task = shape_structured_output_with_budget(&task_out, &mut task_prompt_text, Some(60));
+
+        let task_result = ToolCallResult {
+            content: vec![ToolContent::Text { text: task_prompt_text }],
+            structured: Some(shaped_task),
+            is_error: false,
+        };
+
+        let task_val = task_result.to_value();
+        assert_eq!(task_val["isError"], false);
+        let res_obj = &task_val["structuredContent"]["Result"];
+        assert_eq!(res_obj["truncated"], true);
+        assert_eq!(res_obj["max_inline_chars"], 60);
+        assert_eq!(res_obj["total_bytes"], full_bytes);
+        assert_eq!(res_obj["total_chars"], full_chars);
+        assert_eq!(res_obj["has_output"], true);
+        let task_struct_out = res_obj["output"].as_str().unwrap();
+        assert!(task_struct_out.contains("... (output truncated) ..."));
+        assert!(task_struct_out.len() < 1000);
+
+        let task_serialized = serde_json::to_string(&task_val).unwrap();
+        assert!(task_serialized.len() < 2500, "serialized TaskOutput ToolCallResult must be bounded");
+
+        let task_file_on_disk = fs::read_to_string(&task_file_path).unwrap();
+        assert_eq!(task_file_on_disk.len(), full_bytes);
+        assert_eq!(task_file_on_disk, full_multibyte);
     }
 }
