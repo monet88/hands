@@ -179,43 +179,53 @@ pub fn tunnel_pid_file() -> PathBuf {
 }
 
 pub fn query_process_creation(pid: u32) -> Option<String> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut std::ffi::c_void;
-        fn GetProcessTimes(
-            hProcess: *mut std::ffi::c_void,
-            lpCreationTime: *mut u64,
-            lpExitTime: *mut u64,
-            lpKernelTime: *mut u64,
-            lpUserTime: *mut u64,
-        ) -> i32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        return None;
     }
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    // FILETIME epoch is 1601-01-01; .NET DateTime.Ticks epoch is 0001-01-01.
-    // The PowerShell comparator in `stop_unmanaged` uses
-    // `$p.CreationDate.ToUniversalTime().Ticks` (.NET ticks), so this writer
-    // must produce the same value.
-    const FILETIME_TO_DOTNET_TICKS: u64 = 504_911_232_000_000_000;
 
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(
+                dwDesiredAccess: u32,
+                bInheritHandle: i32,
+                dwProcessId: u32,
+            ) -> *mut std::ffi::c_void;
+            fn GetProcessTimes(
+                hProcess: *mut std::ffi::c_void,
+                lpCreationTime: *mut u64,
+                lpExitTime: *mut u64,
+                lpKernelTime: *mut u64,
+                lpUserTime: *mut u64,
+            ) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        // FILETIME epoch is 1601-01-01; .NET DateTime.Ticks epoch is 0001-01-01.
+        // The PowerShell comparator in `stop_unmanaged` uses
+        // `$p.CreationDate.ToUniversalTime().Ticks` (.NET ticks), so this writer
+        // must produce the same value.
+        const FILETIME_TO_DOTNET_TICKS: u64 = 504_911_232_000_000_000;
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = 0u64;
+        let mut exit = 0u64;
+        let mut kernel = 0u64;
+        let mut user = 0u64;
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        Some((creation + FILETIME_TO_DOTNET_TICKS).to_string())
     }
-    let mut creation = 0u64;
-    let mut exit = 0u64;
-    let mut kernel = 0u64;
-    let mut user = 0u64;
-    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    unsafe { CloseHandle(handle) };
-    if ok == 0 {
-        return None;
-    }
-    Some((creation + FILETIME_TO_DOTNET_TICKS).to_string())
 }
 
 pub fn write_tunnel_pid(pid: u32) -> Result<(), String> {
