@@ -665,7 +665,7 @@ mod tests {
                 let path_end = prompt[path_start..].find(']').expect("matching bracket for log path");
                 let log_path = prompt[path_start..path_start + path_end].trim();
                 std::fs::read_to_string(log_path).unwrap_or_else(|e| panic!("failed to read log {log_path}: {e}"))
-            } else if let Some(start) = prompt.find("[truncated: showing first/last") {
+            } else if prompt.contains("[truncated: showing first/last") {
                 let path_start = prompt.find("full output at:").expect("full output at marker") + "full output at:".len();
                 let path_end = prompt[path_start..].find(']').expect("matching bracket for log path");
                 let log_path = prompt[path_start..path_start + path_end].trim();

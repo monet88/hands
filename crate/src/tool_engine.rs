@@ -2585,4 +2585,512 @@ exit /b 1
         assert_eq!(structured["timed_out"], false);
     }
 
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_single_process_no_double_spawn_and_pid_identity() {
+        let (_lock, _guard) = isolate_env("auto_single_proc");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let marker_file = ws_dir.join("marker.log");
+        let marker_path = marker_file.to_string_lossy().to_string();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. Long running command that appends lines to a file with delay
+        let cmd = format!(
+            "echo PROC_START>> \"{marker_path}\" && ping -n 4 127.0.0.1 > nul && echo PROC_END>> \"{marker_path}\""
+        );
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": cmd,
+                    "description": "single process identity test",
+                    "shell": "cmd",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["execution_mode"], "auto");
+        let task_id = structured["task_id"].as_str().expect("task_id must exist").to_string();
+        let initial_pid = structured.get("pid").and_then(Value::as_u64);
+
+        // At yield time, PROC_START was written once; PROC_END is not yet written
+        let mid_content = fs::read_to_string(&marker_file).unwrap_or_default();
+        assert!(mid_content.contains("PROC_START"));
+        assert_eq!(mid_content.matches("PROC_START").count(), 1);
+        assert!(!mid_content.contains("PROC_END"));
+
+        // Wait for completion via get_task_output
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": &task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        assert_eq!(result_obj["exit_code"], 0);
+
+        // Verify file content: PROC_START must appear EXACTLY ONCE (proving no double spawn / restart)
+        let final_content = fs::read_to_string(&marker_file).expect("read final marker");
+        assert_eq!(
+            final_content.matches("PROC_START").count(),
+            1,
+            "PROC_START must not be re-executed by a duplicate spawn"
+        );
+        assert_eq!(
+            final_content.matches("PROC_END").count(),
+            1,
+            "PROC_END must execute exactly once"
+        );
+
+        if let Some(pid) = initial_pid {
+            assert!(pid > 0, "PID must be a valid positive integer");
+        }
+
+        // 2. Short command completing before yield budget also executes exactly once and preserves PID field
+        let short_marker = ws_dir.join("short_marker.log");
+        let short_path = short_marker.to_string_lossy().to_string();
+        let short_cmd = format!("echo SHORT_ONCE>> \"{short_path}\"");
+        let short_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": short_cmd,
+                    "description": "short single execution test",
+                    "shell": "cmd",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!short_res.is_error);
+        let short_struct = short_res.structured.unwrap();
+        assert_eq!(short_struct["status"], "completed");
+        assert_eq!(short_struct["yielded"], false);
+        assert!(short_struct.get("pid").is_some(), "PID field must be present in structured output");
+        let short_content = fs::read_to_string(&short_marker).expect("read short marker");
+        assert_eq!(short_content.matches("SHORT_ONCE").count(), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_short_completes_foreground_shape_unix() {
+        let (_lock, _guard) = isolate_env("auto_short_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo 'AUTO_SHORT_PAYLOAD_UNIX'",
+                    "description": "auto mode short command unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("AUTO_SHORT_PAYLOAD_UNIX"));
+
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["exit_code"], 0);
+        assert_eq!(structured["status"], "completed");
+        assert_eq!(structured["yielded"], false);
+        assert_eq!(structured["timed_out"], false);
+        assert_eq!(structured["execution_mode"], "auto");
+        assert_eq!(structured["has_output"], true);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_long_yields_to_background_and_resumes_unix() {
+        let (_lock, _guard) = isolate_env("auto_yield_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sleep 2; echo 'AUTO_YIELD_COMPLETED_UNIX'",
+                    "description": "auto mode long command unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("[Command yielded to background after 300ms"));
+        assert!(text.contains("get_task_output"));
+
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["backgrounded"], true);
+        assert_eq!(structured["execution_mode"], "auto");
+        let task_id = structured["task_id"].as_str().expect("task_id must be present").to_string();
+        assert!(!task_id.is_empty());
+
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("get_task_output must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        assert_eq!(result_obj["exit_code"], 0);
+        assert!(result_obj["output"].as_str().unwrap().contains("AUTO_YIELD_COMPLETED_UNIX"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_yield_after_ms_without_mode_opts_in_unix() {
+        let (_lock, _guard) = isolate_env("auto_opt_in_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sleep 2; echo 'IMPLICIT_AUTO_OK_UNIX'",
+                    "description": "yield_after_ms opt in test unix",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["backgrounded"], true);
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_partial_output_continuity_unix() {
+        let (_lock, _guard) = isolate_env("auto_continuity_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo 'PARTIAL_HEAD_SENTINEL_UNIX'; sleep 2; echo 'PARTIAL_TAIL_SENTINEL_UNIX'",
+                    "description": "partial output continuity test unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        let output = result_obj["output"].as_str().unwrap();
+        assert!(output.contains("PARTIAL_HEAD_SENTINEL_UNIX"), "output must retain head produced before yield");
+        assert!(output.contains("PARTIAL_TAIL_SENTINEL_UNIX"), "output must contain tail produced after yield");
+        assert_eq!(output.matches("PARTIAL_HEAD_SENTINEL_UNIX").count(), 1, "head must not be duplicated");
+        assert_eq!(output.matches("PARTIAL_TAIL_SENTINEL_UNIX").count(), 1, "tail must not be duplicated");
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_yield_and_kill_lifecycle_unix() {
+        let (_lock, _guard) = isolate_env("auto_kill_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sleep 60",
+                    "description": "auto mode kill test unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        let kill_res = engine
+            .call_tool(
+                "kill_task",
+                json!({ "task_id": &task_id }),
+            )
+            .await
+            .unwrap();
+        assert!(!kill_res.is_error);
+
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &task_id }),
+            )
+            .await
+            .unwrap();
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let status = poll_struct["Result"]["status"].as_str().unwrap();
+        assert!(status == "cancelled" || status == "killed" || status == "completed" || status == "failed");
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_nonzero_exit_is_not_mcp_error_unix() {
+        let (_lock, _guard) = isolate_env("auto_nonzero_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sh -c 'exit 42'",
+                    "description": "auto nonzero exit unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error, "exit_code != 0 must NOT become MCP isError in auto mode");
+        let structured = res.structured.expect("must return structured output");
+        assert_ne!(structured["exit_code"], 0);
+        assert_eq!(structured["status"], "failed");
+        assert_eq!(structured["yielded"], false);
+        assert_eq!(structured["timed_out"], false);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_with_shell_selectors_unix() {
+        let (_lock, _guard) = isolate_env("auto_shell_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. git-bash selector short auto on Unix
+        let git_bash_short = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo GIT_BASH_AUTO_SHORT_OK",
+                    "description": "git-bash auto short unix",
+                    "shell": "git-bash",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 5000
+                }),
+            )
+            .await
+            .unwrap();
+
+        if host::find_git_bash().is_ok() {
+            assert!(!git_bash_short.is_error);
+            assert!(git_bash_short.content[0].text().contains("GIT_BASH_AUTO_SHORT_OK"));
+            let gb_struct = git_bash_short.structured.unwrap();
+            assert_eq!(gb_struct["status"], "completed");
+            assert_eq!(gb_struct["yielded"], false);
+        } else {
+            assert!(git_bash_short.is_error);
+        }
+
+        // 2. cmd selector fails deterministically on non-Windows
+        let cmd_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo test",
+                    "shell": "cmd",
+                    "execution_mode": "auto"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(cmd_res.is_error);
+        assert!(cmd_res.content[0].text().contains("cmd shell is only supported on Windows"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_run_terminal_cmd_auto_mode_single_process_no_double_spawn_and_pid_identity_unix() {
+        let (_lock, _guard) = isolate_env("auto_single_proc_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let marker_file = ws_dir.join("marker_unix.log");
+        let marker_path = marker_file.to_string_lossy().to_string();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. Long running command that appends lines to a file with delay
+        let cmd = format!(
+            "echo 'UNIX_PROC_START' >> '{marker_path}'; sleep 2; echo 'UNIX_PROC_END' >> '{marker_path}'"
+        );
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": cmd,
+                    "description": "unix single process identity test",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["execution_mode"], "auto");
+        let task_id = structured["task_id"].as_str().expect("task_id must exist").to_string();
+        let initial_pid = structured.get("pid").and_then(Value::as_u64);
+
+        // At yield time, UNIX_PROC_START was written once; UNIX_PROC_END is not yet written
+        let mid_content = fs::read_to_string(&marker_file).unwrap_or_default();
+        assert!(mid_content.contains("UNIX_PROC_START"));
+        assert_eq!(mid_content.matches("UNIX_PROC_START").count(), 1);
+        assert!(!mid_content.contains("UNIX_PROC_END"));
+
+        // Wait for completion via get_task_output
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": &task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        assert_eq!(result_obj["exit_code"], 0);
+
+        // Verify file content: UNIX_PROC_START must appear EXACTLY ONCE (proving no double spawn / restart)
+        let final_content = fs::read_to_string(&marker_file).expect("read final marker");
+        assert_eq!(
+            final_content.matches("UNIX_PROC_START").count(),
+            1,
+            "UNIX_PROC_START must not be re-executed by a duplicate spawn"
+        );
+        assert_eq!(
+            final_content.matches("UNIX_PROC_END").count(),
+            1,
+            "UNIX_PROC_END must execute exactly once"
+        );
+
+        if let Some(pid) = initial_pid {
+            assert!(pid > 0, "PID must be a valid positive integer");
+        }
+
+        // 2. Short command completing before yield budget also executes exactly once and preserves PID field
+        let short_marker = ws_dir.join("short_marker_unix.log");
+        let short_path = short_marker.to_string_lossy().to_string();
+        let short_cmd = format!("echo 'SHORT_UNIX_ONCE' >> '{short_path}'");
+        let short_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": short_cmd,
+                    "description": "unix short single execution test",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!short_res.is_error);
+        let short_struct = short_res.structured.unwrap();
+        assert_eq!(short_struct["status"], "completed");
+        assert_eq!(short_struct["yielded"], false);
+        assert!(short_struct.get("pid").is_some(), "PID field must be present in structured output");
+        let short_content = fs::read_to_string(&short_marker).expect("read short marker");
+        assert_eq!(short_content.matches("SHORT_UNIX_ONCE").count(), 1);
+    }
+
 }
