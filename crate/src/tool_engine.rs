@@ -813,12 +813,11 @@ impl ToolEngine {
                 .as_deref()
                 .or_else(|| meta.and_then(|m| m.owner_session_id.as_deref()));
 
-            // Owner isolation: if caller specified an owner, ignore tasks belonging to a different owner
+            // Optional owner filter: if caller specified an owner, only include tasks matching that owner
             if let Some(req_owner) = filter_owner {
-                if let Some(owner) = task_owner {
-                    if owner != req_owner {
-                        continue;
-                    }
+                match task_owner {
+                    Some(owner) if owner == req_owner => {}
+                    _ => continue,
                 }
             }
 
@@ -841,8 +840,13 @@ impl ToolEngine {
             }
 
             let pid = meta.and_then(|m| m.pid);
-            let command = snap.display_command.clone().unwrap_or_else(|| snap.command.clone());
-            let description = snap.description.clone().or_else(|| meta.as_ref().and_then(|m| m.description.clone()));
+            let raw_command = snap.display_command.clone().unwrap_or_else(|| snap.command.clone());
+            let command = sanitize_safe_metadata(&raw_command);
+            let description = snap
+                .description
+                .clone()
+                .or_else(|| meta.as_ref().and_then(|m| m.description.clone()))
+                .map(|d| sanitize_safe_metadata(&d));
             let cwd = if snap.cwd.is_empty() {
                 meta.as_ref().and_then(|m| m.cwd.clone()).unwrap_or_else(|| self.workspace().to_string_lossy().to_string())
             } else {
@@ -884,10 +888,11 @@ impl ToolEngine {
             });
 
             if include_output {
+                let raw_preview = crate::run_proc::truncate_utf8(&snap.output, 1000);
                 let preview = if snap.output.len() > 1000 {
-                    format!("{}... (truncated)", &snap.output[..1000])
+                    format!("{}... (truncated)", sanitize_safe_metadata(&raw_preview))
                 } else {
-                    snap.output.clone()
+                    sanitize_safe_metadata(&raw_preview)
                 };
                 item["output_preview"] = json!(preview);
             }
@@ -951,6 +956,179 @@ impl ToolEngine {
 
         Ok(ToolCallResult::structured(prompt_text, structured, false))
     }
+}
+
+fn redact_sk_tokens(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(pos) = remaining.find("sk-") {
+        result.push_str(&remaining[..pos]);
+        let rest = &remaining[pos..];
+        let mut token_len = 3;
+        for b in rest[3..].bytes() {
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+                token_len += 1;
+            } else {
+                break;
+            }
+        }
+        if token_len >= 16 {
+            result.push_str("[REDACTED]");
+        } else {
+            result.push_str(&rest[..token_len]);
+        }
+        remaining = &rest[token_len..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+fn redact_bearer_tokens(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut result = String::with_capacity(s.len());
+    let mut last_idx = 0;
+    let mut search_from = 0;
+    while let Some(rel_pos) = lower[search_from..].find("bearer") {
+        let pos = search_from + rel_pos;
+        let after = &s[pos + 6..];
+        let mut prefix_len = 6;
+        let mut chars_iter = after.chars();
+        if let Some(c) = chars_iter.next() {
+            if c == ' ' || c == '=' || c == ':' {
+                prefix_len += c.len_utf8();
+                while let Some(next_c) = chars_iter.next() {
+                    if next_c == ' ' {
+                        prefix_len += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let token_start = pos + prefix_len;
+                if token_start < s.len() {
+                    let rest = &s[token_start..];
+                    let token_len = rest
+                        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ';' || c == '&' || c == '|')
+                        .unwrap_or(rest.len());
+                    if token_len >= 4 {
+                        result.push_str(&s[last_idx..pos + 6]);
+                        result.push(' ');
+                        result.push_str("[REDACTED]");
+                        last_idx = token_start + token_len;
+                        search_from = last_idx;
+                        continue;
+                    }
+                }
+            }
+        }
+        search_from = pos + 6;
+    }
+    result.push_str(&s[last_idx..]);
+    result
+}
+
+fn redact_secret_key_values(s: &str) -> String {
+    let keywords = [
+        "control_plane_api_key",
+        "control-plane-api-key",
+        "access_token",
+        "access-token",
+        "auth_token",
+        "auth-token",
+        "secret_key",
+        "secret-key",
+        "api_key",
+        "api-key",
+        "apikey",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    ];
+    let mut result = s.to_string();
+    for kw in keywords {
+        let mut current_lower = result.to_ascii_lowercase();
+        let mut search_from = 0;
+        while let Some(rel_pos) = current_lower[search_from..].find(kw) {
+            let pos = search_from + rel_pos;
+            let is_boundary = pos == 0 || {
+                let prev = current_lower[..pos].chars().last().unwrap();
+                prev.is_whitespace() || prev == '-' || prev == '/' || prev == '_' || prev == '$' || prev == '"' || prev == '\''
+            };
+            if !is_boundary {
+                search_from = pos + kw.len();
+                continue;
+            }
+
+            let rest = &result[pos + kw.len()..];
+            let mut sep_len = 0;
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                if c == '=' || c == ':' || c == ' ' {
+                    sep_len += c.len_utf8();
+                    while let Some(nc) = chars.next() {
+                        if nc == ' ' {
+                            sep_len += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if sep_len > 0 && pos + kw.len() + sep_len < result.len() {
+                let val_start = pos + kw.len() + sep_len;
+                let val_rest = &result[val_start..];
+                let val_len = if val_rest.starts_with('"') {
+                    val_rest[1..].find('"').map(|i| i + 2).unwrap_or(val_rest.len())
+                } else if val_rest.starts_with('\'') {
+                    val_rest[1..].find('\'').map(|i| i + 2).unwrap_or(val_rest.len())
+                } else {
+                    val_rest
+                        .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+                        .unwrap_or(val_rest.len())
+                };
+
+                if val_len >= 3 {
+                    let mut new_result = String::with_capacity(result.len());
+                    new_result.push_str(&result[..pos + kw.len() + sep_len]);
+                    new_result.push_str("[REDACTED]");
+                    new_result.push_str(&result[val_start + val_len..]);
+                    result = new_result;
+                    current_lower = result.to_ascii_lowercase();
+                    search_from = pos + kw.len() + sep_len + "[REDACTED]".len();
+                    continue;
+                }
+            }
+            search_from = pos + kw.len();
+        }
+    }
+    result
+}
+
+pub fn sanitize_safe_metadata(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = text.to_string();
+
+    if let Some(key) = crate::secrets::get() {
+        let key_trimmed = key.trim();
+        if key_trimmed.len() >= 8 {
+            out = out.replace(key_trimmed, "[REDACTED]");
+        }
+    }
+    if let Ok(key) = std::env::var("CONTROL_PLANE_API_KEY") {
+        let key_trimmed = key.trim();
+        if key_trimmed.len() >= 8 {
+            out = out.replace(key_trimmed, "[REDACTED]");
+        }
+    }
+
+    out = redact_sk_tokens(&out);
+    out = redact_bearer_tokens(&out);
+    out = redact_secret_key_values(&out);
+
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3547,81 +3725,269 @@ exit /b 1
     #[tokio::test]
     async fn test_list_terminal_tasks_owner_isolation_and_no_cross_leak() {
         let (_lock, _guard) = isolate_env("list_owner_iso");
-        let ws_dir = _guard.root.join("ws");
-        fs::create_dir_all(&ws_dir).expect("create ws dir");
+        let ws_dir_alpha = _guard.root.join("ws_alpha");
+        let ws_dir_beta = _guard.root.join("ws_beta");
+        fs::create_dir_all(&ws_dir_alpha).expect("create ws_dir_alpha");
+        fs::create_dir_all(&ws_dir_beta).expect("create ws_dir_beta");
 
-        let engine = ToolEngine::new(ws_dir.clone());
+        let engine_alpha = ToolEngine::new(ws_dir_alpha.clone());
+        let engine_beta = ToolEngine::new(ws_dir_beta.clone());
 
-        // Simulate registering metadata for session_alpha and session_beta
-        engine
-            .record_task_meta(
-                "task_alpha_1",
-                TaskExecMeta {
-                    execution_mode: "auto".to_string(),
-                    yielded: true,
-                    pid: Some(1111),
-                    owner_session_id: Some("session_alpha".to_string()),
-                    description: Some("Alpha Task".to_string()),
-                    cwd: Some(ws_dir.to_string_lossy().to_string()),
-                },
+        let cmd_alpha = if cfg!(windows) {
+            "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\""
+        } else {
+            "sleep 30"
+        };
+        let cmd_beta = if cfg!(windows) {
+            "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\""
+        } else {
+            "sleep 30"
+        };
+
+        // 1. Start real background task in engine_alpha
+        let bg_alpha_res = engine_alpha
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": cmd_alpha,
+                    "description": "Alpha Real Task",
+                    "is_background": true,
+                }),
             )
-            .await;
+            .await
+            .expect("alpha background task call should succeed");
+        assert!(!bg_alpha_res.is_error);
+        let alpha_bg_struct = bg_alpha_res.structured.expect("alpha structured output");
+        let alpha_task_id = alpha_bg_struct["task_id"].as_str().expect("alpha task_id").to_string();
 
-        engine
-            .record_task_meta(
-                "task_beta_1",
-                TaskExecMeta {
-                    execution_mode: "background".to_string(),
-                    yielded: false,
-                    pid: Some(2222),
-                    owner_session_id: Some("session_beta".to_string()),
-                    description: Some("Beta Task".to_string()),
-                    cwd: Some(ws_dir.to_string_lossy().to_string()),
-                },
+        // 2. Start real background task in engine_beta
+        let bg_beta_res = engine_beta
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": cmd_beta,
+                    "description": "Beta Real Task",
+                    "is_background": true,
+                }),
             )
-            .await;
+            .await
+            .expect("beta background task call should succeed");
+        assert!(!bg_beta_res.is_error);
+        let beta_bg_struct = bg_beta_res.structured.expect("beta structured output");
+        let beta_task_id = beta_bg_struct["task_id"].as_str().expect("beta task_id").to_string();
 
-        // Query scoped to session_alpha
-        let res_alpha = engine
+        // 3. Query list_terminal_tasks on engine_alpha: must contain alpha_task_id and NOT beta_task_id
+        let res_alpha = engine_alpha
+            .call_tool("list_terminal_tasks", json!({}))
+            .await
+            .unwrap();
+        assert!(!res_alpha.is_error);
+        let alpha_struct = res_alpha.structured.unwrap();
+        let alpha_tasks = alpha_struct["tasks"].as_array().unwrap();
+        assert!(
+            !alpha_tasks.is_empty(),
+            "engine_alpha must return at least 1 task snapshot"
+        );
+        let alpha_ids: Vec<&str> = alpha_tasks
+            .iter()
+            .filter_map(|t| t["task_id"].as_str())
+            .collect();
+        assert!(
+            alpha_ids.contains(&alpha_task_id.as_str()),
+            "engine_alpha list must include its own task {alpha_task_id}"
+        );
+        assert!(
+            !alpha_ids.contains(&beta_task_id.as_str()),
+            "engine_alpha list must NOT include engine_beta's task {beta_task_id}"
+        );
+        let alpha_prompt = res_alpha.content[0].text();
+        assert!(
+            alpha_prompt.contains(&alpha_task_id),
+            "human prompt text in alpha must include its own task {alpha_task_id}"
+        );
+        assert!(
+            !alpha_prompt.contains(&beta_task_id),
+            "human prompt text in alpha must NOT include beta task {beta_task_id}"
+        );
+
+        // 4. Query list_terminal_tasks on engine_beta: must contain beta_task_id and NOT alpha_task_id
+        let res_beta = engine_beta
+            .call_tool("list_terminal_tasks", json!({}))
+            .await
+            .unwrap();
+        assert!(!res_beta.is_error);
+        let beta_struct = res_beta.structured.unwrap();
+        let beta_tasks = beta_struct["tasks"].as_array().unwrap();
+        assert!(
+            !beta_tasks.is_empty(),
+            "engine_beta must return at least 1 task snapshot"
+        );
+        let beta_ids: Vec<&str> = beta_tasks
+            .iter()
+            .filter_map(|t| t["task_id"].as_str())
+            .collect();
+        assert!(
+            beta_ids.contains(&beta_task_id.as_str()),
+            "engine_beta list must include its own task {beta_task_id}"
+        );
+        assert!(
+            !beta_ids.contains(&alpha_task_id.as_str()),
+            "engine_beta list must NOT include engine_alpha's task {alpha_task_id}"
+        );
+        let beta_prompt = res_beta.content[0].text();
+        assert!(
+            beta_prompt.contains(&beta_task_id),
+            "human prompt text in beta must include its own task {beta_task_id}"
+        );
+        assert!(
+            !beta_prompt.contains(&alpha_task_id),
+            "human prompt text in beta must NOT include alpha task {alpha_task_id}"
+        );
+
+        // 5. Untrusted caller supplying owner_session_id on engine_beta cannot breach isolation
+        let res_beta_attack = engine_beta
             .call_tool(
                 "list_terminal_tasks",
                 json!({ "owner_session_id": "session_alpha" }),
             )
             .await
             .unwrap();
-        assert!(!res_alpha.is_error);
-        let alpha_struct = res_alpha.structured.unwrap();
-        let alpha_tasks = alpha_struct["tasks"].as_array().unwrap();
-        for t in alpha_tasks {
-            if let Some(owner) = t.get("owner_session_id").and_then(Value::as_str) {
-                assert_eq!(
-                    owner, "session_alpha",
-                    "cross-owner leak detected: found task owned by {owner}"
-                );
-            }
-        }
+        assert!(!res_beta_attack.is_error);
+        let attack_struct = res_beta_attack.structured.unwrap();
+        let attack_tasks = attack_struct["tasks"].as_array().unwrap();
+        let attack_ids: Vec<&str> = attack_tasks
+            .iter()
+            .filter_map(|t| t["task_id"].as_str())
+            .collect();
+        assert!(
+            !attack_ids.contains(&alpha_task_id.as_str()),
+            "engine_beta must NEVER return engine_alpha's task even if caller specifies session_alpha"
+        );
 
-        // Query scoped to session_beta
-        let res_beta = engine
-            .call_tool(
-                "list_terminal_tasks",
-                json!({ "owner_session_id": "session_beta" }),
-            )
-            .await
-            .unwrap();
-        assert!(!res_beta.is_error);
-        let beta_struct = res_beta.structured.unwrap();
-        let beta_tasks = beta_struct["tasks"].as_array().unwrap();
-        for t in beta_tasks {
-            if let Some(owner) = t.get("owner_session_id").and_then(Value::as_str) {
-                assert_eq!(
-                    owner, "session_beta",
-                    "cross-owner leak detected: found task owned by {owner}"
-                );
-            }
-        }
+        // Cleanup tasks
+        let _ = engine_alpha.call_tool("kill_task", json!({ "task_id": alpha_task_id })).await;
+        let _ = engine_beta.call_tool("kill_task", json!({ "task_id": beta_task_id })).await;
     }
 
+    #[tokio::test]
+    async fn test_list_terminal_tasks_safe_metadata_and_secret_redaction() {
+        let (_lock, _guard) = isolate_env("list_safe_meta");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let secret_key = "sk-test-secret-key-123456789012345678901234567890";
+        let inline_secret = "my_super_secret_token_123";
+
+        unsafe {
+            std::env::set_var("HANDS_TEST_CRED_NAMESPACE", "1");
+            std::env::set_var("CONTROL_PLANE_API_KEY", secret_key);
+        }
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let cmd = if cfg!(windows) {
+            format!(
+                "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'KEY={secret_key} TOKEN={inline_secret}'; Start-Sleep -Seconds 30\""
+            )
+        } else {
+            format!(
+                "sh -c \"echo 'KEY={secret_key} TOKEN={inline_secret}'; sleep 30\""
+            )
+        };
+
+        let desc = format!("Task with Bearer secret_bearer_token_xyz_98765 and api_key={secret_key}");
+
+        let bg_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": cmd,
+                    "description": desc,
+                    "is_background": true,
+                }),
+            )
+            .await
+            .expect("start background task");
+        assert!(!bg_res.is_error);
+        let bg_struct = bg_res.structured.expect("bg structured output");
+        let task_id = bg_struct["task_id"].as_str().unwrap().to_string();
+
+        // Wait brief moment for task to emit output
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let list_res = engine
+            .call_tool(
+                "list_terminal_tasks",
+                json!({ "include_output": true }),
+            )
+            .await
+            .expect("list_terminal_tasks call should succeed");
+        assert!(!list_res.is_error);
+
+        let list_struct = list_res.structured.expect("structured output");
+        let tasks = list_struct["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+
+        let task_cmd = task["command"].as_str().unwrap_or("");
+        let task_desc = task["description"].as_str().unwrap_or("");
+        let task_preview = task["output_preview"].as_str().unwrap_or("");
+        let human_prompt = list_res.content[0].text();
+
+        // SECRECY ASSERTIONS: Secret key and bearer token must NEVER appear in structured or human text
+        assert!(
+            !task_cmd.contains(secret_key),
+            "Secret key leaked in structured command: {task_cmd}"
+        );
+        assert!(
+            !task_desc.contains("secret_bearer_token_xyz_98765"),
+            "Bearer token leaked in structured description: {task_desc}"
+        );
+        assert!(
+            !task_desc.contains(secret_key),
+            "Secret key leaked in structured description: {task_desc}"
+        );
+        assert!(
+            !task_preview.contains(secret_key),
+            "Secret key leaked in structured output_preview: {task_preview}"
+        );
+        assert!(
+            !human_prompt.contains(secret_key),
+            "Secret key leaked in human prompt text: {human_prompt}"
+        );
+        assert!(
+            !human_prompt.contains("secret_bearer_token_xyz_98765"),
+            "Bearer token leaked in human prompt text: {human_prompt}"
+        );
+
+        // Verification of redaction markers
+        assert!(
+            task_cmd.contains("[REDACTED]"),
+            "Structured command must contain [REDACTED]: {task_cmd}"
+        );
+        assert!(
+            task_desc.contains("[REDACTED]"),
+            "Structured description must contain [REDACTED]: {task_desc}"
+        );
+
+        // Cleanup
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[test]
+    fn test_sanitize_safe_metadata_patterns() {
+        let raw = "CONTROL_PLANE_API_KEY=sk-test-secret-key-123456789012345678901234567890 run --token=my_secret_token_abc --api-key sk-proj-99887766554433221100";
+        let sanitized = sanitize_safe_metadata(raw);
+        assert!(!sanitized.contains("sk-test-secret-key-123456789012345678901234567890"));
+        assert!(!sanitized.contains("sk-proj-99887766554433221100"));
+        assert!(!sanitized.contains("my_secret_token_abc"));
+        assert!(sanitized.contains("[REDACTED]"));
+
+        let bearer = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz";
+        let sanitized_bearer = sanitize_safe_metadata(bearer);
+        assert!(!sanitized_bearer.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz"));
+        assert!(sanitized_bearer.contains("Bearer [REDACTED]"));
+    }
     #[tokio::test]
     #[cfg(windows)]
     async fn test_list_terminal_tasks_bounded_and_status_filtering() {
