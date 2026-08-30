@@ -223,6 +223,21 @@ impl ToolEngine {
                             "description": "Optional explicit working directory for this shell call. Absolute paths may target repositories outside the pinned default Workspace."
                         }),
                     );
+                    props.insert(
+                        "execution_mode".to_string(),
+                        json!({
+                            "type": "string",
+                            "description": "Optional execution mode: 'foreground' (blocks until completion or timeout), 'background' (returns task_id immediately), or 'auto' (runs in foreground up to yield_after_ms, yielding to background task if still running). Default: 'foreground' (or 'background' if is_background is true).",
+                            "enum": ["foreground", "background", "auto"]
+                        }),
+                    );
+                    props.insert(
+                        "yield_after_ms".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional interaction budget in milliseconds for 'auto' execution mode. If the command does not complete within this budget, it yields into a durable background task without killing or restarting the process. Default: 10000 (10 seconds)."
+                        }),
+                    );
                 }
             }
             json!({
@@ -294,100 +309,269 @@ impl ToolEngine {
             return Ok(ToolCallResult::from_value(val));
         }
 
-        // The upstream terminal tool derives cwd from its bridge SessionContext and does not
-        // accept a per-call cwd field. When the caller keeps the default shell but supplies an
-        // explicit cwd, encode that cwd into the existing bridge command so foreground and
-        // background task lifecycle/result shaping remain unchanged.
-        if name == "run_terminal_cmd" && arguments.get("shell").is_none() {
-            let explicit_cwd = arguments
-                .get("cwd")
-                .or_else(|| arguments.get("workdir"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(cwd) = explicit_cwd {
-                let command = arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(obj) = arguments.as_object_mut() {
-                    obj.insert(
-                        "command".to_string(),
-                        json!(wrap_background_cwd(command, Some(&cwd))),
-                    );
-                    obj.remove("cwd");
-                    obj.remove("workdir");
-                }
-            }
-        }
+        if name == "run_terminal_cmd" {
+            let exec_mode = match resolve_execution_mode(&arguments) {
+                Ok(m) => m,
+                Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+            };
 
-        // Handle explicit per-call shell selection for run_terminal_cmd
-        if name == "run_terminal_cmd" && let Some(shell_val) = arguments.get("shell") {
-            let shell_str = match shell_val.as_str() {
-                Some(s) => s.trim(),
-                None => {
-                    return Ok(ToolCallResult::text(
-                        "error: shell must be a string ('powershell', 'cmd', or 'git-bash')",
-                        true,
-                    ));
-                }
+            let shell_str_opt = match arguments.get("shell") {
+                Some(shell_val) => match shell_val.as_str() {
+                    Some(s) => Some(s.trim().to_string()),
+                    None => {
+                        return Ok(ToolCallResult::text(
+                            "error: shell must be a string ('powershell', 'cmd', or 'git-bash')",
+                            true,
+                        ));
+                    }
+                },
+                None => None,
             };
 
             let command = arguments
                 .get("command")
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            let is_background = arguments
-                .get("is_background")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or("")
+                .to_string();
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let explicit_cwd = arguments
                 .get("cwd")
                 .or_else(|| arguments.get("workdir"))
-                .and_then(Value::as_str);
+                .and_then(Value::as_str)
+                .map(str::to_string);
 
-            let cwd_path = if let Some(c) = explicit_cwd {
+            let cwd_path = if let Some(ref c) = explicit_cwd {
                 PathBuf::from(c)
             } else {
                 self.workspace()
             };
             let cwd_str = cwd_path.to_string_lossy().to_string();
 
-            let resolved = match resolve_shell_command(shell_str, command, is_background, explicit_cwd) {
-                Ok(r) => r,
-                Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
-            };
+            match exec_mode {
+                ResolvedExecutionMode::Auto { yield_after_ms } => {
+                    let bg_cmd = if let Some(shell_str) = shell_str_opt {
+                        match resolve_shell_command(shell_str.as_str(), &command, true, explicit_cwd.as_deref()) {
+                            Ok(ResolvedShell::Background { command: c }) => c,
+                            Ok(ResolvedShell::Foreground { .. }) => unreachable!(),
+                            Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+                        }
+                    } else if let Some(cwd) = explicit_cwd {
+                        wrap_background_cwd(command.clone(), Some(&cwd))
+                    } else {
+                        command.to_string()
+                    };
 
-            match resolved {
-                ResolvedShell::Foreground { prog, args } => {
-                    let timeout = arguments.get("timeout").and_then(Value::as_u64);
-                    let env = arguments.get("env");
-                    if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
-                        return Ok(ToolCallResult::text(stale_msg, true));
-                    }
-                    let output = crate::run_proc::run_foreground(
-                        &prog,
-                        &args,
-                        Some(&cwd_str),
-                        timeout,
-                        env,
-                    )
-                    .await;
-                    return Ok(render_proc_output_as_terminal_result(
-                        output,
-                        command,
-                        &cwd_str,
-                        arguments.get("description").and_then(Value::as_str),
-                    ));
-                }
-                ResolvedShell::Background { command: bg_cmd } => {
                     let mut bg_arguments = arguments.clone();
                     if let Some(obj) = bg_arguments.as_object_mut() {
                         obj.insert("command".to_string(), json!(bg_cmd));
+                        obj.insert("is_background".to_string(), json!(true));
                         obj.remove("shell");
                         obj.remove("cwd");
                         obj.remove("workdir");
+                        obj.remove("execution_mode");
+                        obj.remove("yield_after_ms");
                     }
+
+                    let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
+                    let bridge = self.bridge().await?;
+                    if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
+                        return Ok(ToolCallResult::text(stale_msg, true));
+                    }
+
+                    let bg_result = match bridge.call(name, bg_arguments, &call_id).await {
+                        Ok(r) => r,
+                        Err(e) => return Ok(ToolCallResult::text(e.to_string(), true)),
+                    };
+
+                    let (task_id, initial_output_file, pid) = match &bg_result.output {
+                        ToolOutput::BackgroundTaskStarted(b) => {
+                            (b.task_id.clone(), b.output_file.clone(), b.pid)
+                        }
+                        _ => {
+                            let structured = serde_json::to_value(&bg_result.output).unwrap_or_default();
+                            let task_id = structured
+                                .get("task_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&call_id)
+                                .to_string();
+                            let output_file = structured
+                                .get("output_file")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let pid = structured.get("pid").and_then(Value::as_u64).map(|p| p as u32);
+                            (task_id, output_file, pid)
+                        }
+                    };
+
+                    let poll_call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
+                    let poll_args = json!({
+                        "task_id": &task_id,
+                        "timeout_ms": yield_after_ms
+                    });
+
+                    let poll_result = match bridge.call("get_task_output", poll_args, &poll_call_id).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let prompt_text = format!(
+                                "[Command yielded to background after {yield_after_ms}ms. Process is still running with task_id: {task_id}]\nUse get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."
+                            );
+                            let structured = json!({
+                                "task_id": task_id,
+                                "task_type": "bash",
+                                "status": "running",
+                                "command": command,
+                                "summary": format!("Command \"{}\" exceeded yield budget of {}ms and was yielded to background. Process is still running.", command, yield_after_ms),
+                                "retrieval_hint": format!("Use get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."),
+                                "output_file": initial_output_file,
+                                "total_bytes": 0,
+                                "description": description.as_deref(),
+                                "has_output": false,
+                                "execution_mode": "auto",
+                                "yielded": true,
+                                "backgrounded": true,
+                                "pid": pid,
+                            });
+                            return Ok(ToolCallResult {
+                                content: vec![ToolContent::Text { text: prompt_text }],
+                                structured: Some(structured),
+                                is_error: false,
+                            });
+                        }
+                    };
+
+                    let poll_val = serde_json::to_value(&poll_result.output).unwrap_or_default();
+                    let result_obj = poll_val.get("Result").and_then(Value::as_object);
+                    let status = result_obj
+                        .and_then(|r| r.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("running");
+
+                    if status != "running" {
+                        let exit_code = result_obj
+                            .and_then(|r| r.get("exit_code"))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0) as i32;
+                        let output_text = result_obj
+                            .and_then(|r| r.get("output"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let total_bytes = result_obj
+                            .and_then(|r| r.get("raw_output_bytes").or_else(|| r.get("total_bytes")))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(output_text.len() as u64) as usize;
+                        let truncated = result_obj
+                            .and_then(|r| r.get("truncated"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let final_output_file = result_obj
+                            .and_then(|r| r.get("output_file"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&initial_output_file);
+                        let has_output = !output_text.is_empty() || total_bytes > 0;
+
+                        let (text, log_path) = if total_bytes > 40_000 || truncated {
+                            let preview_prefix = crate::run_proc::truncate_utf8(output_text, 20_000);
+                            let preview = format!(
+                                "{preview_prefix}\n\n... (output truncated) ...\n\n[truncated - full output at: {final_output_file}]"
+                            );
+                            (preview, Some(final_output_file.to_string()))
+                        } else {
+                            (output_text.to_string(), None)
+                        };
+
+                        let prompt_text = format!(
+                            "command: {command}\nexit: {exit_code}\n\n{text}"
+                        );
+
+                        let structured = json!({
+                            "command": command,
+                            "exit_code": exit_code,
+                            "timed_out": false,
+                            "termination_reason": null,
+                            "current_dir": cwd_str,
+                            "truncated": truncated || log_path.is_some(),
+                            "output_file": final_output_file,
+                            "total_bytes": total_bytes,
+                            "description": description.as_deref(),
+                            "has_output": has_output,
+                            "error": null,
+                            "execution_mode": "auto",
+                            "status": status,
+                            "yielded": false,
+                            "pid": pid,
+                        });
+
+                        return Ok(ToolCallResult {
+                            content: vec![ToolContent::Text { text: prompt_text }],
+                            structured: Some(structured),
+                            is_error: false,
+                        });
+                    } else {
+                        let total_bytes = result_obj
+                            .and_then(|r| r.get("raw_output_bytes").or_else(|| r.get("total_bytes")))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        let final_output_file = result_obj
+                            .and_then(|r| r.get("output_file"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&initial_output_file);
+
+                        let prompt_text = format!(
+                            "[Command yielded to background after {yield_after_ms}ms. Process is still running with task_id: {task_id}]\nUse get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."
+                        );
+
+                        let structured = json!({
+                            "task_id": task_id,
+                            "task_type": "bash",
+                            "status": "running",
+                            "command": command,
+                            "summary": format!("Command \"{}\" exceeded yield budget of {}ms and was yielded to background. Process is still running.", command, yield_after_ms),
+                            "retrieval_hint": format!("Use get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."),
+                            "output_file": final_output_file,
+                            "total_bytes": total_bytes,
+                            "description": description.as_deref(),
+                            "has_output": total_bytes > 0,
+                            "execution_mode": "auto",
+                            "yielded": true,
+                            "backgrounded": true,
+                            "pid": pid,
+                        });
+
+                        return Ok(ToolCallResult {
+                            content: vec![ToolContent::Text { text: prompt_text }],
+                            structured: Some(structured),
+                            is_error: false,
+                        });
+                    }
+                }
+                ResolvedExecutionMode::Background => {
+                    let bg_cmd = if let Some(shell_str) = shell_str_opt {
+                        match resolve_shell_command(shell_str.as_str(), &command, true, explicit_cwd.as_deref()) {
+                            Ok(ResolvedShell::Background { command: c }) => c,
+                            Ok(ResolvedShell::Foreground { .. }) => unreachable!(),
+                            Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+                        }
+                    } else if let Some(cwd) = explicit_cwd {
+                        wrap_background_cwd(command.clone(), Some(&cwd))
+                    } else {
+                        command.to_string()
+                    };
+
+                    let mut bg_arguments = arguments.clone();
+                    if let Some(obj) = bg_arguments.as_object_mut() {
+                        obj.insert("command".to_string(), json!(bg_cmd));
+                        obj.insert("is_background".to_string(), json!(true));
+                        obj.remove("shell");
+                        obj.remove("cwd");
+                        obj.remove("workdir");
+                        obj.remove("execution_mode");
+                        obj.remove("yield_after_ms");
+                    }
+
                     let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                     let bridge = self.bridge().await?;
                     if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
@@ -405,6 +589,72 @@ impl ToolEngine {
                             });
                         }
                         Err(e) => return Ok(ToolCallResult::text(e.to_string(), true)),
+                    }
+                }
+                ResolvedExecutionMode::Foreground => {
+                    if let Some(shell_str) = shell_str_opt {
+                        let resolved = match resolve_shell_command(shell_str.as_str(), &command, false, explicit_cwd.as_deref()) {
+                            Ok(r) => r,
+                            Err(e) => return Ok(ToolCallResult::text(format!("error: {e}"), true)),
+                        };
+                        match resolved {
+                            ResolvedShell::Foreground { prog, args } => {
+                                let timeout = arguments.get("timeout").and_then(Value::as_u64);
+                                let env = arguments.get("env");
+                                if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
+                                    return Ok(ToolCallResult::text(stale_msg, true));
+                                }
+                                let output = crate::run_proc::run_foreground(
+                                    &prog,
+                                    &args,
+                                    Some(&cwd_str),
+                                    timeout,
+                                    env,
+                                )
+                                .await;
+                                return Ok(render_proc_output_as_terminal_result(
+                                    output,
+                                    &command,
+                                    &cwd_str,
+                                    description.as_deref(),
+                                ));
+                            }
+                            ResolvedShell::Background { .. } => unreachable!(),
+                        }
+                    } else {
+                        // Default shell foreground
+                        if let Some(cwd) = explicit_cwd {
+                            if let Some(obj) = arguments.as_object_mut() {
+                                obj.insert(
+                                    "command".to_string(),
+                                    json!(wrap_background_cwd(command.clone(), Some(&cwd))),
+                                );
+                                obj.remove("cwd");
+                                obj.remove("workdir");
+                            }
+                        }
+                        if let Some(obj) = arguments.as_object_mut() {
+                            obj.remove("execution_mode");
+                            obj.remove("yield_after_ms");
+                        }
+                        let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
+                        let bridge = self.bridge().await?;
+                        if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
+                            return Ok(ToolCallResult::text(stale_msg, true));
+                        }
+                        match bridge.call(name, arguments, &call_id).await {
+                            Ok(result) => {
+                                let mut prompt_text = result.prompt_text;
+                                let structured = shape_structured_output(&result.output, &mut prompt_text);
+                                let is_error = result.output.is_error();
+                                return Ok(ToolCallResult {
+                                    content: vec![ToolContent::Text { text: prompt_text }],
+                                    structured: Some(structured),
+                                    is_error,
+                                });
+                            }
+                            Err(e) => return Ok(ToolCallResult::text(e.to_string(), true)),
+                        }
                     }
                 }
             }
@@ -427,6 +677,75 @@ impl ToolEngine {
                 })
             }
             Err(e) => Ok(ToolCallResult::text(e.to_string(), true)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedExecutionMode {
+    Foreground,
+    Background,
+    Auto { yield_after_ms: u64 },
+}
+
+pub fn resolve_execution_mode(arguments: &Value) -> Result<ResolvedExecutionMode, String> {
+    let mode_str = match arguments.get("execution_mode") {
+        Some(v) => match v.as_str() {
+            Some(s) => Some(s.trim().to_ascii_lowercase()),
+            None => {
+                return Err(
+                    "execution_mode must be a string ('foreground', 'background', or 'auto')"
+                        .to_string(),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let yield_after_ms = match arguments.get("yield_after_ms") {
+        Some(v) => {
+            if let Some(ms) = v.as_u64() {
+                Some(ms)
+            } else if let Some(s) = v.as_str() {
+                if let Ok(ms) = s.parse::<u64>() {
+                    Some(ms)
+                } else {
+                    return Err("yield_after_ms must be an integer (milliseconds)".to_string());
+                }
+            } else {
+                return Err("yield_after_ms must be an integer (milliseconds)".to_string());
+            }
+        }
+        None => None,
+    };
+
+    let is_background = arguments
+        .get("is_background")
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(false);
+
+    match mode_str.as_deref() {
+        Some("background") => Ok(ResolvedExecutionMode::Background),
+        Some("foreground") => Ok(ResolvedExecutionMode::Foreground),
+        Some("auto") => {
+            let budget = yield_after_ms.unwrap_or(10_000);
+            Ok(ResolvedExecutionMode::Auto {
+                yield_after_ms: budget,
+            })
+        }
+        Some(other) => Err(format!(
+            "unsupported execution_mode: '{other}'; must be 'foreground', 'background', or 'auto'"
+        )),
+        None => {
+            if is_background {
+                Ok(ResolvedExecutionMode::Background)
+            } else if let Some(budget) = yield_after_ms {
+                Ok(ResolvedExecutionMode::Auto {
+                    yield_after_ms: budget,
+                })
+            } else {
+                Ok(ResolvedExecutionMode::Foreground)
+            }
         }
     }
 }
@@ -811,7 +1130,7 @@ exit: {}{}
         "truncated": output.capture_truncated || log_path.is_some(),
         "output_file": log_path.unwrap_or_default(),
         "total_bytes": total_bytes,
-        "description": description,
+        "description": description.as_deref(),
         "has_output": has_output,
         "error": output.error,
     });
@@ -1314,6 +1633,8 @@ mod tests {
             .expect("terminal properties");
         assert!(properties.contains_key("shell"));
         assert!(properties.contains_key("cwd"), "explicit cwd must be model-visible");
+        assert!(properties.contains_key("execution_mode"), "execution_mode must be model-visible");
+        assert!(properties.contains_key("yield_after_ms"), "yield_after_ms must be model-visible");
     }
 
     #[tokio::test]
@@ -1919,6 +2240,349 @@ exit /b 1
         })).await.unwrap();
         assert!(bash_err.is_error);
         assert!(bash_err.content[0].text().contains("unsupported shell selector: 'bash'"));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_short_completes_foreground_shape() {
+        let (_lock, _guard) = isolate_env("auto_short");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'AUTO_SHORT_PAYLOAD'\"",
+                    "description": "auto mode short command",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("exit: 0"));
+        assert!(text.contains("AUTO_SHORT_PAYLOAD"));
+
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["exit_code"], 0);
+        assert_eq!(structured["status"], "completed");
+        assert_eq!(structured["yielded"], false);
+        assert_eq!(structured["timed_out"], false);
+        assert_eq!(structured["execution_mode"], "auto");
+        assert_eq!(structured["has_output"], true);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_long_yields_to_background_and_resumes() {
+        let (_lock, _guard) = isolate_env("auto_yield");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Yield budget 400ms while command sleeps 2.5s
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 2500; Write-Output 'AUTO_YIELD_COMPLETED'\"",
+                    "description": "auto mode long command",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("[Command yielded to background after 400ms"));
+        assert!(text.contains("get_task_output"));
+
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["backgrounded"], true);
+        assert_eq!(structured["execution_mode"], "auto");
+        let task_id = structured["task_id"].as_str().expect("task_id must be present").to_string();
+        assert!(!task_id.is_empty());
+
+        // Inspect and wait on task output via get_task_output
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("get_task_output must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        assert_eq!(result_obj["exit_code"], 0);
+        assert!(result_obj["output"].as_str().unwrap().contains("AUTO_YIELD_COMPLETED"));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_yield_after_ms_without_mode_opts_in() {
+        let (_lock, _guard) = isolate_env("auto_opt_in");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Passing yield_after_ms without execution_mode opts into auto mode
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 2500; Write-Output 'IMPLICIT_AUTO_OK'\"",
+                    "description": "yield_after_ms opt in test",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        assert_eq!(structured["backgrounded"], true);
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_partial_output_continuity() {
+        let (_lock, _guard) = isolate_env("auto_continuity");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'PARTIAL_HEAD_SENTINEL'; Start-Sleep -Milliseconds 2000; Write-Output 'PARTIAL_TAIL_SENTINEL'\"",
+                    "description": "partial output continuity test",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 500
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["yielded"], true);
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        // Wait for subsequent output and completion
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({
+                    "task_id": task_id,
+                    "timeout_ms": 15000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let result_obj = &poll_struct["Result"];
+        assert_eq!(result_obj["status"], "completed");
+        let output = result_obj["output"].as_str().unwrap();
+        assert!(output.contains("PARTIAL_HEAD_SENTINEL"), "output must retain head produced before yield");
+        assert!(output.contains("PARTIAL_TAIL_SENTINEL"), "output must contain tail produced after yield");
+        assert_eq!(output.matches("PARTIAL_HEAD_SENTINEL").count(), 1, "head must not be duplicated");
+        assert_eq!(output.matches("PARTIAL_TAIL_SENTINEL").count(), 1, "tail must not be duplicated");
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_yield_and_kill_lifecycle() {
+        let (_lock, _guard) = isolate_env("auto_kill");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 60\"",
+                    "description": "auto mode kill test",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        let structured = res.structured.expect("must return structured output");
+        let task_id = structured["task_id"].as_str().unwrap().to_string();
+
+        // Kill the yielded task
+        let kill_res = engine
+            .call_tool(
+                "kill_task",
+                json!({ "task_id": &task_id }),
+            )
+            .await
+            .unwrap();
+        assert!(!kill_res.is_error);
+
+        // Verify task state after kill
+        let poll_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &task_id }),
+            )
+            .await
+            .unwrap();
+        assert!(!poll_res.is_error);
+        let poll_struct = poll_res.structured.expect("must return structured output");
+        let status = poll_struct["Result"]["status"].as_str().unwrap();
+        assert!(status == "cancelled" || status == "killed" || status == "completed" || status == "failed");
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_with_shell_selectors() {
+        let (_lock, _guard) = isolate_env("auto_shell");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. cmd short auto
+        let cmd_short = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo CMD_AUTO_SHORT_OK",
+                    "description": "cmd auto short",
+                    "shell": "cmd",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 5000
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!cmd_short.is_error);
+        assert!(cmd_short.content[0].text().contains("CMD_AUTO_SHORT_OK"));
+        let cmd_struct = cmd_short.structured.unwrap();
+        assert_eq!(cmd_struct["status"], "completed");
+        assert_eq!(cmd_struct["yielded"], false);
+
+        // 2. cmd long auto yields
+        let cmd_long = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "ping -n 5 127.0.0.1 > nul && echo CMD_YIELD_DONE",
+                    "description": "cmd auto long",
+                    "shell": "cmd",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 400
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!cmd_long.is_error);
+        let cmd_long_struct = cmd_long.structured.unwrap();
+        assert_eq!(cmd_long_struct["status"], "running");
+        assert_eq!(cmd_long_struct["yielded"], true);
+        let cmd_task_id = cmd_long_struct["task_id"].as_str().unwrap().to_string();
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": cmd_task_id })).await;
+    }
+
+    #[tokio::test]
+    async fn test_run_terminal_cmd_invalid_execution_mode_and_yield_after_ms() {
+        let (_lock, _guard) = isolate_env("auto_invalid");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let invalid_mode = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo test",
+                    "execution_mode": "unsupported_mode"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(invalid_mode.is_error);
+        assert!(invalid_mode.content[0].text().contains("unsupported execution_mode: 'unsupported_mode'"));
+
+        let invalid_yield = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo test",
+                    "execution_mode": "auto",
+                    "yield_after_ms": "not-a-number"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(invalid_yield.is_error);
+        assert!(invalid_yield.content[0].text().contains("yield_after_ms must be an integer"));
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_auto_mode_nonzero_exit_is_not_mcp_error() {
+        let (_lock, _guard) = isolate_env("auto_nonzero");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "exit /b 42",
+                    "description": "auto nonzero exit",
+                    "shell": "cmd",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error, "exit_code != 0 must NOT become MCP isError in auto mode");
+        let structured = res.structured.expect("must return structured output");
+        assert_ne!(structured["exit_code"], 0);
+        assert_eq!(structured["status"], "failed");
+        assert_eq!(structured["yielded"], false);
+        assert_eq!(structured["timed_out"], false);
     }
 
 }

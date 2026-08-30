@@ -660,14 +660,27 @@ mod tests {
         }
 
         fn parse_json_output(label: &str, prompt: &str) -> serde_json::Value {
-            let start = prompt
+            let json_str = if let Some(start) = prompt.find("[truncated - full output at:") {
+                let path_start = start + "[truncated - full output at:".len();
+                let path_end = prompt[path_start..].find(']').expect("matching bracket for log path");
+                let log_path = prompt[path_start..path_start + path_end].trim();
+                std::fs::read_to_string(log_path).unwrap_or_else(|e| panic!("failed to read log {log_path}: {e}"))
+            } else if let Some(start) = prompt.find("[truncated: showing first/last") {
+                let path_start = prompt.find("full output at:").expect("full output at marker") + "full output at:".len();
+                let path_end = prompt[path_start..].find(']').expect("matching bracket for log path");
+                let log_path = prompt[path_start..path_start + path_end].trim();
+                std::fs::read_to_string(log_path).unwrap_or_else(|e| panic!("failed to read log {log_path}: {e}"))
+            } else {
+                prompt.to_string()
+            };
+            let start = json_str
                 .find('{')
-                .unwrap_or_else(|| panic!("{label} did not return JSON: {prompt}"));
-            let end = prompt
+                .unwrap_or_else(|| panic!("{label} did not return JSON: {json_str}"));
+            let end = json_str
                 .rfind('}')
-                .unwrap_or_else(|| panic!("{label} returned truncated JSON: {prompt}"));
-            serde_json::from_str(&prompt[start..=end])
-                .unwrap_or_else(|error| panic!("{label} returned invalid JSON ({error}): {prompt}"))
+                .unwrap_or_else(|| panic!("{label} returned truncated JSON: {json_str}"));
+            serde_json::from_str(&json_str[start..=end])
+                .unwrap_or_else(|error| panic!("{label} returned invalid JSON ({error}): {json_str}"))
         }
 
         let resolve_args = serde_json::json!({
