@@ -18,11 +18,12 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// may inherit pipe handles, so we cannot wait indefinitely.
 const BOUNDED_DRAIN_TIMEOUT_MS: u64 = 500;
 
-/// Output character cap (bytes). Matching the terminal tool's bounded-output
+/// Output character cap (bytes/chars). Matching the terminal tool's bounded-output
 /// rule: the combined stdout+stderr response is bounded, and oversized
 /// output is persisted to a temp log file for later retrieval.
-const OUTPUT_BOUND: usize = 40_000;
-
+pub const OUTPUT_BOUND: usize = 40_000;
+pub const MIN_INLINE_BUDGET: usize = 20;
+pub const MAX_INLINE_BUDGET: usize = 1_000_000;
 /// Hard cap on raw bytes buffered per stream before truncation. Prevents a
 /// runaway child from exhausting process memory while still capturing
 /// enough to persist a useful log.
@@ -353,7 +354,7 @@ pub fn input_schema() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": { "type": "string" },
                 "description": "Optional environment overrides applied to the child without rewriting argv."
-            }
+            },
         },
         "required": ["command"]
     })
@@ -370,6 +371,81 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
+/// Resolve optional inline output budget parameter (`max_inline_chars`) from tool arguments.
+///
+/// Returns `Ok(None)` if `max_inline_chars` is not provided.
+/// Returns `Ok(Some(clamped))` if `max_inline_chars` is a non-negative integer, clamping between `MIN_INLINE_BUDGET` and `MAX_INLINE_BUDGET`.
+/// Returns `Err(...)` if `max_inline_chars` is present but has an invalid type or negative/malformed value.
+pub fn resolve_inline_budget(arguments: &serde_json::Value) -> Result<Option<usize>, String> {
+    let Some(raw) = arguments.get("max_inline_chars") else {
+        return Ok(None);
+    };
+    match raw {
+        serde_json::Value::Number(n) => {
+            if let Some(v) = n.as_u64() {
+                Ok(Some((v as usize).clamp(MIN_INLINE_BUDGET, MAX_INLINE_BUDGET)))
+            } else {
+                Err("max_inline_chars must be a non-negative integer".to_string())
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Ok(v) = s.trim().parse::<u64>() {
+                Ok(Some((v as usize).clamp(MIN_INLINE_BUDGET, MAX_INLINE_BUDGET)))
+            } else {
+                Err("max_inline_chars must be a non-negative integer".to_string())
+            }
+        }
+        _ => Err("max_inline_chars must be a non-negative integer".to_string()),
+    }
+}
+
+/// Split `s` into (head, tail) substrings containing at most `max_chars` characters
+/// and at most `max_bytes` bytes total, safe at UTF-8 char boundaries.
+///
+/// Head contains up to half the budget and tail contains the remaining budget.
+pub fn truncate_head_tail_utf8(s: &str, max_chars: usize, max_bytes: usize) -> (String, String) {
+    if s.is_empty() || max_chars == 0 || max_bytes == 0 {
+        return (String::new(), String::new());
+    }
+    if s.len() <= max_bytes && s.chars().count() <= max_chars {
+        return (s.to_string(), String::new());
+    }
+
+    let head_target_chars = max_chars / 2;
+    let head_target_bytes = max_bytes / 2;
+
+    let mut head_end = 0;
+    let mut count = 0;
+    for (idx, ch) in s.char_indices() {
+        if count >= head_target_chars || idx + ch.len_utf8() > head_target_bytes {
+            break;
+        }
+        head_end = idx + ch.len_utf8();
+        count += 1;
+    }
+    let head = &s[..head_end];
+
+    let tail_target_chars = max_chars.saturating_sub(count);
+    let tail_target_bytes = max_bytes.saturating_sub(head_end);
+
+    let total_len = s.len();
+    let mut tail_start = total_len;
+    let mut tail_count = 0;
+    for (idx, _) in s.char_indices().rev() {
+        let byte_len_from_end = total_len - idx;
+        if tail_count >= tail_target_chars || byte_len_from_end > tail_target_bytes {
+            break;
+        }
+        tail_start = idx;
+        tail_count += 1;
+    }
+    if tail_start < head_end {
+        tail_start = head_end;
+    }
+    let tail = &s[tail_start..];
+
+    (head.to_string(), tail.to_string())
+}
 /// Persist the full captured output to a temp log file so the operator can
 /// retrieve what was truncated from the bounded tool response. Returns the
 /// log path on success.
@@ -605,10 +681,8 @@ pub async fn handle_call(
     } else {
         (unbounded, None)
     };
-
     let has_output = !output.stdout.is_empty() || !output.stderr.is_empty();
     let total_bytes = output.stdout.len() + output.stderr.len();
-
     let termination_reason = output.termination_reason.map(|r| r.as_str());
 
     let structured = serde_json::json!({
@@ -624,8 +698,6 @@ pub async fn handle_call(
         "output_file": log_path,
         "error": output.error,
     });
-
-    // Non-zero exit, timeout, and missing-executable are all distinct
     // outcomes. A child exiting non-zero or timing out is NOT an MCP
     // protocol error — only an unlaunchable process is.
     serde_json::json!({
@@ -1982,6 +2054,9 @@ mod tests {
         assert_eq!(normal_res["isError"], false);
         assert_eq!(normal_res["structuredContent"]["exit_code"], 0);
         assert_eq!(normal_res["structuredContent"]["timed_out"], false);
+        assert_eq!(normal_res["structuredContent"]["has_output"], true);
+        assert!(normal_res["structuredContent"]["total_bytes"].as_u64().unwrap() > 0);
+        assert!(normal_res["structuredContent"].get("max_inline_chars").is_none());
         assert_eq!(normal_res["structuredContent"]["termination_reason"], serde_json::Value::Null);
 
         // Non-zero child exit remains a normal outcome (termination_reason: null, isError: false)
@@ -2026,4 +2101,62 @@ mod tests {
         assert_eq!(timeout_res["structuredContent"]["termination_reason"], "timeout");
     }
 
+    #[test]
+    fn test_truncate_head_tail_utf8_ascii_and_multibyte() {
+        // ASCII
+        let s = "0123456789";
+        let (head, tail) = truncate_head_tail_utf8(s, 6, 6);
+        assert_eq!(head, "012");
+        assert_eq!(tail, "789");
+
+        // Multibyte Vietnamese
+        let vn = "Xin chào các bạn và Đại Ca!";
+        let (head, tail) = truncate_head_tail_utf8(vn, 10, 50);
+        assert_eq!(head.chars().count(), 5);
+        assert_eq!(tail.chars().count(), 5);
+        assert!(vn.starts_with(&head));
+        assert!(vn.ends_with(&tail));
+
+        // Multibyte Emojis
+        let emojis = "🦀🚀🎉🔥💻🌟✨🎯💡🤖";
+        let (head, tail) = truncate_head_tail_utf8(emojis, 4, 50);
+        assert_eq!(head, "🦀🚀");
+        assert_eq!(tail, "💡🤖");
+
+        // Edge cases
+        assert_eq!(truncate_head_tail_utf8("", 10, 10), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 0, 10), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 10, 0), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 10, 10), ("abc".to_string(), String::new()));
+    }
+
+    #[test]
+    fn test_resolve_inline_budget_clamping_and_types() {
+        assert_eq!(resolve_inline_budget(&serde_json::json!({})), Ok(None));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 500 })), Ok(Some(500)));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": "250" })), Ok(Some(250)));
+
+        // Clamping tiny budgets
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 0 })), Ok(Some(MIN_INLINE_BUDGET)));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 5 })), Ok(Some(MIN_INLINE_BUDGET)));
+
+        // Clamping oversized budgets
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 50_000_000 })), Ok(Some(MAX_INLINE_BUDGET)));
+
+        // Invalid types fail safely with Err
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": "invalid_number" })).is_err());
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": -10 })).is_err());
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": true })).is_err());
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": null })).is_err());
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": [1, 2] })).is_err());
+        assert!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 12.34 })).is_err());
+    }
+
+    #[test]
+    fn test_truncate_head_tail_utf8_multibyte_vietnamese() {
+        let s = "BẮT_ĐẦU_".to_string() + &"🇻🇳".repeat(100) + "_KẾT_THÚC";
+        let (head, tail) = truncate_head_tail_utf8(&s, 20, 20 * 4);
+        assert!(head.starts_with("BẮT_ĐẦU_"));
+        assert!(tail.ends_with("_KẾT_THÚC"));
+    }
 }
