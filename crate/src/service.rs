@@ -10,7 +10,6 @@ use std::time::Duration;
 use crate::host;
 
 pub use health::{HEALTH_BASE, ready, wait_ready};
-#[cfg(test)]
 pub use profile::which;
 pub use profile::{
     PROFILE, profile_file, run_tunnel_daemon, save_connect, set_tunnel_id, status_json,
