@@ -1,0 +1,14 @@
+crate/src/service/platform/windows.rs
+  h_17f2fa2b92da6a 182-184,187-227
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d288992ee5aaef155dfeedc7077a7cab8446066c",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
