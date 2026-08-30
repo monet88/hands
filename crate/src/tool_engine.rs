@@ -299,6 +299,38 @@ impl ToolEngine {
                             "description": "Optional interaction budget in milliseconds for 'auto' execution mode. If the command does not complete within this budget, it yields into a durable background task without killing or restarting the process. Default: 10000 (10 seconds)."
                         }),
                     );
+                    props.insert(
+                        "max_inline_chars".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional per-call inline output budget in characters for head/tail preview truncation. Output exceeding this budget is truncated with head and tail retained, while full output is preserved in the output_file. Default: 40000."
+                        }),
+                    );
+                    props.insert(
+                        "max_inline_bytes".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional alias for max_inline_chars specifying the inline budget in bytes."
+                        }),
+                    );
+                }
+            }
+            if name == "get_task_output" {
+                if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                    props.insert(
+                        "max_inline_chars".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional per-call inline output budget in characters for head/tail preview truncation. Output exceeding this budget is truncated with head and tail retained, while full output is preserved in the output_file. Default: 40000."
+                        }),
+                    );
+                    props.insert(
+                        "max_inline_bytes".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional alias for max_inline_chars specifying the inline budget in bytes."
+                        }),
+                    );
                 }
             }
             json!({
@@ -334,7 +366,7 @@ impl ToolEngine {
         Ok(cli_tools)
     }
 
-    pub async fn call_tool(&self, name: &str, mut arguments: Value) -> Result<ToolCallResult, String> {
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallResult, String> {
         let is_context_dep = is_context_dependent_call(name, &arguments);
         if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
             return Ok(ToolCallResult::text(stale_msg, true));
@@ -550,12 +582,23 @@ impl ToolEngine {
                             .and_then(|r| r.get("output_file"))
                             .and_then(Value::as_str)
                             .unwrap_or(&initial_output_file);
+                        let total_chars = output_text.chars().count();
                         let has_output = !output_text.is_empty() || total_bytes > 0;
 
-                        let (text, log_path) = if total_bytes > 40_000 || truncated {
-                            let preview_prefix = crate::run_proc::truncate_utf8(output_text, 20_000);
+                        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
+                        let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
+                        let needs_truncation = total_chars > budget || total_bytes > budget || truncated;
+
+                        let (text, log_path) = if needs_truncation {
+                            let full_content = if !final_output_file.is_empty() {
+                                std::fs::read_to_string(final_output_file).unwrap_or_else(|_| output_text.to_string())
+                            } else {
+                                output_text.to_string()
+                            };
+                            let preview_budget = budget.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
+                            let (head, tail) = crate::run_proc::truncate_head_tail_utf8(&full_content, preview_budget, preview_budget);
                             let preview = format!(
-                                "{preview_prefix}\n\n... (output truncated) ...\n\n[truncated - full output at: {final_output_file}]"
+                                "{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - full output at: {final_output_file}]"
                             );
                             (preview, Some(final_output_file.to_string()))
                         } else {
@@ -572,9 +615,11 @@ impl ToolEngine {
                             "timed_out": false,
                             "termination_reason": null,
                             "current_dir": cwd_str,
-                            "truncated": truncated || log_path.is_some(),
+                            "truncated": truncated || log_path.is_some() || needs_truncation,
                             "output_file": final_output_file,
                             "total_bytes": total_bytes,
+                            "total_chars": total_chars,
+                            "max_inline_chars": budget,
                             "description": description.as_deref(),
                             "has_output": has_output,
                             "error": null,
@@ -707,19 +752,22 @@ impl ToolEngine {
                                     env,
                                 )
                                 .await;
+                                let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
                                 return Ok(render_proc_output_as_terminal_result(
                                     output,
                                     &command,
                                     &cwd_str,
                                     description.as_deref(),
+                                    budget_opt,
                                 ));
                             }
                             ResolvedShell::Background { .. } => unreachable!(),
                         }
                     } else {
-                        // Default shell foreground
+                        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
+                        let mut fg_arguments = arguments.clone();
                         if let Some(cwd) = explicit_cwd {
-                            if let Some(obj) = arguments.as_object_mut() {
+                            if let Some(obj) = fg_arguments.as_object_mut() {
                                 obj.insert(
                                     "command".to_string(),
                                     json!(wrap_background_cwd(command.clone(), Some(&cwd))),
@@ -728,19 +776,22 @@ impl ToolEngine {
                                 obj.remove("workdir");
                             }
                         }
-                        if let Some(obj) = arguments.as_object_mut() {
+                        if let Some(obj) = fg_arguments.as_object_mut() {
                             obj.remove("execution_mode");
                             obj.remove("yield_after_ms");
+                            obj.remove("max_inline_chars");
+                            obj.remove("max_inline_bytes");
+                            obj.remove("output_budget");
                         }
                         let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                         let bridge = self.bridge().await?;
                         if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
                             return Ok(ToolCallResult::text(stale_msg, true));
                         }
-                        match bridge.call(name, arguments, &call_id).await {
+                        match bridge.call(name, fg_arguments, &call_id).await {
                             Ok(result) => {
                                 let mut prompt_text = result.prompt_text;
-                                let structured = shape_structured_output(&result.output, &mut prompt_text);
+                                let structured = shape_structured_output_with_budget(&result.output, &mut prompt_text, budget_opt);
                                 let is_error = result.output.is_error();
                                 return Ok(ToolCallResult {
                                     content: vec![ToolContent::Text { text: prompt_text }],
@@ -755,15 +806,22 @@ impl ToolEngine {
             }
         }
 
+        let budget_opt = crate::run_proc::resolve_inline_budget(&arguments);
+        let mut bridge_arguments = arguments.clone();
+        if let Some(obj) = bridge_arguments.as_object_mut() {
+            obj.remove("max_inline_chars");
+            obj.remove("max_inline_bytes");
+            obj.remove("output_budget");
+        }
         let call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
         let bridge = self.bridge().await?;
         if let Err(stale_msg) = self.check_stale_context(is_context_dep).await {
             return Ok(ToolCallResult::text(stale_msg, true));
         }
-        match bridge.call(name, arguments, &call_id).await {
+        match bridge.call(name, bridge_arguments, &call_id).await {
             Ok(result) => {
                 let mut prompt_text = result.prompt_text;
-                let structured = shape_structured_output(&result.output, &mut prompt_text);
+                let structured = shape_structured_output_with_budget(&result.output, &mut prompt_text, budget_opt);
                 let is_error = result.output.is_error();
                 Ok(ToolCallResult {
                     content: vec![ToolContent::Text { text: prompt_text }],
@@ -1473,6 +1531,15 @@ fn is_context_dependent_call(tool_name: &str, arguments: &Value) -> bool {
 }
 
 fn shape_structured_output(output: &ToolOutput, prompt_text: &mut String) -> Value {
+    shape_structured_output_with_budget(output, prompt_text, None)
+}
+
+fn shape_structured_output_with_budget(
+    output: &ToolOutput,
+    prompt_text: &mut String,
+    budget_opt: Option<usize>,
+) -> Value {
+    let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
     let mut structured = serde_json::to_value(output).unwrap_or_else(|_| json!({ "type": "unknown" }));
 
     // Enrich specific tool variant structured outputs
@@ -1480,23 +1547,88 @@ fn shape_structured_output(output: &ToolOutput, prompt_text: &mut String) -> Val
         if bash.get("type").and_then(Value::as_str) == Some("Bash") {
             let total_bytes = bash.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
             let has_output = total_bytes > 0 || !prompt_text.is_empty();
+            let total_chars = prompt_text.chars().count();
             bash.insert("has_output".to_string(), json!(has_output));
+            bash.insert("total_chars".to_string(), json!(total_chars));
+            bash.insert("max_inline_chars".to_string(), json!(budget));
+
+            if total_chars > budget || total_bytes as usize > budget {
+                bash.insert("truncated".to_string(), json!(true));
+                let (head, tail) = crate::run_proc::truncate_head_tail_utf8(prompt_text, budget, budget);
+                *prompt_text = format!("{head}\n\n... (output truncated) ...\n\n{tail}");
+            }
         } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
             if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
-                let raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0);
+                let mut raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let truncated = res.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-                let is_output_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
-                let has_output = !is_output_empty || raw_bytes > 0;
-                res.insert("total_bytes".to_string(), json!(raw_bytes));
-                res.insert("has_output".to_string(), json!(has_output));
+                let inline_output = res.get("output").and_then(Value::as_str).unwrap_or("").to_string();
+                let output_file = res.get("output_file").and_then(Value::as_str).unwrap_or("").to_string();
 
-                // Fix contradictory text when retained output exists but inline text was empty
-                if is_output_empty && (truncated || raw_bytes > 0) {
+                let file_content = if !output_file.is_empty() {
+                    std::fs::read_to_string(&output_file).ok()
+                } else {
+                    None
+                };
+
+                let full_output = match &file_content {
+                    Some(content) if !content.is_empty() => content.as_str(),
+                    _ => inline_output.as_str(),
+                };
+
+                if let Some(content) = &file_content {
+                    raw_bytes = raw_bytes.max(content.len());
+                } else {
+                    raw_bytes = raw_bytes.max(inline_output.len());
+                }
+
+                let total_chars = full_output.chars().count();
+                let has_output = !full_output.is_empty() || raw_bytes > 0;
+
+                res.insert("total_bytes".to_string(), json!(raw_bytes));
+                res.insert("total_chars".to_string(), json!(total_chars));
+                res.insert("has_output".to_string(), json!(has_output));
+                res.insert("max_inline_chars".to_string(), json!(budget));
+
+                let is_explicit_budget = budget_opt.is_some();
+                let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
+                let needs_budget_truncation = if is_explicit_budget {
+                    total_chars > budget || raw_bytes > budget || truncated
+                } else {
+                    total_chars > crate::run_proc::DEFAULT_OUTPUT_BOUND || raw_bytes > crate::run_proc::DEFAULT_OUTPUT_BOUND || truncated
+                };
+
+                if needs_budget_truncation {
+                    res.insert("truncated".to_string(), json!(true));
+                    let (head, tail) = if is_explicit_budget {
+                        crate::run_proc::truncate_head_tail_utf8(full_output, budget, budget.saturating_mul(4))
+                    } else {
+                        let preview_budget = crate::run_proc::DEFAULT_OUTPUT_BOUND.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
+                        crate::run_proc::truncate_head_tail_utf8(full_output, preview_budget, preview_budget)
+                    };
+
+                    let preview_text = if !output_file.is_empty() {
+                        format!("{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - use read_file on output_file for full content]")
+                    } else {
+                        format!("{head}\n\n... (output truncated) ...\n\n{tail}")
+                    };
+
                     if prompt_text.contains("(no output)") {
-                        *prompt_text = prompt_text.replace(
-                            "(no output)",
-                            "(output truncated - use read_file on output_file for full content)",
-                        );
+                        *prompt_text = prompt_text.replace("(no output)", &preview_text);
+                    } else if !prompt_text.contains("... (output truncated) ...") {
+                        if let Some(pos) = prompt_text.find("Output:\n") {
+                            let prefix = &prompt_text[..pos + "Output:\n".len()];
+                            *prompt_text = format!("{prefix}{preview_text}");
+                        } else {
+                            *prompt_text = format!("{}\n\n{}", prompt_text.trim_end(), preview_text);
+                        }
+                    }
+                } else {
+                    res.insert("truncated".to_string(), json!(false));
+                    if inline_output.is_empty() && has_output && !full_output.is_empty() {
+                        res.insert("output".to_string(), json!(full_output));
+                        if prompt_text.contains("(no output)") {
+                            *prompt_text = prompt_text.replace("(no output)", full_output);
+                        }
                     }
                 }
             } else if let Some(results) = bash
@@ -1510,12 +1642,10 @@ fn shape_structured_output(output: &ToolOutput, prompt_text: &mut String) -> Val
                         continue;
                     };
                     let raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0);
-                    let is_output_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
+                    let is_empty = res.get("output").and_then(Value::as_str).map_or(true, str::is_empty);
                     res.insert("total_bytes".to_string(), json!(raw_bytes));
-                    res.insert(
-                        "has_output".to_string(),
-                        json!(!is_output_empty || raw_bytes > 0),
-                    );
+                    res.insert("has_output".to_string(), json!(!is_empty || raw_bytes > 0));
+                    res.insert("max_inline_chars".to_string(), json!(budget));
                 }
             }
         }
@@ -1529,6 +1659,7 @@ fn render_proc_output_as_terminal_result(
     command: &str,
     cwd: &str,
     description: Option<&str>,
+    budget_opt: Option<usize>,
 ) -> ToolCallResult {
     let mut combined = String::new();
     if !output.stdout.is_empty() {
@@ -1543,16 +1674,27 @@ fn render_proc_output_as_terminal_result(
 
     let has_output = !combined.is_empty();
     let total_bytes = combined.len();
+    let total_chars = combined.chars().count();
 
-    let (text, log_path) = if combined.len() > 40_000 {
+    let is_explicit_budget = budget_opt.is_some();
+    let budget = budget_opt.unwrap_or(crate::run_proc::DEFAULT_OUTPUT_BOUND);
+
+    let needs_truncation = if is_explicit_budget {
+        total_chars > budget || total_bytes > budget || output.capture_truncated
+    } else {
+        total_bytes > crate::run_proc::DEFAULT_OUTPUT_BOUND || output.capture_truncated
+    };
+
+    let (text, log_path) = if needs_truncation {
         let log = crate::run_proc::write_temp_log(&output.stdout, &output.stderr);
-        let preview_prefix = crate::run_proc::truncate_utf8(&combined, 20_000);
+        let (head, tail) = if is_explicit_budget {
+            crate::run_proc::truncate_head_tail_utf8(&combined, budget, budget.saturating_mul(4))
+        } else {
+            let preview_budget = crate::run_proc::DEFAULT_OUTPUT_BOUND.saturating_sub(60).max(crate::run_proc::MIN_INLINE_BUDGET / 2);
+            crate::run_proc::truncate_head_tail_utf8(&combined, preview_budget, preview_budget)
+        };
         let preview = format!(
-            "{preview_prefix}
-
-... (output truncated) ...
-
-[truncated - full output at: {}]",
+            "{head}\n\n... (output truncated) ...\n\n{tail}\n\n[truncated - full output at: {}]",
             log.as_deref().unwrap_or("")
         );
         (preview, log)
@@ -1561,10 +1703,7 @@ fn render_proc_output_as_terminal_result(
     };
 
     let prompt_text = format!(
-        "command: {command}
-exit: {}{}
-
-{text}",
+        "command: {command}\nexit: {}{}\n\n{text}",
         output.exit_code,
         if output.timed_out { " (timed out)" } else { "" }
     );
@@ -1577,9 +1716,11 @@ exit: {}{}
         "timed_out": output.timed_out,
         "termination_reason": termination_reason,
         "current_dir": cwd,
-        "truncated": output.capture_truncated || log_path.is_some(),
+        "truncated": output.capture_truncated || log_path.is_some() || needs_truncation,
         "output_file": log_path.unwrap_or_default(),
         "total_bytes": total_bytes,
+        "total_chars": total_chars,
+        "max_inline_chars": budget,
         "description": description.as_deref(),
         "has_output": has_output,
         "error": output.error,
@@ -2559,6 +2700,7 @@ mod tests {
             proc_output,
             "echo test",
             "C:/ws",
+            None,
             None,
         );
 
@@ -4195,4 +4337,180 @@ exit /b 1
         }
     }
 
+    #[test]
+    fn test_render_proc_output_custom_budget_and_tiny_clamping() {
+        let output = crate::run_proc::ProcOutput {
+            stdout: "HEADER_START_1234567890_MIDDLE_DATA_0987654321_FOOTER_END".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+            capture_truncated: false,
+            error: None,
+            termination_reason: None,
+        };
+
+        // Budget 30: head + tail preview with truncation marker
+        let res = render_proc_output_as_terminal_result(output, "echo test", "C:/ws", None, Some(30));
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("HEADER_START_"));
+        assert!(text.contains("FOOTER_END"));
+
+        let structured = res.structured.expect("structured");
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["max_inline_chars"], 30);
+        let out_file = structured["output_file"].as_str().unwrap();
+        assert!(!out_file.is_empty());
+        let _ = std::fs::remove_file(out_file);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_run_terminal_cmd_foreground_custom_max_inline_chars() {
+        let (_lock, _guard) = isolate_env("fg_budget");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+        let res = engine.call_tool("run_terminal_cmd", json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output ('START_' + ('X' * 5000) + '_END')\"",
+            "shell": "powershell",
+            "max_inline_chars": 80
+        })).await.unwrap();
+
+        assert!(!res.is_error);
+        let text = res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("START_"));
+        assert!(text.contains("_END"));
+
+        let structured = res.structured.expect("structured output");
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["max_inline_chars"], 80);
+
+        let out_file = structured["output_file"].as_str().expect("output_file");
+        assert!(!out_file.is_empty());
+        let log = fs::read_to_string(out_file).unwrap();
+        assert!(log.contains("START_"));
+        assert!(log.contains("_END"));
+        assert!(log.contains(&"X".repeat(5000)));
+        let _ = fs::remove_file(out_file);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_get_task_output_with_custom_max_inline_chars() {
+        let (_lock, _guard) = isolate_env("task_out_budget");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Start background task
+        let bg_res = engine.call_tool("run_terminal_cmd", json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'HEAD_MARKER_AAA'; [Console]::Out.Write(('BULK_DATA:' + [string][char]0x42) * 5000); Write-Output 'TAIL_MARKER_ZZZ'\"",
+            "description": "task output budget test",
+            "is_background": true
+        })).await.unwrap();
+
+        let bg_struct = bg_res.structured.unwrap();
+        let task_id = bg_struct["task_id"].as_str().unwrap();
+
+        // Wait with timeout_ms and custom max_inline_chars: 120
+        let out_res = engine.call_tool("get_task_output", json!({
+            "task_id": task_id,
+            "timeout_ms": 30000,
+            "max_inline_chars": 120
+        })).await.unwrap();
+
+        assert!(!out_res.is_error);
+        let text = out_res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("HEAD_MARKER_AAA"), "preview head must contain HEAD_MARKER_AAA");
+        assert!(text.contains("TAIL_MARKER_ZZZ"), "preview tail must contain TAIL_MARKER_ZZZ");
+        assert!(!text.contains("(no output)"), "must never contain contradictory (no output)");
+
+        let structured = out_res.structured.unwrap();
+        let result_obj = &structured["Result"];
+        assert_eq!(result_obj["task_id"], task_id);
+        assert_eq!(result_obj["has_output"], true);
+        assert_eq!(result_obj["truncated"], true);
+        assert_eq!(result_obj["max_inline_chars"], 120);
+
+        let total_bytes = result_obj["total_bytes"].as_u64().unwrap();
+        assert!(total_bytes > 50000);
+
+        let output_file = result_obj["output_file"].as_str().unwrap();
+        assert!(!output_file.is_empty());
+        let full_file = fs::read_to_string(output_file).unwrap();
+        assert!(full_file.contains("HEAD_MARKER_AAA"));
+        assert!(full_file.contains("TAIL_MARKER_ZZZ"));
+        assert!(full_file.contains("BULK_DATA:B"));
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_get_task_output_multibyte_vietnamese_and_emojis_budget() {
+        let (_lock, _guard) = isolate_env("task_out_vn_budget");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        let bg_res = engine.call_tool("run_terminal_cmd", json!({
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'XIN_CHÀO_VIỆT_NAM'; [Console]::Out.Write(('🦀🇻🇳' + [string][char]0x43) * 3000); Write-Output 'KẾT_THÚC_HOÀN_TẤT'\"",
+            "description": "multibyte task output budget test",
+            "is_background": true
+        })).await.unwrap();
+
+        let bg_struct = bg_res.structured.unwrap();
+        let task_id = bg_struct["task_id"].as_str().unwrap();
+
+        let out_res = engine.call_tool("get_task_output", json!({
+            "task_id": task_id,
+            "timeout_ms": 30000,
+            "max_inline_chars": 100
+        })).await.unwrap();
+
+        assert!(!out_res.is_error);
+        let text = out_res.content[0].text();
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("XIN_CHÀO_VIỆT_NAM"));
+        assert!(text.contains("KẾT_THÚC_HOÀN_TẤT"));
+
+        let structured = out_res.structured.unwrap();
+        let result_obj = &structured["Result"];
+        assert_eq!(result_obj["has_output"], true);
+        assert_eq!(result_obj["truncated"], true);
+        assert_eq!(result_obj["max_inline_chars"], 100);
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": task_id })).await;
+    }
+
+    #[tokio::test]
+    async fn test_tool_schema_includes_max_inline_chars() {
+        let (_lock, _guard) = isolate_env("schema_budget");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let engine = ToolEngine::new(ws_dir);
+        let tools = engine.list_tools().await.unwrap();
+
+        let run_cmd = tools.iter().find(|t| t["name"] == "run_command").unwrap();
+        assert!(run_cmd["inputSchema"]["properties"]["max_inline_chars"].is_object());
+        assert!(run_cmd["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+
+        let term_cmd = tools.iter().find(|t| t["name"] == "run_terminal_cmd").unwrap();
+        assert!(term_cmd["inputSchema"]["properties"]["max_inline_chars"].is_object());
+        assert!(term_cmd["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+
+        let task_out = tools.iter().find(|t| t["name"] == "get_task_output").unwrap();
+        assert!(task_out["inputSchema"]["properties"]["max_inline_chars"].is_object());
+        assert!(task_out["inputSchema"]["properties"]["max_inline_bytes"].is_object());
+    }
 }

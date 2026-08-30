@@ -18,11 +18,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// may inherit pipe handles, so we cannot wait indefinitely.
 const BOUNDED_DRAIN_TIMEOUT_MS: u64 = 500;
 
-/// Output character cap (bytes). Matching the terminal tool's bounded-output
+/// Output character cap (bytes/chars). Matching the terminal tool's bounded-output
 /// rule: the combined stdout+stderr response is bounded, and oversized
 /// output is persisted to a temp log file for later retrieval.
-const OUTPUT_BOUND: usize = 40_000;
-
+pub const OUTPUT_BOUND: usize = 40_000;
+pub const DEFAULT_OUTPUT_BOUND: usize = OUTPUT_BOUND;
+pub const MIN_INLINE_BUDGET: usize = 20;
+pub const MAX_INLINE_BUDGET: usize = 1_000_000;
 /// Hard cap on raw bytes buffered per stream before truncation. Prevents a
 /// runaway child from exhausting process memory while still capturing
 /// enough to persist a useful log.
@@ -353,6 +355,14 @@ pub fn input_schema() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": { "type": "string" },
                 "description": "Optional environment overrides applied to the child without rewriting argv."
+            },
+            "max_inline_chars": {
+                "type": "integer",
+                "description": "Optional per-call inline output budget in characters for head/tail preview truncation. Output exceeding this budget is truncated with head and tail retained, while full output is preserved in the output_file. Default: 40000."
+            },
+            "max_inline_bytes": {
+                "type": "integer",
+                "description": "Optional alias for max_inline_chars specifying the inline budget in bytes."
             }
         },
         "required": ["command"]
@@ -370,6 +380,68 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
+/// Resolve optional inline output budget parameter (chars/bytes) from tool arguments.
+/// Clamps between `MIN_INLINE_BUDGET` and `MAX_INLINE_BUDGET`.
+pub fn resolve_inline_budget(arguments: &serde_json::Value) -> Option<usize> {
+    let raw = arguments
+        .get("max_inline_chars")
+        .or_else(|| arguments.get("max_inline_bytes"))
+        .or_else(|| arguments.get("output_budget"));
+    let val = match raw {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v as usize),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<usize>().ok(),
+        _ => None,
+    };
+    val.map(|b| b.clamp(MIN_INLINE_BUDGET, MAX_INLINE_BUDGET))
+}
+
+/// Split `s` into (head, tail) substrings containing at most `max_chars` characters
+/// and at most `max_bytes` bytes total, safe at UTF-8 char boundaries.
+///
+/// Head contains up to half the budget and tail contains the remaining budget.
+pub fn truncate_head_tail_utf8(s: &str, max_chars: usize, max_bytes: usize) -> (String, String) {
+    if s.is_empty() || max_chars == 0 || max_bytes == 0 {
+        return (String::new(), String::new());
+    }
+    if s.len() <= max_bytes && s.chars().count() <= max_chars {
+        return (s.to_string(), String::new());
+    }
+
+    let head_target_chars = max_chars / 2;
+    let head_target_bytes = max_bytes / 2;
+
+    let mut head_end = 0;
+    let mut count = 0;
+    for (idx, ch) in s.char_indices() {
+        if count >= head_target_chars || idx + ch.len_utf8() > head_target_bytes {
+            break;
+        }
+        head_end = idx + ch.len_utf8();
+        count += 1;
+    }
+    let head = &s[..head_end];
+
+    let tail_target_chars = max_chars.saturating_sub(count);
+    let tail_target_bytes = max_bytes.saturating_sub(head_end);
+
+    let total_len = s.len();
+    let mut tail_start = total_len;
+    let mut tail_count = 0;
+    for (idx, _) in s.char_indices().rev() {
+        let byte_len_from_end = total_len - idx;
+        if tail_count >= tail_target_chars || byte_len_from_end > tail_target_bytes {
+            break;
+        }
+        tail_start = idx;
+        tail_count += 1;
+    }
+    if tail_start < head_end {
+        tail_start = head_end;
+    }
+    let tail = &s[tail_start..];
+
+    (head.to_string(), tail.to_string())
+}
 /// Persist the full captured output to a temp log file so the operator can
 /// retrieve what was truncated from the bounded tool response. Returns the
 /// log path on success.
@@ -477,43 +549,29 @@ fn render_tool_text(output: &ProcOutput) -> String {
     lines.join("\n")
 }
 
-fn render_bounded_tool_text(output: &ProcOutput, log_path: Option<&str>) -> String {
+pub fn render_bounded_tool_text(
+    output: &ProcOutput,
+    log_path: Option<&str>,
+    budget_opt: Option<usize>,
+) -> String {
     let full = render_tool_text(output);
-    if full.as_bytes().len() <= OUTPUT_BOUND {
+    let full_chars = full.chars().count();
+    let full_bytes = full.len();
+
+    let is_explicit_budget = budget_opt.is_some();
+    let budget = budget_opt.unwrap_or(OUTPUT_BOUND);
+
+    if !is_explicit_budget && full_bytes <= OUTPUT_BOUND {
         return full;
     }
-
-    let footer = match (log_path, output.capture_truncated) {
-        (Some(path), false) => {
-            format!("... (output truncated) ...\n[truncated - full output: {path}; use read_file]")
-        }
-        (Some(path), true) => format!(
-            "... (output truncated) ...\n[truncated - captured output: {path}; raw capture capped at {MAX_RAW_OUTPUT_BYTES} bytes; use read_file]"
-        ),
-        (None, _) => {
-            "... (output truncated) ...\n[truncated - full output log unavailable]".to_string()
-        }
-    };
+    if is_explicit_budget && full_chars <= budget && full_bytes <= budget {
+        return full;
+    }
 
     let mut fixed_before = Vec::new();
     if let Some(err) = &output.error {
         fixed_before.push(format!("error: {err}"));
     }
-    let mut fixed_after = vec![footer];
-    if output.timed_out {
-        fixed_after.push("timed out".to_string());
-    }
-    fixed_after.push(exit_line(output));
-
-    let fixed_bytes: usize = fixed_before
-        .iter()
-        .chain(fixed_after.iter())
-        .map(|part| part.as_bytes().len())
-        .sum();
-    // Reserve separators between all fixed parts plus the preview. Eight
-    // bytes is intentionally conservative and keeps the final response
-    // strictly within OUTPUT_BOUND even when every optional part is present.
-    let preview_budget = OUTPUT_BOUND.saturating_sub(fixed_bytes + 8);
 
     let mut stream_text = String::new();
     if !output.stdout.is_empty() {
@@ -526,16 +584,54 @@ fn render_bounded_tool_text(output: &ProcOutput, log_path: Option<&str>) -> Stri
         stream_text.push_str("stderr: ");
         stream_text.push_str(&output.stderr);
     }
-    let preview = truncate_utf8(&stream_text, preview_budget);
+
+    let footer_text = match (log_path, output.capture_truncated) {
+        (Some(path), false) => {
+            format!("[truncated - full output: {path}; use read_file]")
+        }
+        (Some(path), true) => format!(
+            "[truncated - captured output: {path}; raw capture capped at {MAX_RAW_OUTPUT_BYTES} bytes; use read_file]"
+        ),
+        (None, _) => {
+            "[truncated - full output log unavailable]".to_string()
+        }
+    };
+
+    let marker = "... (output truncated) ...";
+    let exit_str = exit_line(output);
+    let timed_out_str = if output.timed_out {
+        Some("timed out".to_string())
+    } else {
+        None
+    };
+
+    let (head, tail) = if is_explicit_budget {
+        truncate_head_tail_utf8(&stream_text, budget, budget.saturating_mul(4))
+    } else {
+        let fixed_bytes: usize = fixed_before.iter().map(|p| p.len()).sum::<usize>()
+            + marker.len()
+            + footer_text.len()
+            + exit_str.len()
+            + timed_out_str.as_ref().map_or(0, |s| s.len())
+            + 10;
+        let preview_bytes = OUTPUT_BOUND.saturating_sub(fixed_bytes).max(MIN_INLINE_BUDGET / 2);
+        truncate_head_tail_utf8(&stream_text, preview_bytes, preview_bytes)
+    };
 
     let mut parts = fixed_before;
-    if !preview.is_empty() {
-        parts.push(preview);
+    if !head.is_empty() {
+        parts.push(head);
     }
-    parts.extend(fixed_after);
-    let text = parts.join("\n");
-    debug_assert!(text.as_bytes().len() <= OUTPUT_BOUND);
-    text
+    parts.push(marker.to_string());
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts.push(footer_text);
+    if let Some(to) = timed_out_str {
+        parts.push(to);
+    }
+    parts.push(exit_str);
+    parts.join("\n")
 }
 
 /// Execute `run_command` from parsed MCP-like arguments and return the
@@ -597,18 +693,26 @@ pub async fn handle_call(
         }
     };
 
+    let budget_opt = resolve_inline_budget(arguments);
+    let budget = budget_opt.unwrap_or(OUTPUT_BOUND);
     let output = run_foreground(command, &args, workdir, timeout, env).await;
     let unbounded = render_tool_text(&output);
-    let (text, log_path) = if unbounded.as_bytes().len() > OUTPUT_BOUND {
+    let total_bytes = output.stdout.len() + output.stderr.len();
+    let total_chars = output.stdout.chars().count() + output.stderr.chars().count();
+    let has_output = !output.stdout.is_empty() || !output.stderr.is_empty();
+
+    let needs_truncation = if let Some(b) = budget_opt {
+        total_chars > b || total_bytes > b || unbounded.chars().count() > b || output.capture_truncated
+    } else {
+        unbounded.len() > OUTPUT_BOUND || output.capture_truncated
+    };
+
+    let (text, log_path) = if needs_truncation {
         let log_path = write_temp_log(&output.stdout, &output.stderr);
-        (render_bounded_tool_text(&output, log_path.as_deref()), log_path)
+        (render_bounded_tool_text(&output, log_path.as_deref(), budget_opt), log_path)
     } else {
         (unbounded, None)
     };
-
-    let has_output = !output.stdout.is_empty() || !output.stderr.is_empty();
-    let total_bytes = output.stdout.len() + output.stderr.len();
-
     let termination_reason = output.termination_reason.map(|r| r.as_str());
 
     let structured = serde_json::json!({
@@ -618,13 +722,14 @@ pub async fn handle_call(
         "exit_code": output.exit_code,
         "timed_out": output.timed_out,
         "termination_reason": termination_reason,
-        "truncated": output.capture_truncated || log_path.is_some(),
+        "truncated": output.capture_truncated || log_path.is_some() || needs_truncation,
         "has_output": has_output,
         "total_bytes": total_bytes,
+        "total_chars": total_chars,
+        "max_inline_chars": budget,
         "output_file": log_path,
         "error": output.error,
     });
-
     // Non-zero exit, timeout, and missing-executable are all distinct
     // outcomes. A child exiting non-zero or timing out is NOT an MCP
     // protocol error — only an unlaunchable process is.
@@ -2026,4 +2131,113 @@ mod tests {
         assert_eq!(timeout_res["structuredContent"]["termination_reason"], "timeout");
     }
 
+    #[test]
+    fn test_truncate_head_tail_utf8_ascii_and_multibyte() {
+        // ASCII
+        let s = "0123456789";
+        let (head, tail) = truncate_head_tail_utf8(s, 6, 6);
+        assert_eq!(head, "012");
+        assert_eq!(tail, "789");
+
+        // Multibyte Vietnamese
+        let vn = "Xin chào các bạn và Đại Ca!";
+        let (head, tail) = truncate_head_tail_utf8(vn, 10, 50);
+        assert_eq!(head.chars().count(), 5);
+        assert_eq!(tail.chars().count(), 5);
+        assert!(vn.starts_with(&head));
+        assert!(vn.ends_with(&tail));
+
+        // Multibyte Emojis
+        let emojis = "🦀🚀🎉🔥💻🌟✨🎯💡🤖";
+        let (head, tail) = truncate_head_tail_utf8(emojis, 4, 50);
+        assert_eq!(head, "🦀🚀");
+        assert_eq!(tail, "💡🤖");
+
+        // Edge cases
+        assert_eq!(truncate_head_tail_utf8("", 10, 10), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 0, 10), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 10, 0), (String::new(), String::new()));
+        assert_eq!(truncate_head_tail_utf8("abc", 10, 10), ("abc".to_string(), String::new()));
+    }
+
+    #[test]
+    fn test_resolve_inline_budget_clamping_and_types() {
+        assert_eq!(resolve_inline_budget(&serde_json::json!({})), None);
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 500 })), Some(500));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": "250" })), Some(250));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_bytes": 1000 })), Some(1000));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "output_budget": 800 })), Some(800));
+
+        // Clamping tiny budgets
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 0 })), Some(MIN_INLINE_BUDGET));
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 5 })), Some(MIN_INLINE_BUDGET));
+
+        // Clamping oversized budgets
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": 50_000_000 })), Some(MAX_INLINE_BUDGET));
+
+        // Invalid types fail safely to None
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": "invalid_number" })), None);
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": true })), None);
+        assert_eq!(resolve_inline_budget(&serde_json::json!({ "max_inline_chars": null })), None);
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_custom_max_inline_chars() {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let arguments = serde_json::json!({
+            "command": python,
+            "args": [
+                "-c",
+                "import sys; sys.stdout.write('HEAD_START_' + 'X' * 5000 + '_TAIL_END')"
+            ],
+            "max_inline_chars": 200
+        });
+
+        let result = handle_call(&arguments, None).await;
+        let text = result["content"][0]["text"].as_str().expect("content text");
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("HEAD_START_"), "preview head must contain HEAD_START_");
+        assert!(text.contains("_TAIL_END"), "preview tail must contain _TAIL_END");
+
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["max_inline_chars"], 200);
+        let total_chars = structured["total_chars"].as_u64().unwrap();
+        assert!(total_chars > 5000);
+
+        let out_file = structured["output_file"].as_str().expect("output_file in structured");
+        let full_log = std::fs::read_to_string(out_file).expect("log must be complete on disk");
+        assert!(full_log.contains("HEAD_START_"));
+        assert!(full_log.contains("_TAIL_END"));
+        assert!(full_log.contains(&"X".repeat(5000)));
+        let _ = std::fs::remove_file(out_file);
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_multibyte_vietnamese_head_tail_preservation() {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let arguments = serde_json::json!({
+            "command": python,
+            "args": [
+                "-c",
+                "import sys; sys.stdout.write('BẮT_ĐẦU_' + '🇻🇳' * 1000 + '_KẾT_THÚC')"
+            ],
+            "max_inline_chars": 150
+        });
+
+        let result = handle_call(&arguments, None).await;
+        let text = result["content"][0]["text"].as_str().expect("content text");
+        assert!(text.contains("... (output truncated) ..."));
+        assert!(text.contains("BẮT_ĐẦU_"));
+        assert!(text.contains("_KẾT_THÚC"));
+
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["has_output"], true);
+        assert_eq!(structured["max_inline_chars"], 150);
+
+        let out_file = structured["output_file"].as_str().expect("output_file");
+        let _ = std::fs::remove_file(out_file);
+    }
 }
