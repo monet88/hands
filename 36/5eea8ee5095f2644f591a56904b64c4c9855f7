@@ -1,0 +1,30 @@
+crate/src/service.rs
+  h_17f2fa2b92da6a 1,3-5,7-8,10,12-18,20-21,24-25,42-70,73-75,77,79-87,97-100,116,125,135,160,171,174-177,181-182,186-188,192-213,216-223,225-226
+crate/src/service/health.rs
+  h_17f2fa2b92da6a 1-70
+crate/src/service/platform/fallback.rs
+  h_17f2fa2b92da6a 1-39
+crate/src/service/platform/linux.rs
+  h_17f2fa2b92da6a 1-168
+crate/src/service/platform/macos.rs
+  h_17f2fa2b92da6a 1-250
+crate/src/service/platform/mod.rs
+  h_17f2fa2b92da6a 1-89
+crate/src/service/platform/unix.rs
+  h_17f2fa2b92da6a 1-76
+crate/src/service/platform/windows.rs
+  h_17f2fa2b92da6a 1-377
+crate/src/service/profile.rs
+  h_17f2fa2b92da6a 1-459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "365eea8ee5095f2644f591a56904b64c4c9855f7",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
