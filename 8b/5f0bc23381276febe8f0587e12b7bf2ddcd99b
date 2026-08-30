@@ -1,0 +1,14 @@
+crate/src/tool_engine.rs
+  h_17f2fa2b92da6a 816,818-820,843-849,891,893,895,961-1133,3728-3731,3733-3734,3736-3755,3757-3761,3763-3764,3766-3771,3774-3782,3787-3811,3813-3815,3821-3883,3885-3974,3977-3990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8b5f0bc23381276febe8f0587e12b7bf2ddcd99b",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
