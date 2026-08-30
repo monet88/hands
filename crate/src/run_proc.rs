@@ -264,6 +264,25 @@ where
     read_capped_pipe_shared(reader, capture).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    Timeout,
+    SpawnFailure,
+    WaitFailure,
+    OutputReadFailure,
+}
+
+impl TerminationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TerminationReason::Timeout => "timeout",
+            TerminationReason::SpawnFailure => "spawn_failure",
+            TerminationReason::WaitFailure => "wait_failure",
+            TerminationReason::OutputReadFailure => "output_read_failure",
+        }
+    }
+}
+
 /// Result of a foreground process execution.
 pub struct ProcOutput {
     pub stdout: String,
@@ -276,6 +295,8 @@ pub struct ProcOutput {
     /// Set when the process could not be spawned or wait() failed.
     /// NOT set for non-zero exit codes — those are a normal result.
     pub error: Option<String>,
+    /// Machine-readable termination reason when process execution did not exit normally.
+    pub termination_reason: Option<TerminationReason>,
 }
 
 pub const TOOL_NAME: &str = "run_command";
@@ -341,7 +362,7 @@ pub fn input_schema() -> serde_json::Value {
 /// Truncate `s` to at most `max_bytes` bytes at a UTF-8 char boundary.
 /// `String::truncate` panics if the index is not on a char boundary, so
 /// oversized multibyte output must be cut with this helper.
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -352,7 +373,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 /// Persist the full captured output to a temp log file so the operator can
 /// retrieve what was truncated from the bounded tool response. Returns the
 /// log path on success.
-fn write_temp_log(stdout: &str, stderr: &str) -> Option<String> {
+pub fn write_temp_log(stdout: &str, stderr: &str) -> Option<String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -578,18 +599,38 @@ pub async fn handle_call(
 
     let output = run_foreground(command, &args, workdir, timeout, env).await;
     let unbounded = render_tool_text(&output);
-    let text = if unbounded.as_bytes().len() > OUTPUT_BOUND {
+    let (text, log_path) = if unbounded.as_bytes().len() > OUTPUT_BOUND {
         let log_path = write_temp_log(&output.stdout, &output.stderr);
-        render_bounded_tool_text(&output, log_path.as_deref())
+        (render_bounded_tool_text(&output, log_path.as_deref()), log_path)
     } else {
-        unbounded
+        (unbounded, None)
     };
+
+    let has_output = !output.stdout.is_empty() || !output.stderr.is_empty();
+    let total_bytes = output.stdout.len() + output.stderr.len();
+
+    let termination_reason = output.termination_reason.map(|r| r.as_str());
+
+    let structured = serde_json::json!({
+        "command": command,
+        "args": args,
+        "workdir": workdir,
+        "exit_code": output.exit_code,
+        "timed_out": output.timed_out,
+        "termination_reason": termination_reason,
+        "truncated": output.capture_truncated || log_path.is_some(),
+        "has_output": has_output,
+        "total_bytes": total_bytes,
+        "output_file": log_path,
+        "error": output.error,
+    });
 
     // Non-zero exit, timeout, and missing-executable are all distinct
     // outcomes. A child exiting non-zero or timing out is NOT an MCP
     // protocol error — only an unlaunchable process is.
     serde_json::json!({
         "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
         "isError": output.error.is_some()
     })
 }
@@ -608,17 +649,25 @@ fn proc_output_from_captures(
     exit_code: i32,
     timed_out: bool,
     error: Option<String>,
+    reason: Option<TerminationReason>,
 ) -> ProcOutput {
     // A pipe read failure means the captured output may be incomplete even
     // when the child itself succeeded. Surface it rather than reporting a
     // clean run with truncated-looking output.
     let mut error = error;
+    let mut termination_reason = reason;
     if let Some(e) = stdout.read_error.or_else(|| stderr.read_error.clone()) {
         let msg = format!("output read failed: {e}");
         error = Some(match error {
             Some(existing) => format!("{existing}; {msg}"),
             None => msg,
         });
+        if termination_reason.is_none() && !timed_out {
+            termination_reason = Some(TerminationReason::OutputReadFailure);
+        }
+    }
+    if timed_out && termination_reason.is_none() {
+        termination_reason = Some(TerminationReason::Timeout);
     }
     ProcOutput {
         stdout: String::from_utf8_lossy(&stdout.bytes).to_string(),
@@ -627,6 +676,7 @@ fn proc_output_from_captures(
         timed_out,
         capture_truncated: stdout.truncated || stderr.truncated,
         error,
+        termination_reason,
     }
 }
 
@@ -766,6 +816,7 @@ pub async fn run_foreground(
                 timed_out: false,
                 capture_truncated: false,
                 error: Some(format!("failed to spawn: {e}")),
+                termination_reason: Some(TerminationReason::SpawnFailure),
             };
         }
     };
@@ -813,6 +864,7 @@ pub async fn run_foreground(
                 timed_out: false,
                 capture_truncated: false,
                 error: Some("failed to resume suspended process".to_string()),
+                termination_reason: Some(TerminationReason::SpawnFailure),
             };
         }
     }
@@ -899,16 +951,31 @@ async fn resolve_drain_result(
                     status.code().unwrap_or(-1),
                     false,
                     None,
+                    None,
                 ),
                 Ok(Err(e)) => {
                     let wait_error = format!("process wait failed: {e}");
                     terminate_tree(child, job, child_pid).await;
-                    proc_output_from_captures(stdout_cap, stderr_cap, -1, false, Some(wait_error))
+                    proc_output_from_captures(
+                        stdout_cap,
+                        stderr_cap,
+                        -1,
+                        false,
+                        Some(wait_error),
+                        Some(TerminationReason::WaitFailure),
+                    )
                 }
                 Err(_elapsed) => {
                     // Root process closed pipes but did not exit before deadline.
                     terminate_tree(child, job, child_pid).await;
-                    proc_output_from_captures(stdout_cap, stderr_cap, -1, true, None)
+                    proc_output_from_captures(
+                        stdout_cap,
+                        stderr_cap,
+                        -1,
+                        true,
+                        None,
+                        Some(TerminationReason::Timeout),
+                    )
                 }
             }
         }
@@ -926,6 +993,7 @@ async fn resolve_drain_result(
                 -1,
                 false,
                 Some("pipe drain task failed".to_string()),
+                Some(TerminationReason::OutputReadFailure),
             )
         }
         Err(_elapsed) => {
@@ -940,7 +1008,14 @@ async fn resolve_drain_result(
                 BOUNDED_DRAIN_TIMEOUT_MS,
             )
             .await;
-            proc_output_from_captures(stdout_cap, stderr_cap, -1, true, None)
+            proc_output_from_captures(
+                stdout_cap,
+                stderr_cap,
+                -1,
+                true,
+                None,
+                Some(TerminationReason::Timeout),
+            )
         }
     }
 }
@@ -1896,4 +1971,59 @@ mod tests {
         let end = rest.find("; use read_file]")?;
         Some(std::path::PathBuf::from(&rest[..end]))
     }
+    #[tokio::test]
+    async fn test_termination_reason_structured_outcomes() {
+        let (echo_cmd, echo_args) = platform_echo(&["TERMINATION_REASON_OK"]);
+        let normal_call = serde_json::json!({
+            "command": echo_cmd,
+            "args": echo_args
+        });
+        let normal_res = handle_call(&normal_call, None).await;
+        assert_eq!(normal_res["isError"], false);
+        assert_eq!(normal_res["structuredContent"]["exit_code"], 0);
+        assert_eq!(normal_res["structuredContent"]["timed_out"], false);
+        assert_eq!(normal_res["structuredContent"]["termination_reason"], serde_json::Value::Null);
+
+        // Non-zero child exit remains a normal outcome (termination_reason: null, isError: false)
+        let (exit_cmd, exit_args) = if cfg!(windows) {
+            ("cmd.exe".to_string(), vec!["/c".to_string(), "exit 42".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "exit 42".to_string()])
+        };
+        let nonzero_call = serde_json::json!({
+            "command": exit_cmd,
+            "args": exit_args
+        });
+        let nonzero_res = handle_call(&nonzero_call, None).await;
+        assert_eq!(nonzero_res["isError"], false);
+        assert_eq!(nonzero_res["structuredContent"]["exit_code"], 42);
+        assert_eq!(nonzero_res["structuredContent"]["timed_out"], false);
+        assert_eq!(nonzero_res["structuredContent"]["termination_reason"], serde_json::Value::Null);
+
+        // Spawn failure -> termination_reason: "spawn_failure", isError: true
+        let spawn_fail_call = serde_json::json!({
+            "command": "nonexistent_executable_12345_xyz"
+        });
+        let spawn_fail_res = handle_call(&spawn_fail_call, None).await;
+        assert_eq!(spawn_fail_res["isError"], true);
+        assert_eq!(spawn_fail_res["structuredContent"]["exit_code"], -1);
+        assert_eq!(spawn_fail_res["structuredContent"]["termination_reason"], "spawn_failure");
+
+        // Timeout -> termination_reason: "timeout", timed_out: true, isError: false
+        let (sleep_cmd, sleep_args) = if cfg!(windows) {
+            ("powershell.exe".to_string(), vec!["-NoProfile".to_string(), "-Command".to_string(), "Start-Sleep -Seconds 5".to_string()])
+        } else {
+            ("sleep".to_string(), vec!["5".to_string()])
+        };
+        let timeout_call = serde_json::json!({
+            "command": sleep_cmd,
+            "args": sleep_args,
+            "timeout": 300
+        });
+        let timeout_res = handle_call(&timeout_call, None).await;
+        assert_eq!(timeout_res["isError"], false);
+        assert_eq!(timeout_res["structuredContent"]["timed_out"], true);
+        assert_eq!(timeout_res["structuredContent"]["termination_reason"], "timeout");
+    }
+
 }

@@ -88,6 +88,21 @@ pub fn workspace_file() -> PathBuf {
     config_dir().join("workspace")
 }
 
+pub fn workspace_generation_file() -> PathBuf {
+    config_dir().join("workspace_generation")
+}
+
+pub fn current_workspace_generation() -> String {
+    migrate_from_legacy();
+    if let Ok(gen_str) = std::fs::read_to_string(workspace_generation_file()) {
+        let trimmed = gen_str.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "gen_0".to_string()
+}
+
 /// Resolve the unambiguous native Windows command processor (`cmd.exe`).
 /// Avoids PATH shadowing from third-party scripts or executables named `cmd`.
 pub fn native_cmd_exe() -> Result<PathBuf, String> {
@@ -135,6 +150,58 @@ where
                 .join(", ");
             format!("native Windows cmd.exe not found; tried: {tried}")
         })
+}
+
+/// Locate Git for Windows Bash runtime deterministically.
+pub fn find_git_bash() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::new();
+        if let Some(prog_files) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(prog_files.clone()).join(r"Git\bin\bash.exe"));
+            candidates.push(PathBuf::from(prog_files).join(r"Git\usr\bin\bash.exe"));
+        }
+        if let Some(prog_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            candidates.push(PathBuf::from(prog_files_x86.clone()).join(r"Git\bin\bash.exe"));
+            candidates.push(PathBuf::from(prog_files_x86).join(r"Git\usr\bin\bash.exe"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data.clone()).join(r"Programs\Git\bin\bash.exe"));
+            candidates.push(PathBuf::from(local_app_data).join(r"Programs\Git\usr\bin\bash.exe"));
+        }
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+
+        if let Some(git_exe) = crate::service::which("git") {
+            if let Some(git_dir) = git_exe.parent() {
+                candidates.push(git_dir.join("bash.exe"));
+                if let Some(parent) = git_dir.parent() {
+                    candidates.push(parent.join(r"bin\bash.exe"));
+                    candidates.push(parent.join(r"usr\bin\bash.exe"));
+                }
+            }
+        }
+
+        for candidate in &candidates {
+            if candidate.is_file() {
+                return Ok(candidate.clone());
+            }
+        }
+
+        let tried = candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("Git for Windows Bash not found; tried: {tried}"))
+    }
+    #[cfg(not(windows))]
+    {
+        crate::service::which("bash")
+            .or_else(|| crate::service::which("sh"))
+            .ok_or_else(|| "bash not found in PATH".to_string())
+    }
 }
 
 /// Read User Environment PATH from Windows registry `HKCU\Environment\Path`.
@@ -334,8 +401,43 @@ pub fn pin_workspace(dir: &Path) -> Result<PathBuf, String> {
     let cwd = dunce::canonicalize(dir).map_err(|e| format!("canonicalize: {e}"))?;
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    std::fs::write(workspace_file(), format!("{}\n", cwd.display()))
-        .map_err(|e| format!("write workspace pin: {e}"))?;
+
+    let prev_gen = std::fs::read(workspace_generation_file()).ok();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let new_gen = format!("gen_{now}_{}", std::process::id());
+
+    // 1. Write generation file first: if this fails, workspace_file is completely untouched
+    if let Err(e) = std::fs::write(workspace_generation_file(), format!("{new_gen}
+")) {
+        return Err(format!("write workspace generation: {e}"));
+    }
+
+    // 2. Write workspace pin file: if this fails, rollback generation file and report any secondary error
+    if let Err(e) = std::fs::write(workspace_file(), format!("{}
+", cwd.display())) {
+        let mut rollback_err = None;
+        match prev_gen {
+            Some(prev) => {
+                if let Err(re) = std::fs::write(workspace_generation_file(), prev) {
+                    rollback_err = Some(format!("failed to restore generation: {re}"));
+                }
+            }
+            None => {
+                if let Err(re) = std::fs::remove_file(workspace_generation_file()) {
+                    rollback_err = Some(format!("failed to remove generation: {re}"));
+                }
+            }
+        }
+        if let Some(r_err) = rollback_err {
+            return Err(format!("write workspace pin: {e} (rollback failed: {r_err})"));
+        }
+        return Err(format!("write workspace pin: {e}"));
+    }
+
     Ok(cwd)
 }
 
@@ -1108,5 +1210,46 @@ mod tests {
         let _ = kill_res;
 
         let _ = std::fs::remove_dir_all(&temp_ws);
+    }
+    #[test]
+    fn test_pin_workspace_generation_failure_rolls_back_and_fails_closed() {
+        let (_env_lock, env_guard) = isolate_env("pin_gen_fail");
+        let ws1 = env_guard.root.join("ws1");
+        let ws2 = env_guard.root.join("ws2");
+        std::fs::create_dir_all(&ws1).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+
+        // 1. Initially pin ws1 successfully
+        let pinned1 = pin_workspace(&ws1).expect("initial pin of ws1 should succeed");
+        assert_eq!(pinned1, dunce::canonicalize(&ws1).unwrap());
+        let initial_gen = current_workspace_generation();
+
+        // 2. Make workspace_generation path a directory so writing to it will fail deterministically
+        let gen_file = workspace_generation_file();
+        let _ = std::fs::remove_file(&gen_file);
+        std::fs::create_dir_all(&gen_file).expect("create dir at generation file path");
+
+        // 3. Attempting to pin ws2 must fail closed
+        let pin_err = pin_workspace(&ws2);
+        assert!(pin_err.is_err(), "pin_workspace must fail when generation write fails");
+        let err_msg = pin_err.unwrap_err();
+        assert!(err_msg.contains("write workspace generation"), "error should describe generation write failure: {err_msg}");
+
+        // 4. Workspace pin file was never touched, so read_pinned_workspace() is still ws1 immediately without manual repair
+        let current_pin = read_pinned_workspace();
+        assert_eq!(current_pin, Some(dunce::canonicalize(&ws1).unwrap()), "workspace pin must remain ws1 after generation write failure");
+
+        // 5. Clean up the blocking directory and verify normal pinning (including A->B->A) works
+        let _ = std::fs::remove_dir_all(&gen_file);
+        let pinned2 = pin_workspace(&ws2).expect("pin ws2 after restoring gen path");
+        assert_eq!(pinned2, dunce::canonicalize(&ws2).unwrap());
+        let gen_ws2 = current_workspace_generation();
+        assert_ne!(gen_ws2, initial_gen);
+
+        let pinned1_again = pin_workspace(&ws1).expect("re-pin ws1 (A->B->A)");
+        assert_eq!(pinned1_again, dunce::canonicalize(&ws1).unwrap());
+        let gen_ws1_again = current_workspace_generation();
+        assert_ne!(gen_ws1_again, gen_ws2);
+        assert_ne!(gen_ws1_again, initial_gen, "A->B->A must generate a new unique generation");
     }
 }

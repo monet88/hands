@@ -106,10 +106,11 @@ impl McpHost {
             },
             "instructions": format!(
                 "Hands: unofficial local coding tools for ChatGPT. No model. \
-                 Workspace is set on the machine with `hands use` or the config UI. \
+                 Workspace pin is the default context and safety anchor for relative paths and default commands, not a filesystem sandbox. \
+                 Explicit absolute paths and explicit working directories may be used across multiple repositories without repinning. \
                  Call workspace_info first (now {}). \
                  Then read_file/grep/glob/list_dir, write/search_replace/apply_patch to edit, \
-                 todo_write for plans, run_terminal_cmd to test (background + kill_task/get_task_output). \
+                 todo_write for plans, run_terminal_cmd (supports optional shell selector powershell/cmd/git-bash) or run_command to test. \
                  After each edit, rerun the failing check.",
                 self.engine.workspace().display()
             ),
@@ -472,5 +473,215 @@ mod tests {
         assert_eq!(http_resp["result"]["isError"], false);
 
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_mcp_tools_call_multi_task_structured_output_contract() {
+        let (_lock, _guard) = isolate_env("mcp_multi_task_structured");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let start_large = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_terminal_cmd",
+                    "arguments": {
+                        "command": "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write(('MCP_MULTI_A:' + [string][char]0x41) * 60000); Write-Output 'MCP_MULTI_TAIL'\"",
+                        "description": "MCP multi-result large output",
+                        "is_background": true
+                    }
+                }
+            }))
+            .await
+            .expect("large background start response");
+        assert_eq!(start_large["result"]["isError"], false);
+        let large_task_id = start_large["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .expect("large task id")
+            .to_string();
+
+        let start_small = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_terminal_cmd",
+                    "arguments": {
+                        "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'MCP_MULTI_SMALL'\"",
+                        "description": "MCP multi-result small output",
+                        "is_background": true
+                    }
+                }
+            }))
+            .await
+            .expect("small background start response");
+        assert_eq!(start_small["result"]["isError"], false);
+        let small_task_id = start_small["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .expect("small task id")
+            .to_string();
+
+        let output = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_task_output",
+                    "arguments": {
+                        "task_ids": [large_task_id, small_task_id],
+                        "timeout_ms": 30000
+                    }
+                }
+            }))
+            .await
+            .expect("multi task output response");
+
+        let result = &output["result"];
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("backward-compatible text content");
+        assert!(text.contains("=== Multi-wait"));
+
+        let results = result["structuredContent"]["MultiResult"]["results"]
+            .as_array()
+            .expect("structured MultiResult results");
+        assert_eq!(results.len(), 2);
+        for task in results {
+            assert_eq!(task["has_output"], true, "task must explicitly report retained output");
+            assert!(
+                task["total_bytes"].as_u64().unwrap_or(0) > 0,
+                "task must expose total output bytes"
+            );
+        }
+
+        let large = results
+            .iter()
+            .find(|task| task["task_id"] == large_task_id)
+            .expect("large task result");
+        assert_eq!(large["truncated"], true);
+        assert!(
+            !large["output_file"].as_str().unwrap_or("").is_empty(),
+            "truncated task must expose retrievable output_file"
+        );
+    }
+    #[tokio::test]
+    async fn test_mcp_tools_call_foreground_terminal_structured_output_contract() {
+        let (_lock, _guard) = isolate_env("mcp_foreground_structured");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let output = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_terminal_cmd",
+                    "arguments": {
+                        "command": "echo MCP_FOREGROUND_STRUCTURED",
+                        "description": "MCP foreground structured contract"
+                    }
+                }
+            }))
+            .await
+            .expect("foreground terminal response");
+
+        let result = &output["result"];
+        assert_eq!(result["isError"], false);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MCP_FOREGROUND_STRUCTURED"),
+            "existing model-facing text must be preserved"
+        );
+
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["type"], "Bash");
+        assert_eq!(structured["exit_code"], 0);
+        assert_eq!(structured["timed_out"], false);
+        assert_eq!(structured["has_output"], true);
+        assert!(structured["total_bytes"].as_u64().unwrap_or(0) > 0);
+        assert!(structured["current_dir"].as_str().is_some());
+        assert!(structured.get("truncated").is_some());
+        assert!(structured.get("output_file").is_some());
+        assert!(structured.get("signal").is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_mcp_tools_call_cancellation_is_structured() {
+        let (_lock, _guard) = isolate_env("mcp_cancellation_structured");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let started = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 24,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_terminal_cmd",
+                    "arguments": {
+                        "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"",
+                        "description": "MCP cancellation structured contract",
+                        "is_background": true
+                    }
+                }
+            }))
+            .await
+            .expect("background start response");
+        assert_eq!(started["result"]["isError"], false);
+        let task_id = started["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .expect("background task id")
+            .to_string();
+
+        let killed = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "tools/call",
+                "params": {
+                    "name": "kill_task",
+                    "arguments": { "task_id": task_id }
+                }
+            }))
+            .await
+            .expect("kill response");
+        assert_eq!(killed["result"]["isError"], false);
+        assert_eq!(
+            killed["result"]["structuredContent"]["Result"]["outcome"],
+            "killed"
+        );
+
+        let after = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 26,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_task_output",
+                    "arguments": { "task_id": task_id, "timeout_ms": 5000 }
+                }
+            }))
+            .await
+            .expect("post-cancel output response");
+        assert_eq!(after["result"]["isError"], false);
+        assert_eq!(
+            after["result"]["structuredContent"]["Result"]["status"],
+            "cancelled",
+            "caller must distinguish cancellation without parsing prompt text"
+        );
     }
 }
