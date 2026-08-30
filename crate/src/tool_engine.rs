@@ -5,6 +5,7 @@
 //! Workspace generation tracking, explicit shell selection, and
 //! execution/result/error shaping.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,8 +23,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
     "glob",
     "get_task_output",
+    "list_terminal_tasks",
 ];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallResult {
     pub content: Vec<ToolContent>,
@@ -110,11 +111,22 @@ impl ToolCallResult {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskExecMeta {
+    pub execution_mode: String,
+    pub yielded: bool,
+    pub pid: Option<u32>,
+    pub owner_session_id: Option<String>,
+    pub description: Option<String>,
+    pub cwd: Option<String>,
+}
+
 pub struct ToolEngine {
     fallback_cwd: PathBuf,
     cached: Mutex<Option<(PathBuf, ToolBridge)>>,
     call_seq: AtomicU64,
     acknowledged_generation: Mutex<Option<String>>,
+    task_metadata: Mutex<HashMap<String, TaskExecMeta>>,
 }
 
 impl ToolEngine {
@@ -124,7 +136,25 @@ impl ToolEngine {
             cached: Mutex::new(None),
             call_seq: AtomicU64::new(1),
             acknowledged_generation: Mutex::new(None),
+            task_metadata: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub async fn record_task_meta(&self, task_id: &str, meta: TaskExecMeta) {
+        let mut map = self.task_metadata.lock().await;
+        map.insert(task_id.to_string(), meta);
+    }
+
+    pub async fn update_task_yielded(&self, task_id: &str, yielded: bool) {
+        let mut map = self.task_metadata.lock().await;
+        if let Some(meta) = map.get_mut(task_id) {
+            meta.yielded = yielded;
+        }
+    }
+
+    pub async fn get_all_task_meta(&self) -> HashMap<String, TaskExecMeta> {
+        let map = self.task_metadata.lock().await;
+        map.clone()
     }
 
     pub fn workspace(&self) -> PathBuf {
@@ -201,6 +231,37 @@ impl ToolEngine {
             }
         })];
         tools.push(crate::run_proc::tool_json());
+        tools.push(json!({
+            "name": "list_terminal_tasks",
+            "description": "List recoverable terminal task snapshots (running, completed, auto-yielded, and background) for the active session. Returns task identifiers, execution status, process ID, runtime duration, retained output files, and execution mode.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter: 'all', 'running', 'completed', 'failed', 'cancelled', 'timed_out'. Default: 'all'.",
+                        "enum": ["all", "running", "completed", "failed", "cancelled", "timed_out"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of task snapshots to return. Default: 50. Max: 200."
+                    },
+                    "owner_session_id": {
+                        "type": "string",
+                        "description": "Optional owner session ID to filter task snapshots for session isolation."
+                    },
+                    "include_output": {
+                        "type": "boolean",
+                        "description": "Optional flag to include a short output preview in each task snapshot. Default: false."
+                    }
+                }
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            }
+        }));
         let defs = self.bridge().await?.tool_definitions().await;
         tools.extend(defs.into_iter().map(|d| {
             let name = d.function.name;
@@ -298,6 +359,10 @@ impl ToolEngine {
             });
             return Ok(ToolCallResult::structured(prompt_text, structured, false));
         }
+        if name == "list_terminal_tasks" {
+            return self.handle_list_terminal_tasks(arguments).await;
+        }
+
 
         if name == crate::run_proc::TOOL_NAME {
             let ws = self.workspace();
@@ -406,6 +471,19 @@ impl ToolEngine {
                             (task_id, output_file, pid)
                         }
                     };
+                    self.record_task_meta(
+                        &task_id,
+                        TaskExecMeta {
+                            execution_mode: "auto".to_string(),
+                            yielded: false,
+                            pid,
+                            owner_session_id: arguments.get("owner_session_id").and_then(Value::as_str).map(str::to_string),
+                            description: description.clone(),
+                            cwd: Some(cwd_str.clone()),
+                        },
+                    )
+                    .await;
+
 
                     let poll_call_id = format!("mcp-{}", self.call_seq.fetch_add(1, Ordering::Relaxed));
                     let poll_args = json!({
@@ -416,6 +494,7 @@ impl ToolEngine {
                     let poll_result = match bridge.call("get_task_output", poll_args, &poll_call_id).await {
                         Ok(r) => r,
                         Err(_) => {
+                            self.update_task_yielded(&task_id, true).await;
                             let prompt_text = format!(
                                 "[Command yielded to background after {yield_after_ms}ms. Process is still running with task_id: {task_id}]\nUse get_task_output with task_id=\"{task_id}\" to inspect subsequent output or status."
                             );
@@ -505,6 +584,7 @@ impl ToolEngine {
                             "pid": pid,
                         });
 
+                        self.update_task_yielded(&task_id, false).await;
                         return Ok(ToolCallResult {
                             content: vec![ToolContent::Text { text: prompt_text }],
                             structured: Some(structured),
@@ -541,6 +621,7 @@ impl ToolEngine {
                             "pid": pid,
                         });
 
+                        self.update_task_yielded(&task_id, true).await;
                         return Ok(ToolCallResult {
                             content: vec![ToolContent::Text { text: prompt_text }],
                             structured: Some(structured),
@@ -579,6 +660,20 @@ impl ToolEngine {
                     }
                     match bridge.call(name, bg_arguments, &call_id).await {
                         Ok(result) => {
+                            if let ToolOutput::BackgroundTaskStarted(b) = &result.output {
+                                self.record_task_meta(
+                                    &b.task_id,
+                                    TaskExecMeta {
+                                        execution_mode: "background".to_string(),
+                                        yielded: false,
+                                        pid: b.pid,
+                                        owner_session_id: arguments.get("owner_session_id").and_then(Value::as_str).map(str::to_string),
+                                        description: description.clone(),
+                                        cwd: Some(cwd_str.clone()),
+                                    },
+                                )
+                                .await;
+                            }
                             let mut prompt_text = result.prompt_text;
                             let structured = shape_structured_output(&result.output, &mut prompt_text);
                             let is_error = result.output.is_error();
@@ -678,6 +773,183 @@ impl ToolEngine {
             }
             Err(e) => Ok(ToolCallResult::text(e.to_string(), true)),
         }
+    }
+
+    async fn handle_list_terminal_tasks(&self, arguments: Value) -> Result<ToolCallResult, String> {
+        let bridge = self.bridge().await?;
+        let all_meta = self.get_all_task_meta().await;
+        let raw_snapshots = bridge.list_tasks().await.unwrap_or_default();
+
+        let status_filter = arguments
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("all")
+            .to_ascii_lowercase();
+
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|l| (l as usize).clamp(1, 200))
+            .unwrap_or(50);
+
+        let filter_owner = arguments
+            .get("owner_session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let include_output = arguments
+            .get("include_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut tasks = Vec::new();
+
+        for snap in raw_snapshots {
+            let meta = all_meta.get(&snap.task_id);
+
+            let task_owner = snap
+                .owner_session_id
+                .as_deref()
+                .or_else(|| meta.and_then(|m| m.owner_session_id.as_deref()));
+
+            // Owner isolation: if caller specified an owner, ignore tasks belonging to a different owner
+            if let Some(req_owner) = filter_owner {
+                if let Some(owner) = task_owner {
+                    if owner != req_owner {
+                        continue;
+                    }
+                }
+            }
+
+            let status = if snap.completed {
+                if snap.explicitly_killed {
+                    "cancelled"
+                } else if snap.signal.as_deref() == Some("timeout") {
+                    "timed_out"
+                } else if snap.exit_code == Some(0) {
+                    "completed"
+                } else {
+                    "failed"
+                }
+            } else {
+                "running"
+            };
+
+            if status_filter != "all" && status != status_filter {
+                continue;
+            }
+
+            let pid = meta.and_then(|m| m.pid);
+            let command = snap.display_command.clone().unwrap_or_else(|| snap.command.clone());
+            let description = snap.description.clone().or_else(|| meta.as_ref().and_then(|m| m.description.clone()));
+            let cwd = if snap.cwd.is_empty() {
+                meta.as_ref().and_then(|m| m.cwd.clone()).unwrap_or_else(|| self.workspace().to_string_lossy().to_string())
+            } else {
+                snap.cwd.clone()
+            };
+
+            let started = xai_grok_tools::types::process_manager::format_system_time_rfc3339(snap.start_time);
+            let ended = snap.end_time.map(xai_grok_tools::types::process_manager::format_system_time_rfc3339);
+            let duration_secs = (snap.duration_secs() * 100.0).round() / 100.0;
+
+            let output_total_bytes = snap.output_total_bytes.max(snap.output.len());
+            let has_output = output_total_bytes > 0 || !snap.output.is_empty();
+
+            let execution_mode = meta
+                .map(|m| m.execution_mode.clone())
+                .unwrap_or_else(|| if snap.is_backgrounded { "background".to_string() } else { "foreground".to_string() });
+            let is_auto_yielded = meta.map(|m| m.yielded).unwrap_or(false);
+
+            let mut item = json!({
+                "task_id": snap.task_id,
+                "status": status,
+                "command": command,
+                "description": description,
+                "cwd": cwd,
+                "pid": pid,
+                "started": started,
+                "ended": ended,
+                "duration_secs": duration_secs,
+                "exit_code": snap.exit_code,
+                "signal": snap.signal,
+                "output_file": snap.output_file.to_string_lossy().to_string(),
+                "output_total_bytes": output_total_bytes,
+                "truncated": snap.truncated,
+                "has_output": has_output,
+                "execution_mode": execution_mode,
+                "is_auto_yielded": is_auto_yielded,
+                "is_background": snap.is_backgrounded || meta.is_some(),
+                "owner_session_id": task_owner,
+            });
+
+            if include_output {
+                let preview = if snap.output.len() > 1000 {
+                    format!("{}... (truncated)", &snap.output[..1000])
+                } else {
+                    snap.output.clone()
+                };
+                item["output_preview"] = json!(preview);
+            }
+
+            tasks.push(item);
+        }
+
+        let total_count = tasks.len();
+        let running_count = tasks.iter().filter(|t| t["status"] == "running").count();
+        let completed_count = total_count - running_count;
+
+        // Apply limit
+        if tasks.len() > limit {
+            tasks.truncate(limit);
+        }
+
+        let prompt_text = if total_count == 0 {
+            "No terminal tasks found.".to_string()
+        } else {
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "Found {total_count} terminal task(s) ({running_count} running, {completed_count} completed, showing {}):",
+                tasks.len()
+            ));
+            for t in &tasks {
+                let tid = t["task_id"].as_str().unwrap_or("");
+                let st = t["status"].as_str().unwrap_or("");
+                let dur = t["duration_secs"].as_f64().unwrap_or(0.0);
+                let mode = t["execution_mode"].as_str().unwrap_or("unknown");
+                let yielded_flag = if t["is_auto_yielded"].as_bool().unwrap_or(false) {
+                    " [auto-yielded]"
+                } else {
+                    ""
+                };
+                let pid_str = match t.get("pid").and_then(Value::as_u64) {
+                    Some(p) => format!("PID {p}"),
+                    None => "PID N/A".to_string(),
+                };
+                let label = t["description"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| t["command"].as_str().unwrap_or(""));
+                let cwd_str = t["cwd"].as_str().unwrap_or("");
+                let out_file = t["output_file"].as_str().unwrap_or("");
+                let bytes = t["output_total_bytes"].as_u64().unwrap_or(0);
+
+                lines.push(format!(
+                    "- [{tid}] {st} ({pid_str}, mode: {mode}{yielded_flag}, elapsed: {dur}s): {label}\n  cwd: {cwd_str}\n  output_file: {out_file} ({bytes} bytes)\n  hint: get_task_output(task_id=\"{tid}\") | kill_task(task_id=\"{tid}\")"
+                ));
+            }
+            lines.join("\n")
+        };
+
+        let structured = json!({
+            "tasks": tasks,
+            "total_count": total_count,
+            "running_count": running_count,
+            "completed_count": completed_count,
+            "limit": limit,
+        });
+
+        Ok(ToolCallResult::structured(prompt_text, structured, false))
     }
 }
 
@@ -918,7 +1190,7 @@ fn is_path_absolute(path_str: &str) -> bool {
 
 fn is_context_dependent_call(tool_name: &str, arguments: &Value) -> bool {
     match tool_name {
-        "workspace_info" | "get_task_output" | "kill_task" => false,
+        "workspace_info" | "get_task_output" | "kill_task" | "list_terminal_tasks" => false,
         "run_command" => {
             if let Some(workdir) = arguments.get("workdir").and_then(Value::as_str) {
                 !is_path_absolute(workdir)
@@ -3091,6 +3363,470 @@ exit /b 1
         assert!(short_struct.get("pid").is_some(), "PID field must be present in structured output");
         let short_content = fs::read_to_string(&short_marker).expect("read short marker");
         assert_eq!(short_content.matches("SHORT_UNIX_ONCE").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_terminal_tasks_schema_and_read_only_hint() {
+        let (_lock, _guard) = isolate_env("list_term_tasks_schema");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir);
+        let tools = engine.list_tools().await.expect("list_tools should succeed");
+
+        let list_tool = tools
+            .iter()
+            .find(|t| t["name"] == "list_terminal_tasks")
+            .expect("list_terminal_tasks must be registered");
+
+        assert_eq!(
+            list_tool["annotations"]["readOnlyHint"],
+            true,
+            "list_terminal_tasks must have readOnlyHint: true"
+        );
+        assert_eq!(
+            list_tool["annotations"]["destructiveHint"],
+            false,
+            "list_terminal_tasks must not be destructive"
+        );
+
+        let props = list_tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties object");
+        assert!(props.contains_key("status"), "schema must include 'status'");
+        assert!(props.contains_key("limit"), "schema must include 'limit'");
+        assert!(props.contains_key("owner_session_id"), "schema must include 'owner_session_id'");
+        assert!(props.contains_key("include_output"), "schema must include 'include_output'");
+
+        // Empty listing when no tasks have been started
+        let res = engine
+            .call_tool("list_terminal_tasks", json!({}))
+            .await
+            .expect("call list_terminal_tasks should succeed");
+        assert!(!res.is_error);
+        assert!(res.content[0].text().contains("No terminal tasks found"));
+        let structured = res.structured.expect("must return structured output");
+        assert_eq!(structured["total_count"], 0);
+        assert_eq!(structured["running_count"], 0);
+        assert_eq!(structured["completed_count"], 0);
+        assert_eq!(structured["tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_list_terminal_tasks_running_completed_yielded_and_continuity_windows() {
+        let (_lock, _guard) = isolate_env("list_tasks_win");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. Start an explicit background task (long sleep)
+        let bg_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"",
+                    "description": "explicit background sleep task",
+                    "is_background": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!bg_res.is_error);
+        let bg_struct = bg_res.structured.unwrap();
+        let bg_task_id = bg_struct["task_id"].as_str().unwrap().to_string();
+
+        // 2. Start an auto-yield task that exceeds budget and yields to background
+        let auto_yield_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"",
+                    "description": "auto-yielded long sleep task",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!auto_yield_res.is_error);
+        let auto_yield_struct = auto_yield_res.structured.unwrap();
+        assert_eq!(auto_yield_struct["status"], "running");
+        assert_eq!(auto_yield_struct["yielded"], true);
+        let auto_task_id = auto_yield_struct["task_id"].as_str().unwrap().to_string();
+
+        // 3. Start an auto task that completes within budget
+        let auto_done_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output 'QUICK_DONE'\"",
+                    "description": "quick completed auto task",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!auto_done_res.is_error);
+        let auto_done_struct = auto_done_res.structured.unwrap();
+        assert_eq!(auto_done_struct["status"], "completed");
+        assert_eq!(auto_done_struct["yielded"], false);
+
+        // 4. Query list_terminal_tasks
+        let list_res = engine
+            .call_tool("list_terminal_tasks", json!({ "include_output": true }))
+            .await
+            .unwrap();
+        assert!(!list_res.is_error);
+        let list_struct = list_res.structured.expect("structured output");
+        let tasks = list_struct["tasks"].as_array().expect("tasks array");
+
+        // Should contain at least 3 tasks
+        assert!(tasks.len() >= 3, "expected at least 3 tasks, got {}", tasks.len());
+        assert!(list_struct["total_count"].as_u64().unwrap() >= 3);
+        assert!(list_struct["running_count"].as_u64().unwrap() >= 2);
+
+        // Verify prompt_text format and hints
+        let prompt = list_res.content[0].text();
+        assert!(prompt.contains(&bg_task_id));
+        assert!(prompt.contains(&auto_task_id));
+        assert!(prompt.contains("get_task_output"));
+        assert!(prompt.contains("kill_task"));
+
+        // Verify explicit background task item
+        let bg_item = tasks.iter().find(|t| t["task_id"] == bg_task_id).expect("bg task in list");
+        assert_eq!(bg_item["status"], "running");
+        assert_eq!(bg_item["execution_mode"], "background");
+        assert_eq!(bg_item["is_auto_yielded"], false);
+        assert_eq!(bg_item["is_background"], true);
+        assert!(bg_item["output_file"].as_str().unwrap().len() > 0);
+        assert!(bg_item.get("pid").is_some());
+
+        // Verify auto-yielded task item
+        let auto_item = tasks.iter().find(|t| t["task_id"] == auto_task_id).expect("auto task in list");
+        assert_eq!(auto_item["status"], "running");
+        assert_eq!(auto_item["execution_mode"], "auto");
+        assert_eq!(auto_item["is_auto_yielded"], true);
+        assert!(auto_item["output_file"].as_str().unwrap().len() > 0);
+
+        // 5. Test continuity: get_task_output and kill_task using task_id from list
+        let out_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &bg_task_id, "timeout_ms": 1000 }),
+            )
+            .await
+            .unwrap();
+        assert!(!out_res.is_error);
+
+        let kill_res = engine
+            .call_tool("kill_task", json!({ "task_id": &bg_task_id }))
+            .await
+            .unwrap();
+        assert!(!kill_res.is_error);
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": &auto_task_id })).await;
+
+        // After kill, list_terminal_tasks should show the killed task as cancelled
+        let after_kill_res = engine
+            .call_tool("list_terminal_tasks", json!({}))
+            .await
+            .unwrap();
+        let after_kill_struct = after_kill_res.structured.unwrap();
+        let after_tasks = after_kill_struct["tasks"].as_array().unwrap();
+        let bg_after = after_tasks.iter().find(|t| t["task_id"] == bg_task_id).unwrap();
+        assert!(
+            bg_after["status"] == "cancelled" || bg_after["status"] == "failed" || bg_after["status"] == "completed",
+            "killed task must transition to terminal status: {}",
+            bg_after["status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_terminal_tasks_owner_isolation_and_no_cross_leak() {
+        let (_lock, _guard) = isolate_env("list_owner_iso");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Simulate registering metadata for session_alpha and session_beta
+        engine
+            .record_task_meta(
+                "task_alpha_1",
+                TaskExecMeta {
+                    execution_mode: "auto".to_string(),
+                    yielded: true,
+                    pid: Some(1111),
+                    owner_session_id: Some("session_alpha".to_string()),
+                    description: Some("Alpha Task".to_string()),
+                    cwd: Some(ws_dir.to_string_lossy().to_string()),
+                },
+            )
+            .await;
+
+        engine
+            .record_task_meta(
+                "task_beta_1",
+                TaskExecMeta {
+                    execution_mode: "background".to_string(),
+                    yielded: false,
+                    pid: Some(2222),
+                    owner_session_id: Some("session_beta".to_string()),
+                    description: Some("Beta Task".to_string()),
+                    cwd: Some(ws_dir.to_string_lossy().to_string()),
+                },
+            )
+            .await;
+
+        // Query scoped to session_alpha
+        let res_alpha = engine
+            .call_tool(
+                "list_terminal_tasks",
+                json!({ "owner_session_id": "session_alpha" }),
+            )
+            .await
+            .unwrap();
+        assert!(!res_alpha.is_error);
+        let alpha_struct = res_alpha.structured.unwrap();
+        let alpha_tasks = alpha_struct["tasks"].as_array().unwrap();
+        for t in alpha_tasks {
+            if let Some(owner) = t.get("owner_session_id").and_then(Value::as_str) {
+                assert_eq!(
+                    owner, "session_alpha",
+                    "cross-owner leak detected: found task owned by {owner}"
+                );
+            }
+        }
+
+        // Query scoped to session_beta
+        let res_beta = engine
+            .call_tool(
+                "list_terminal_tasks",
+                json!({ "owner_session_id": "session_beta" }),
+            )
+            .await
+            .unwrap();
+        assert!(!res_beta.is_error);
+        let beta_struct = res_beta.structured.unwrap();
+        let beta_tasks = beta_struct["tasks"].as_array().unwrap();
+        for t in beta_tasks {
+            if let Some(owner) = t.get("owner_session_id").and_then(Value::as_str) {
+                assert_eq!(
+                    owner, "session_beta",
+                    "cross-owner leak detected: found task owned by {owner}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_list_terminal_tasks_bounded_and_status_filtering() {
+        let (_lock, _guard) = isolate_env("list_bound_filt");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Spawn 3 background tasks
+        for i in 1..=3 {
+            let _ = engine
+                .call_tool(
+                    "run_terminal_cmd",
+                    json!({
+                        "command": "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"",
+                        "description": format!("bounded test sleep {i}"),
+                        "is_background": true
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Test limit = 2
+        let bound_res = engine
+            .call_tool("list_terminal_tasks", json!({ "limit": 2 }))
+            .await
+            .unwrap();
+        assert!(!bound_res.is_error);
+        let bound_struct = bound_res.structured.unwrap();
+        let tasks = bound_struct["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2, "limit of 2 must be respected");
+        assert!(bound_struct["total_count"].as_u64().unwrap() >= 3);
+        assert_eq!(bound_struct["limit"], 2);
+
+        // Test status filtering: running
+        let running_res = engine
+            .call_tool("list_terminal_tasks", json!({ "status": "running" }))
+            .await
+            .unwrap();
+        assert!(!running_res.is_error);
+        let running_struct = running_res.structured.unwrap();
+        for t in running_struct["tasks"].as_array().unwrap() {
+            assert_eq!(t["status"], "running");
+        }
+
+        // Clean up spawned tasks
+        for t in running_struct["tasks"].as_array().unwrap() {
+            if let Some(tid) = t["task_id"].as_str() {
+                let _ = engine.call_tool("kill_task", json!({ "task_id": tid })).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_list_terminal_tasks_running_completed_yielded_and_continuity_unix() {
+        let (_lock, _guard) = isolate_env("list_tasks_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // 1. Start an explicit background task (long sleep)
+        let bg_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sleep 30",
+                    "description": "explicit background sleep unix",
+                    "is_background": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!bg_res.is_error);
+        let bg_struct = bg_res.structured.unwrap();
+        let bg_task_id = bg_struct["task_id"].as_str().unwrap().to_string();
+
+        // 2. Start an auto-yield task that exceeds budget and yields to background
+        let auto_yield_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "sleep 30",
+                    "description": "auto-yielded long sleep unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 300
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!auto_yield_res.is_error);
+        let auto_yield_struct = auto_yield_res.structured.unwrap();
+        assert_eq!(auto_yield_struct["status"], "running");
+        assert_eq!(auto_yield_struct["yielded"], true);
+        let auto_task_id = auto_yield_struct["task_id"].as_str().unwrap().to_string();
+
+        // 3. Start an auto task that completes within budget
+        let auto_done_res = engine
+            .call_tool(
+                "run_terminal_cmd",
+                json!({
+                    "command": "echo 'QUICK_DONE_UNIX'",
+                    "description": "quick completed auto task unix",
+                    "execution_mode": "auto",
+                    "yield_after_ms": 10000
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!auto_done_res.is_error);
+        let auto_done_struct = auto_done_res.structured.unwrap();
+        assert_eq!(auto_done_struct["status"], "completed");
+        assert_eq!(auto_done_struct["yielded"], false);
+
+        // 4. Query list_terminal_tasks
+        let list_res = engine
+            .call_tool("list_terminal_tasks", json!({ "include_output": true }))
+            .await
+            .unwrap();
+        assert!(!list_res.is_error);
+        let list_struct = list_res.structured.expect("structured output");
+        let tasks = list_struct["tasks"].as_array().expect("tasks array");
+
+        assert!(tasks.len() >= 3, "expected at least 3 tasks, got {}", tasks.len());
+        assert!(list_struct["total_count"].as_u64().unwrap() >= 3);
+        assert!(list_struct["running_count"].as_u64().unwrap() >= 2);
+
+        let prompt = list_res.content[0].text();
+        assert!(prompt.contains(&bg_task_id));
+        assert!(prompt.contains(&auto_task_id));
+        assert!(prompt.contains("get_task_output"));
+        assert!(prompt.contains("kill_task"));
+
+        // 5. Test continuity: get_task_output and kill_task
+        let out_res = engine
+            .call_tool(
+                "get_task_output",
+                json!({ "task_id": &bg_task_id, "timeout_ms": 1000 }),
+            )
+            .await
+            .unwrap();
+        assert!(!out_res.is_error);
+
+        let kill_res = engine
+            .call_tool("kill_task", json!({ "task_id": &bg_task_id }))
+            .await
+            .unwrap();
+        assert!(!kill_res.is_error);
+
+        let _ = engine.call_tool("kill_task", json!({ "task_id": &auto_task_id })).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_list_terminal_tasks_bounded_and_status_filtering_unix() {
+        let (_lock, _guard) = isolate_env("list_bound_filt_unix");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+        let engine = ToolEngine::new(ws_dir.clone());
+
+        // Spawn 3 background tasks
+        for i in 1..=3 {
+            let _ = engine
+                .call_tool(
+                    "run_terminal_cmd",
+                    json!({
+                        "command": "sleep 30",
+                        "description": format!("bounded test sleep {i}"),
+                        "is_background": true
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let bound_res = engine
+            .call_tool("list_terminal_tasks", json!({ "limit": 2 }))
+            .await
+            .unwrap();
+        assert!(!bound_res.is_error);
+        let bound_struct = bound_res.structured.unwrap();
+        let tasks = bound_struct["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2, "limit of 2 must be respected");
+        assert!(bound_struct["total_count"].as_u64().unwrap() >= 3);
+        assert_eq!(bound_struct["limit"], 2);
+
+        let running_res = engine
+            .call_tool("list_terminal_tasks", json!({ "status": "running" }))
+            .await
+            .unwrap();
+        assert!(!running_res.is_error);
+        let running_struct = running_res.structured.unwrap();
+        for t in running_struct["tasks"].as_array().unwrap() {
+            assert_eq!(t["status"], "running");
+        }
+
+        for t in running_struct["tasks"].as_array().unwrap() {
+            if let Some(tid) = t["task_id"].as_str() {
+                let _ = engine.call_tool("kill_task", json!({ "task_id": tid })).await;
+            }
+        }
     }
 
 }
