@@ -187,11 +187,13 @@ function Validate-ChatGPTEvidence {
             source_git_sha = $HeadSha
             connected_via_chatgpt_web = $true
             scan_succeeded = $true
-            tool_names = @("workspace_info", "read_file", "write", "run_terminal_cmd", "get_task_output", "kill_task")
+            tool_names = @("workspace_info", "read_file", "write", "run_terminal_cmd", "run_command", "get_task_output", "kill_task")
             workspace_info_text = "workspace: <intended workspace>`nsource_git_sha: $HeadSha"
             read_file_ok = $true
             write_ok = $true
             foreground_ok = $true
+            foreground_structured_output_ok = $true
+            native_structured_output_ok = $true
             background_task_id = "<task id returned by ChatGPT Hands call>"
             background_output_ordered = $true
             kill_task_ok = $true
@@ -225,6 +227,8 @@ function Validate-ChatGPTEvidence {
         "read_file_ok",
         "write_ok",
         "foreground_ok",
+        "foreground_structured_output_ok",
+        "native_structured_output_ok",
         "background_output_ordered",
         "kill_task_ok",
         "orca_status_ready",
@@ -340,15 +344,41 @@ try {
     $mutation = Get-Content -Path (Join-Path $script:TestWs $mutationRel) -Raw
     if ($mutation -notmatch "HANDS_E2E_MUTATION_OK") { throw "write mutation did not land in intended workspace." }
 
-    Write-Host "`n[4/9] Foreground terminal..."
-    $foreground = Invoke-McpTool "run_terminal_cmd" @{
-        command = 'powershell.exe -NoProfile -NonInteractive -Command "Write-Output E2E_FG_1; Write-Output E2E_FG_2; exit 0"'
-        description = "Windows E2E foreground"
+    Write-Host "`n[4/9] Foreground + native structured output..."
+    $foregroundResult = Invoke-McpRpc "tools/call" @{
+        name = "run_terminal_cmd"
+        arguments = @{
+            command = 'powershell.exe -NoProfile -NonInteractive -Command "Write-Output E2E_FG_1; Write-Output E2E_FG_2; exit 0"'
+            description = "Windows E2E foreground"
+        }
     }
+    if ($foregroundResult.isError -eq $true) {
+        throw "Foreground terminal returned isError=true: $(Get-McpText $foregroundResult)"
+    }
+    $foreground = Get-McpText $foregroundResult
     Assert-TerminalSuccess $foreground "foreground terminal"
     $fg1 = $foreground.IndexOf("E2E_FG_1")
     $fg2 = $foreground.IndexOf("E2E_FG_2")
     if ($fg1 -lt 0 -or $fg2 -le $fg1) { throw "Foreground output order was not preserved: $foreground" }
+    $foregroundStructured = [string]$foregroundResult.structuredContent.output
+    if ($foregroundStructured -notmatch "E2E_FG_1" -or $foregroundStructured -notmatch "E2E_FG_2") {
+        throw "Foreground structuredContent.output omitted command output: $($foregroundResult.structuredContent | ConvertTo-Json -Depth 10 -Compress)"
+    }
+
+    $nativeResult = Invoke-McpRpc "tools/call" @{
+        name = "run_command"
+        arguments = @{
+            command = "cmd.exe"
+            args = @("/d", "/c", "echo E2E_NATIVE_STRUCTURED")
+        }
+    }
+    if ($nativeResult.isError -eq $true) {
+        throw "Native run_command returned isError=true: $(Get-McpText $nativeResult)"
+    }
+    $nativeStructured = [string]$nativeResult.structuredContent.output
+    if ($nativeStructured -notmatch "E2E_NATIVE_STRUCTURED") {
+        throw "run_command structuredContent.output omitted command output: $($nativeResult.structuredContent | ConvertTo-Json -Depth 10 -Compress)"
+    }
 
     Write-Host "`n[5/9] Unrelated tunnel-client.exe fixture..."
     $script:ControlDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hands_e2e_control_" + [guid]::NewGuid().ToString("N"))

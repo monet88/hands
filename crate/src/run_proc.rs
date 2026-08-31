@@ -446,6 +446,52 @@ pub fn truncate_head_tail_utf8(s: &str, max_chars: usize, max_bytes: usize) -> (
 
     (head.to_string(), tail.to_string())
 }
+
+/// Build a model-visible command-stream preview that stays inside both the
+/// character and byte budgets. Truncation metadata is part of the preview
+/// budget rather than appended after the fact, so structured MCP content
+/// cannot grow beyond the requested/default inline bound.
+pub fn render_output_preview(
+    raw: &str,
+    output_file: Option<&str>,
+    force_truncated: bool,
+    max_chars: usize,
+    max_bytes: usize,
+) -> (String, bool) {
+    if !force_truncated && raw.chars().count() <= max_chars && raw.len() <= max_bytes {
+        return (raw.to_string(), false);
+    }
+
+    const MARKER: &str = "\n\n... (output truncated) ...\n\n";
+    let footer = output_file
+        .filter(|path| !path.is_empty())
+        .map(|path| format!("\n\n[truncated - full output at: {path}]"))
+        .unwrap_or_default();
+    let fixed_chars = MARKER.chars().count() + footer.chars().count();
+    let fixed_bytes = MARKER.len() + footer.len();
+
+    // Normal command paths have ample room for the marker/footer. Keep a
+    // deterministic bounded fallback for pathological tiny budgets or an
+    // unusually long retained-output path.
+    if fixed_chars >= max_chars || fixed_bytes >= max_bytes {
+        let fallback = if footer.is_empty() {
+            "... (output truncated) ...".to_string()
+        } else {
+            format!("... (output truncated) ...{footer}")
+        };
+        let bounded = truncate_utf8(&fallback, max_bytes);
+        let bounded = bounded.chars().take(max_chars).collect::<String>();
+        return (bounded, true);
+    }
+
+    let preview_chars = max_chars - fixed_chars;
+    let preview_bytes = max_bytes - fixed_bytes;
+    let (head, tail) = truncate_head_tail_utf8(raw, preview_chars, preview_bytes);
+    let preview = format!("{head}{MARKER}{tail}{footer}");
+    debug_assert!(preview.chars().count() <= max_chars);
+    debug_assert!(preview.len() <= max_bytes);
+    (preview, true)
+}
 /// Persist the full captured output to a temp log file so the operator can
 /// retrieve what was truncated from the bounded tool response. Returns the
 /// log path on success.
@@ -684,6 +730,20 @@ pub async fn handle_call(
     let has_output = !output.stdout.is_empty() || !output.stderr.is_empty();
     let total_bytes = output.stdout.len() + output.stderr.len();
     let termination_reason = output.termination_reason.map(|r| r.as_str());
+    let mut stream_output = output.stdout.clone();
+    if !output.stderr.is_empty() {
+        if !stream_output.is_empty() {
+            stream_output.push('\n');
+        }
+        stream_output.push_str(&output.stderr);
+    }
+    let (structured_output, _) = render_output_preview(
+        &stream_output,
+        log_path.as_deref(),
+        output.capture_truncated || log_path.is_some(),
+        OUTPUT_BOUND,
+        OUTPUT_BOUND,
+    );
 
     let structured = serde_json::json!({
         "command": command,
@@ -696,6 +756,7 @@ pub async fn handle_call(
         "has_output": has_output,
         "total_bytes": total_bytes,
         "output_file": log_path,
+        "output": structured_output,
         "error": output.error,
     });
     // outcomes. A child exiting non-zero or timing out is NOT an MCP
@@ -1660,6 +1721,46 @@ mod tests {
             "raw output should exceed bound, len={}",
             output.stdout.len()
         );
+    }
+
+    #[test]
+    fn test_render_output_preview_bounds_ascii_utf8_and_small_output() {
+        let short = "xin chào 👋";
+        let (preview, truncated) = render_output_preview(short, None, false, 128, 128);
+        assert_eq!(preview, short);
+        assert!(!truncated);
+
+        let large_ascii = format!("HEAD{}TAIL", "X".repeat(OUTPUT_BOUND + 2048));
+        let (preview, truncated) = render_output_preview(
+            &large_ascii,
+            Some("/ws/full.log"),
+            false,
+            OUTPUT_BOUND,
+            OUTPUT_BOUND,
+        );
+        assert!(truncated);
+        assert!(preview.len() <= OUTPUT_BOUND);
+        assert!(preview.chars().count() <= OUTPUT_BOUND);
+        assert!(preview.starts_with("HEAD"));
+        assert!(preview.contains("... (output truncated) ..."));
+        assert!(preview.contains("[truncated - full output at: /ws/full.log]"));
+        assert!(preview.contains("TAIL"));
+
+        let large_utf8 = format!("ĐẦU{}CUỐI", "Việt🚀".repeat(10_000));
+        let (preview, truncated) = render_output_preview(
+            &large_utf8,
+            Some("/ws/utf8.log"),
+            false,
+            2048,
+            4096,
+        );
+        assert!(truncated);
+        assert!(preview.chars().count() <= 2048);
+        assert!(preview.len() <= 4096);
+        assert!(preview.starts_with("ĐẦU"));
+        assert!(preview.contains("... (output truncated) ..."));
+        assert!(preview.contains("[truncated - full output at: /ws/utf8.log]"));
+        assert!(preview.contains("CUỐI"));
     }
 
     #[tokio::test]

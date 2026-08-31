@@ -610,11 +610,69 @@ mod tests {
         assert_eq!(structured["exit_code"], 0);
         assert_eq!(structured["timed_out"], false);
         assert_eq!(structured["has_output"], true);
+        assert!(
+            structured["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MCP_FOREGROUND_STRUCTURED"),
+            "ChatGPT-visible structured output must include the foreground sentinel"
+        );
         assert!(structured["total_bytes"].as_u64().unwrap_or(0) > 0);
         assert!(structured["current_dir"].as_str().is_some());
         assert!(structured.get("truncated").is_some());
         assert!(structured.get("output_file").is_some());
         assert!(structured.get("signal").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tools_call_run_command_structured_output_is_model_visible() {
+        let (_lock, _guard) = isolate_env("mcp_run_command_structured_output");
+        let ws_dir = _guard.root.join("ws");
+        fs::create_dir_all(&ws_dir).expect("create ws");
+        let host = McpHost::new(ws_dir);
+
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe", json!(["/d", "/c", "echo MCP_RUN_COMMAND_STRUCTURED"]))
+        } else {
+            ("sh", json!(["-c", "printf 'MCP_RUN_COMMAND_STRUCTURED\\n'"]))
+        };
+
+        let output = host
+            .handle_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 24,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_command",
+                    "arguments": {
+                        "command": command,
+                        "args": args
+                    }
+                }
+            }))
+            .await
+            .expect("run_command response");
+
+        let result = &output["result"];
+        assert_eq!(result["isError"], false);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MCP_RUN_COMMAND_STRUCTURED"),
+            "backward-compatible content text must keep the native sentinel"
+        );
+        let structured_output = result["structuredContent"]["output"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            structured_output.contains("MCP_RUN_COMMAND_STRUCTURED"),
+            "ChatGPT-visible structured output must include the native sentinel"
+        );
+        assert!(
+            !structured_output.contains("exit:"),
+            "structured output should expose command stream text only; exit metadata already has dedicated fields"
+        );
     }
 
     #[tokio::test]

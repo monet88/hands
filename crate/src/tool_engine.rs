@@ -1587,9 +1587,10 @@ fn shape_structured_output_with_budget(
                     }
 
                     bash.insert("output_for_prompt".to_string(), json!(&*prompt_text));
-                    bash.insert("output".to_string(), json!(preview_raw.as_bytes()));
+                    bash.insert("output".to_string(), json!(preview_raw));
                 } else {
                     bash.insert("truncated".to_string(), json!(false));
+                    bash.insert("output".to_string(), json!(raw_output_str));
                 }
             } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
                 if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
@@ -1747,6 +1748,20 @@ fn shape_structured_output_with_budget(
                 let total_bytes = bash.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
                 let has_output = total_bytes > 0 || !prompt_text.is_empty();
                 bash.insert("has_output".to_string(), json!(has_output));
+                if let ToolOutput::Bash(b) = output {
+                    let raw_output = String::from_utf8_lossy(&b.output).into_owned();
+                    let previously_truncated = bash.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                    let output_file = bash.get("output_file").and_then(Value::as_str);
+                    let (preview, truncated) = crate::run_proc::render_output_preview(
+                        &raw_output,
+                        output_file,
+                        previously_truncated,
+                        crate::run_proc::OUTPUT_BOUND,
+                        crate::run_proc::OUTPUT_BOUND,
+                    );
+                    bash.insert("truncated".to_string(), json!(truncated));
+                    bash.insert("output".to_string(), json!(preview));
+                }
             } else if bash.get("type").and_then(Value::as_str) == Some("TaskOutput") {
                 if let Some(res) = bash.get_mut("Result").and_then(Value::as_object_mut) {
                     let raw_bytes = res.get("raw_output_bytes").and_then(Value::as_u64).unwrap_or(0);
@@ -1854,6 +1869,7 @@ fn render_proc_output_as_terminal_result(
         "total_bytes": total_bytes,
         "description": description,
         "has_output": has_output,
+        "output": text.clone(),
         "error": output.error,
     });
 
@@ -3014,6 +3030,14 @@ exit /b 1
         assert_eq!(auto_struct["type"], fg_struct["type"]);
         assert_eq!(auto_struct["exit_code"], fg_struct["exit_code"]);
         assert_eq!(auto_struct["has_output"], fg_struct["has_output"]);
+        assert!(
+            auto_struct["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("AUTO_SHORT_PAYLOAD"),
+            "auto-short structured output must expose the completed command sentinel"
+        );
+        assert_eq!(auto_struct["output"], fg_struct["output"]);
         assert_eq!(auto_struct.get("Result"), None, "auto-short must not wrap in TaskOutput Result");
 
         // 2. Explicit shell: compare auto-short directly against ordinary foreground with shell
@@ -4961,10 +4985,8 @@ Exit Code: 0
         assert!(prompt_text.contains("[truncated - full output at: /ws/bash_test.log]"));
         assert_eq!(structured["output_for_prompt"].as_str().unwrap(), prompt_text.as_str());
 
-        // 3. Structured output is bounded command-output bytes and does NOT contain the exit header
-        let struct_output_bytes = structured["output"].as_array().unwrap();
-        let struct_output_vec: Vec<u8> = struct_output_bytes.iter().map(|v| v.as_u64().unwrap() as u8).collect();
-        let struct_output_str = String::from_utf8(struct_output_vec).unwrap();
+        // 3. Structured output is bounded model-visible command text and does NOT contain the exit header
+        let struct_output_str = structured["output"].as_str().unwrap();
         assert!(!struct_output_str.starts_with("exit: 0"), "structured output must not be polluted with exit header");
         assert!(struct_output_str.contains("... (output truncated) ..."));
         assert!(struct_output_str.contains("[truncated - full output at: /ws/bash_test.log]"));
@@ -5023,6 +5045,13 @@ Exit Code: 0
         assert_eq!(shaped_bash["has_output"], true);
         assert!(shaped_bash.get("max_inline_chars").is_none());
         assert!(shaped_bash.get("total_chars").is_none());
+        let shaped_output = shaped_bash["output"].as_str().expect("model-visible output string");
+        assert!(
+            shaped_output.as_bytes().len() <= crate::run_proc::OUTPUT_BOUND,
+            "omitted-budget structured output must stay within the default output bound"
+        );
+        assert!(shaped_output.contains("... (output truncated) ..."));
+        assert!(shaped_output.contains("[truncated - full output at: /ws/out.log]"));
 
         // 3. shape_structured_output_with_budget with None on TaskOutput Result
         let task_json = json!({
@@ -5195,8 +5224,9 @@ Exit Code: 0
         assert!(struct_prompt.contains("... (output truncated) ..."));
         assert!(struct_prompt.len() < 1000, "structured output_for_prompt must be bounded");
 
-        let struct_bytes = struct_content["output"].as_array().unwrap();
-        assert!(struct_bytes.len() < 1000, "structured output byte array must be bounded");
+        let struct_output = struct_content["output"].as_str().unwrap();
+        assert!(struct_output.len() < 1000, "structured output text must be bounded");
+        assert!(struct_output.contains("... (output truncated) ..."));
 
         // Total serialized size of ToolCallResult must be strictly bounded (< 2500 bytes)
         let serialized_json = serde_json::to_string(&val).unwrap();
