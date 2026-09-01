@@ -36,6 +36,30 @@ Canonical 5-role triage vocabulary (`needs-triage`, `needs-info`, `ready-for-age
 
 Single-context layout (`CONTEXT.md` + `docs/adr/`). See `docs/agents/domain.md`.
 
+## Architecture & Anti-Overengineering Guardrails
+
+To maintain high reliability, sub-millisecond responsiveness, and avoid stability issues (502 timeouts, socket hangs, supervisor collisions):
+
+### 1. Direct Upstream Bridge First (No Middleman Tool Engines)
+- Rely directly on `xai_grok_tools::bridge::ToolBridge` for tool execution.
+- NEVER build custom multi-thousand-line virtual tool engines, AST parsers, or intermediate routing abstractions. Delegate directly to upstream.
+
+### 2. External Process Management (Zero In-Process Daemons)
+- Hands is a lean CLI/MCP binary, NOT a system daemon.
+- Process lifecycle, environment injection, and tunnel supervision are managed strictly via external scripts (`start-hands.bat` / `.ps1` or OS startup scripts).
+- NEVER implement in-process background health pollers, Task Scheduler supervisors, or auto-restart loops inside Rust.
+
+### 3. Non-Blocking Stdio & Minimal Process Invocations
+- Keep JSON-RPC `stdin`/`stdout` streams non-blocking, direct, and flushed immediately.
+- Avoid low-level OS process hijacking (e.g., Windows Job Objects / `AssignProcessToJobObject` or complex asynchronous pipe draining loops). Use standard `std::process` / `tokio::process`.
+
+### 4. The Ponytail Ladder (Strict YAGNI & Minimal Code)
+- Always follow: YAGNI → Upstream Crate → Stdlib → Minimal code.
+- No speculative abstractions, no unrequested middleware. Keep diffs as small as possible.
+
+### 5. Static, Clean Configs
+- Keep tunnel and profile configs (`hands.yaml`) static and clean. Never introduce redundant escape quotes (`"\"...\""`) that break YAML/Go parsers.
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
