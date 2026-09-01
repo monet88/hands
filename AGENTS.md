@@ -38,70 +38,53 @@ Single-context layout (`CONTEXT.md` + `docs/adr/`). See `docs/agents/domain.md`.
 
 ## Architecture & Anti-Overengineering Guardrails
 
-To maintain high reliability, sub-millisecond responsiveness, and avoid stability issues (502 timeouts, socket hangs, supervisor collisions):
+Hands should stay a thin CLI/MCP adapter around upstream capabilities. Prefer the smallest reliable change that preserves the direct execution path; do not add architecture for failures that have not been reproduced.
 
-### 1. Direct Upstream Bridge First (No Middleman Tool Engines)
-- Rely directly on `xai_grok_tools::bridge::ToolBridge` for tool execution.
-- NEVER build custom multi-thousand-line virtual tool engines, AST parsers, or intermediate routing abstractions. Delegate directly to upstream.
+### 1. ToolBridge-first execution
+- Keep MCP -> `xai_grok_tools::bridge::ToolBridge` as the default tool-execution path.
+- Reuse existing repository and upstream behavior before adding adapters.
+- Add a narrow tool-specific adapter only when a demonstrated requirement cannot be satisfied through the existing bridge/upstream surface. Do not introduce a second general execution engine, router, or orchestration layer.
 
-### 2. External Process Management (Zero In-Process Daemons)
-- Hands is a lean CLI/MCP binary, NOT a system daemon.
-- Process lifecycle, environment injection, and tunnel supervision are managed strictly via external scripts (`start-hands.bat` / `.ps1` or OS startup scripts).
-- NEVER implement in-process background health pollers, Task Scheduler supervisors, or auto-restart loops inside Rust.
+### 2. External supervision, lean Hands process
+- Long-lived supervision belongs to OS/external mechanisms such as `launchd`, `systemd`, Windows launcher/startup scripts, and `tunnel-client`, not to a watchdog loop inside the Hands process.
+- Rust may configure or invoke those external integrations, but Hands must not become an in-process restart/health daemon unless an explicit, reproduced requirement cannot be met externally.
+- Keep lifecycle and environment ownership at clear process boundaries; do not duplicate supervision state inside the MCP command path.
 
-### 3. Non-Blocking Stdio & Minimal Process Invocations
-- Keep JSON-RPC `stdin`/`stdout` streams non-blocking, direct, and flushed immediately.
-- Avoid low-level OS process hijacking (e.g., Windows Job Objects / `AssignProcessToJobObject` or complex asynchronous pipe draining loops). Use standard `std::process` / `tokio::process`.
+### 3. Standard process primitives first
+- Prefer upstream behavior plus `std::process` / `tokio::process` for child execution and lifecycle management.
+- Add platform-specific process control only when a red-capable regression proves direct-child handling is insufficient, and keep that remediation at the narrowest owning seam.
+- Keep the MCP protocol path direct and responsive: do not repurpose MCP stdio for child I/O or add polling/coordinator middleware merely to emulate synchronous execution.
 
-### 4. The Ponytail Ladder (Strict YAGNI & Minimal Code)
-- Always follow: YAGNI → Upstream Crate → Stdlib → Minimal code.
-- No speculative abstractions, no unrequested middleware. Keep diffs as small as possible.
-
-### 5. Static, Clean Configs
-- Keep tunnel and profile configs (`hands.yaml`) static and clean. Never introduce redundant escape quotes (`"\"...\""`) that break YAML/Go parsers.
+### 4. Ponytail ladder
+- Choose implementations in this order: YAGNI -> existing repo/upstream -> stdlib/runtime -> native platform feature -> existing dependency -> minimum new code.
+- Prefer local, explicit changes over speculative reusable layers. Extract an abstraction only after concrete duplication or independent variation demonstrates that it is needed.
+- Keep platform/config parser quirks in their owning docs or regression tests instead of accumulating bug-specific prohibitions here.
 
 <!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# GitNexus - Code Intelligence
 
-This project is indexed by GitNexus as **hands** (241 symbols, 669 relationships, 7 execution flows).
+Use GitNexus as a navigation and blast-radius aid; current source and tests remain the source of truth. Do not embed symbol, relationship, or flow counts here because the index changes with the codebase.
 
-> Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
+Before graph-dependent work, check index freshness and refresh it if stale. Use the installed workflow Skill and current GitNexus CLI help as command authority rather than copying CLI syntax into this file.
 
-## Always Do
+## Route by task
 
-- **MUST run impact analysis before editing.** Use `impact({target: "symbolName", direction: "upstream"})` (MCP) or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
-
-## Never Do
-
-- NEVER edit a function, class, or method before MCP/CLI impact analysis.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read `UNKNOWN` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit before MCP/CLI graph change analysis.
-
-## Resources
-
-| Resource | Use for |
+| Task | Skill |
 | --- | --- |
-| `gitnexus://repo/hands/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/hands/clusters` | All functional areas |
-| `gitnexus://repo/hands/processes` | All execution flows |
-| `gitnexus://repo/hands/process/{name}` | Step-by-step execution trace |
+| Understand unfamiliar architecture or execution flow | `~/.agents/skills/gitnexus-exploring/SKILL.md` |
+| Assess blast radius before a risky/shared-seam/public-interface change | `~/.agents/skills/gitnexus-impact-analysis/SKILL.md` |
+| Trace a bug or regression | `~/.agents/skills/gitnexus-debugging/SKILL.md` |
+| Rename, extract, split, or refactor symbols | `~/.agents/skills/gitnexus-refactoring/SKILL.md` |
+| Tool/resource/schema reference | `~/.agents/skills/gitnexus-guide/SKILL.md` |
+| Index, status, refresh, or CLI operations | `~/.agents/skills/gitnexus-cli/SKILL.md` |
 
-## CLI
+## Required gates
 
-| Task | Read this skill file |
-| --- | --- |
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus-cli/SKILL.md` |
+- For risky shared seams, public interfaces, refactors, or behavior with multiple callers, run upstream impact analysis before editing and verify the relevant source directly.
+- Surface HIGH/CRITICAL impact before proceeding. Treat `UNKNOWN` as unresolved: confirm with source/text search rather than reading an empty caller set as safe.
+- Before commit/readiness for a non-trivial code change, run graph change analysis against the intended base. `partial` or `truncated` output is incomplete evidence, not a clean result.
+- For trivial docs/config-only edits, graph impact/change analysis is optional unless the edit changes executable behavior or an agent/runtime contract.
+- Prefer graph-aware rename/refactor tooling when supported; do not use blind find-and-replace for semantic symbol changes.
+- If GitNexus and direct source evidence disagree, trust the source, report the index limitation, and refresh/re-query when useful.
 
 <!-- gitnexus:end -->
