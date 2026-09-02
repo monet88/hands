@@ -181,7 +181,7 @@ impl McpHost {
         }
     }
 
-    async fn handle_rpc(&self, msg: Value) -> Option<Value> {
+    pub async fn handle_rpc(&self, msg: Value) -> Option<Value> {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let Some(id) = msg.get("id").cloned() else {
             return None;
@@ -220,7 +220,7 @@ impl McpHost {
             "capabilities": plugin::initialize_capabilities(),
             "serverInfo": {
                 "name": SERVER_NAME,
-                "version": SERVER_VERSION,
+                "version": format!("{}+{}.{}", SERVER_VERSION, host::UPSTREAM_BASE_COMMIT, host::DEV_GIT_REV),
             },
             "instructions": plugin::initialize_instructions(
                 &self.workspace().display().to_string()

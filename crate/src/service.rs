@@ -194,6 +194,8 @@ pub fn status_json(workspace: &Path) -> serde_json::Value {
         "name": host::DISPLAY,
         "unofficial": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "upstream_base": host::UPSTREAM_BASE_COMMIT,
+        "git_revision": host::DEV_GIT_REV,
         "workspace": workspace.display().to_string(),
         "pin": pin.as_ref().map(|p| p.display().to_string()),
         "tunnel_ready": ready(),

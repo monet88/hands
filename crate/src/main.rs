@@ -69,7 +69,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             }
             "--open" | "--ui" => open = true,
             "-V" | "--version" => {
-                println!("{APP} {}", env!("CARGO_PKG_VERSION"));
+                println!("{APP} {} (upstream: {}, rev: {})", env!("CARGO_PKG_VERSION"), host::UPSTREAM_BASE_COMMIT, host::DEV_GIT_REV);
                 std::process::exit(0);
             }
             "-h" | "--help" => return Err(USAGE.trim_end().to_string()),
