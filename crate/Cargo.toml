@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "hands"
 path = "src/main.rs"
+
 [dependencies]
 dirs = { workspace = true }
 dunce = { workspace = true }
@@ -24,6 +25,9 @@ tokio = { workspace = true, features = [
     "io-std",
     "net",
     "sync",
+    "process",
+    "time",
+    "io-util",
 ] }
 xai-grok-tools = { path = "../xai-grok-tools" }
 xai-tool-types = { workspace = true }
@@ -31,5 +35,6 @@ xai-tool-types = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+
 [lints]
 workspace = true

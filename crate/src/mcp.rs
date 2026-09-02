@@ -18,6 +18,7 @@ use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use crate::host;
 use crate::plugin;
 use crate::ui;
+use crate::run_command;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "Hands";
@@ -258,6 +259,7 @@ impl McpHost {
                     "properties": {}
                 }),
             ),
+            run_command::tool_descriptor(),
         ];
         let defs = self
             .bridge()
@@ -371,6 +373,12 @@ impl McpHost {
                 },
                 "isError": false
             }));
+        }
+        if name == run_command::TOOL_NAME {
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let active_workspace = self.workspace();
+            let res = run_command::execute(&arguments, &active_workspace).await;
+            return Ok(res);
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         let call_id = format!(

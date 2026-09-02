@@ -1,6 +1,7 @@
 pub mod host;
 pub mod mcp;
 pub mod plugin;
+pub mod run_command;
 pub mod secrets;
 pub mod service;
 pub mod setup;

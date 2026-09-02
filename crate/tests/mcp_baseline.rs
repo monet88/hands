@@ -56,6 +56,7 @@ async fn test_mcp_tools_list() {
     assert!(names.contains(&"set_workspace"), "must list set_workspace");
     assert!(names.contains(&"read_file"), "must list read_file");
     assert!(names.contains(&"run_terminal_cmd"), "must list run_terminal_cmd");
+    assert!(names.contains(&"run_command"), "must list run_command");
 
     // Check annotations and _meta
     for tool in tools {

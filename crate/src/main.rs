@@ -1,6 +1,6 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
-use hands::{host, mcp, service, setup, ui, watch};
+use hands::{host, mcp, run_command, service, setup, ui, watch};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -191,20 +191,24 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         Cmd::McpHttp { addr } => mcp::McpHost::new(fallback).serve_http(addr).await,
         Cmd::List | Cmd::Call { .. } => {
             let cwd = host::resolve_workspace(&fallback);
-            let bridge = host::build_bridge(cwd).await?;
+            let bridge = host::build_bridge(cwd.clone()).await?;
             match cmd {
                 Cmd::List => {
                     let defs = bridge.tool_definitions().await;
-                    let tools: Vec<serde_json::Value> = defs
-                        .into_iter()
-                        .map(|d| {
-                            serde_json::json!({
-                                "name": d.function.name,
-                                "description": d.function.description,
-                                "parameters": d.function.parameters,
-                            })
+                    let mut tools: Vec<serde_json::Value> = vec![
+                        serde_json::json!({
+                            "name": run_command::TOOL_NAME,
+                            "description": run_command::TOOL_DESCRIPTION,
+                            "parameters": run_command::input_schema(),
                         })
-                        .collect();
+                    ];
+                    tools.extend(defs.into_iter().map(|d| {
+                        serde_json::json!({
+                            "name": d.function.name,
+                            "description": d.function.description,
+                            "parameters": d.function.parameters,
+                        })
+                    }));
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({ "tools": tools }))
@@ -215,6 +219,15 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                 Cmd::Call { tool, args_json } => {
                     let params: serde_json::Value = serde_json::from_str(&args_json)
                         .map_err(|e| format!("invalid json args: {e}"))?;
+                    if tool == run_command::TOOL_NAME {
+                        let res = run_command::execute(&params, &cwd).await;
+                        let text = res["content"][0]["text"].as_str().unwrap_or_default();
+                        println!("{text}");
+                        if res["isError"].as_bool().unwrap_or(false) {
+                            return Err("command execution failed".to_string());
+                        }
+                        return Ok(());
+                    }
                     let result = bridge
                         .call(&tool, params, "hands-1")
                         .await
