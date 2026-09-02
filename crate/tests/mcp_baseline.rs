@@ -219,4 +219,22 @@ fn test_host_and_service_provenance_and_isolation() {
     let status = service::status_json(config_dir.path());
     assert_eq!(status["upstream_base"], "26f9001");
     assert_eq!(status["git_revision"], host::DEV_GIT_REV);
+
+    // Assert provenance git_revision matches .hands-source-rev or hands source git rev
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let prov_file = std::path::Path::new(manifest_dir).join(".hands-source-rev");
+    if prov_file.exists() {
+        let rev = std::fs::read_to_string(&prov_file).unwrap();
+        assert_eq!(host::DEV_GIT_REV, rev.trim(), "DEV_GIT_REV must match injected .hands-source-rev");
+    } else {
+        let git_out = std::process::Command::new("git")
+            .args(["-C", manifest_dir, "rev-parse", "--short", "HEAD"])
+            .output();
+        if let Ok(out) = git_out {
+            if out.status.success() {
+                let rev = String::from_utf8(out.stdout).unwrap();
+                assert_eq!(host::DEV_GIT_REV, rev.trim(), "DEV_GIT_REV must match source repo git rev");
+            }
+        }
+    }
 }

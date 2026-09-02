@@ -60,6 +60,11 @@ Hands should stay a thin CLI/MCP adapter around upstream capabilities. Prefer th
 - Prefer local, explicit changes over speculative reusable layers. Extract an abstraction only after concrete duplication or independent variation demonstrates that it is needed.
 - Keep platform/config parser quirks in their owning docs or regression tests instead of accumulating bug-specific prohibitions here.
 
+### 5. `.grok-build` is read-only upstream state
+- Treat `.grok-build/` as a disposable checkout/injection sandbox sourced from `xai-org/grok-build`. Never edit files under `.grok-build/` directly, even for quick debugging or temporary workarounds.
+- Use `.grok-build/` only for upstream source inspection and as the generated target for injection, build, and test workflows. Automated injection/bootstrap may wipe or rewrite `.grok-build/crates/codegen/hands/` at any time.
+- Make required changes in Hands-owned source, tests, or injection/build logic. If a fix genuinely belongs upstream, change the upstream repository separately and update the tracking revision cleanly.
+- Direct edits under `.grok-build/` invalidate review/test evidence because they are non-authoritative and disposable; restore or regenerate the sandbox before taking evidence.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

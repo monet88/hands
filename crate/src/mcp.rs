@@ -325,17 +325,29 @@ impl McpHost {
                 } else {
                     "running"
                 };
+                let raw_summary = if let Some(desc) = t.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                    desc
+                } else if let Some(display) = t.display_command.as_deref().filter(|d| !d.trim().is_empty()) {
+                    display
+                } else {
+                    &t.command
+                };
+                let bounded_summary = if raw_summary.len() > 120 {
+                    let boundary = raw_summary.floor_char_boundary(117);
+                    format!("{}...", &raw_summary[..boundary])
+                } else {
+                    raw_summary.to_string()
+                };
 
-                let cmd = t.display_command.clone().unwrap_or(t.command.clone());
                 summary_lines.push(format!(
                     "- ID: {}\n  Status: {}\n  Command: {}\n  Exit Code: {:?}",
-                    t.task_id, status, cmd, t.exit_code
+                    t.task_id, status, bounded_summary, t.exit_code
                 ));
 
                 projected.push(json!({
                     "task_id": t.task_id,
                     "status": status,
-                    "command": cmd,
+                    "command": bounded_summary,
                     "cwd": t.cwd,
                     "exit_code": t.exit_code,
                     "output_file": t.output_file.display().to_string(),
