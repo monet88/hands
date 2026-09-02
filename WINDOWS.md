@@ -69,7 +69,7 @@ tunnel-client doctor --profile hands
 Script launcher được đặt tại `%LOCALAPPDATA%\Programs\hands\bin\start-hands.bat` (và `.ps1`), tự động thực hiện:
 1. **Chuyển thư mục:** `cd /d "%~dp0"` đảm bảo nhận đúng binary cục bộ.
 2. **Background HTTP MCP Server:** Khởi chạy `hands.exe --http --port 8787` dưới nền.
-3. **Auto-open Web UI & Logs:** Mở trình duyệt tại `http://127.0.0.1:8787/ui` (xem trạng thái, workspace ghim và log).
+3. **Auto-open Web UI & Logs:** Mở trình duyệt tại `http://127.0.0.1:18780/ui` (xem trạng thái tunnel, channel main, request và logs).
 4. **Inject Env:** Nạp động `Tunnel ID` và `API Key`.
 5. **Launch Tunnel:** Chạy `tunnel-client run --profile hands` ở foreground.
 6. **Clean Exit:** Dọn sạch biến môi trường khi kết thúc (Ctrl+C).
@@ -85,7 +85,7 @@ Nội dung script:
 start /b "" powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Programs\hands\bin\start-hands.ps1" -Background
 ```
 
-* **Cơ chế:** Khi đăng nhập Windows, Windows Startup sẽ kích hoạt `hands-autostart.cmd`, gọi ngầm `start-hands.ps1 -Background` ở chế độ ẩn hoàn toàn (không hiện console CMD, không chặn tiến trình), và tự động mở tab `http://127.0.0.1:8787/ui` trên trình duyệt để kiểm tra trạng thái và logs.
+* **Cơ chế:** Khi đăng nhập Windows, Windows Startup sẽ kích hoạt `hands-autostart.cmd`, gọi ngầm `start-hands.ps1 -Background` ở chế độ ẩn hoàn toàn (không hiện console CMD, không chặn tiến trình), và tự động mở tab `http://127.0.0.1:18780/ui` trên trình duyệt để kiểm tra trạng thái và logs.
 
 ---
 

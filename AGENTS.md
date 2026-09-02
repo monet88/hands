@@ -61,30 +61,36 @@ Hands should stay a thin CLI/MCP adapter around upstream capabilities. Prefer th
 - Keep platform/config parser quirks in their owning docs or regression tests instead of accumulating bug-specific prohibitions here.
 
 <!-- gitnexus:start -->
-# GitNexus - Code Intelligence
+# GitNexus — Code Intelligence
 
-Use GitNexus as a navigation and blast-radius aid; current source and tests remain the source of truth. Do not embed symbol, relationship, or flow counts here because the index changes with the codebase.
+This project is indexed by GitNexus as **hands** (280 symbols, 736 relationships, 13 execution flows).
 
-Before graph-dependent work, check index freshness and refresh it if stale. Use the installed workflow Skill and current GitNexus CLI help as command authority rather than copying CLI syntax into this file.
+> Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
-## Route by task
+## Always Do
 
-| Task | Skill |
+- **MUST run impact analysis before editing.** Use `impact({target: "symbolName", direction: "upstream"})` (MCP) or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+
+## Never Do
+
+- NEVER edit a function, class, or method before MCP/CLI impact analysis.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read `UNKNOWN` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit before MCP/CLI graph change analysis.
+
+## Resources
+
+| Resource | Use for |
 | --- | --- |
-| Understand unfamiliar architecture or execution flow | `~/.agents/skills/gitnexus-exploring/SKILL.md` |
-| Assess blast radius before a risky/shared-seam/public-interface change | `~/.agents/skills/gitnexus-impact-analysis/SKILL.md` |
-| Trace a bug or regression | `~/.agents/skills/gitnexus-debugging/SKILL.md` |
-| Rename, extract, split, or refactor symbols | `~/.agents/skills/gitnexus-refactoring/SKILL.md` |
-| Tool/resource/schema reference | `~/.agents/skills/gitnexus-guide/SKILL.md` |
-| Index, status, refresh, or CLI operations | `~/.agents/skills/gitnexus-cli/SKILL.md` |
-
-## Required gates
-
-- For risky shared seams, public interfaces, refactors, or behavior with multiple callers, run upstream impact analysis before editing and verify the relevant source directly.
-- Surface HIGH/CRITICAL impact before proceeding. Treat `UNKNOWN` as unresolved: confirm with source/text search rather than reading an empty caller set as safe.
-- Before commit/readiness for a non-trivial code change, run graph change analysis against the intended base. `partial` or `truncated` output is incomplete evidence, not a clean result.
-- For trivial docs/config-only edits, graph impact/change analysis is optional unless the edit changes executable behavior or an agent/runtime contract.
-- Prefer graph-aware rename/refactor tooling when supported; do not use blind find-and-replace for semantic symbol changes.
-- If GitNexus and direct source evidence disagree, trust the source, report the index limitation, and refresh/re-query when useful.
+| `gitnexus://repo/hands/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/hands/clusters` | All functional areas |
+| `gitnexus://repo/hands/processes` | All execution flows |
+| `gitnexus://repo/hands/process/{name}` | Step-by-step execution trace |
 
 <!-- gitnexus:end -->
