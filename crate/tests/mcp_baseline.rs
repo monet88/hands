@@ -1,47 +1,10 @@
-use std::sync::Arc;
+mod common;
+use common::TestHarness;
 use hands::host;
-use hands::mcp::McpHost;
 use hands::service;
-use serde_json::{json, Value};
+use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
-
-struct TestHarness {
-    _temp: TempDir,
-    _config_dir: TempDir,
-    host: Arc<McpHost>,
-}
-
-impl TestHarness {
-    fn new() -> Self {
-        let temp = TempDir::new().expect("workspace tempdir");
-        let config_dir = TempDir::new().expect("config tempdir");
-        // Set HANDS_CONFIG_DIR so that test execution doesn't mutate or read real user configs
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", config_dir.path());
-        }
-        let host = McpHost::new(temp.path().to_path_buf());
-        Self {
-            _temp: temp,
-            _config_dir: config_dir,
-            host,
-        }
-    }
-
-    async fn rpc(&self, method: &str, params: Value) -> Value {
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-        self.host
-            .handle_rpc(req)
-            .await
-            .expect("response expected for request with id")
-    }
-}
-
 #[tokio::test]
 #[serial]
 async fn test_mcp_initialize() {

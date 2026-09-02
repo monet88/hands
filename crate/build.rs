@@ -18,5 +18,4 @@ fn main() {
     });
 
     println!("cargo:rustc-env=DEV_GIT_REV={rev}");
-    println!("cargo:rustc-env=UPSTREAM_BASE_COMMIT=26f9001");
 }

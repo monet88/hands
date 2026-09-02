@@ -387,6 +387,11 @@ impl McpHost {
     }
 }
 
+#[inline]
+fn kb(n: usize) -> usize {
+    (n + 1023) / 1024
+}
+
 pub fn truncate_output_text(text: &str, max_bytes: usize, output_file: &str) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
@@ -396,19 +401,15 @@ pub fn truncate_output_text(text: &str, max_bytes: usize, output_file: &str) -> 
     let head = &text[..head_boundary];
     let tail_start = text.ceil_char_boundary(text.len().saturating_sub(half));
     let tail = &text[tail_start..];
-    let total_kb = (text.len() + 1023) / 1024;
-    let head_kb = (head_boundary + 1023) / 1024;
-    let tail_kb = (text.len() - tail_start + 1023) / 1024;
+    let total_kb = kb(text.len());
+    let head_kb = kb(head_boundary);
+    let tail_kb = kb(text.len() - tail_start);
     let file_hint = if !output_file.is_empty() {
         format!(" Full output saved to {output_file}.")
     } else {
         String::new()
     };
-    format!("{head}
-
-[Output truncated: showing first {head_kb}KB and last {tail_kb}KB of {total_kb}KB.{file_hint}]
-
-{tail}")
+    format!("{head}\n\n[Output truncated: showing first {head_kb}KB and last {tail_kb}KB of {total_kb}KB.{file_hint}]\n\n{tail}")
 }
 
 pub fn shape_tool_result(result: &ToolRunResult) -> (Value, String) {
@@ -424,30 +425,31 @@ pub fn shape_tool_result(result: &ToolRunResult) -> (Value, String) {
         ToolOutput::BackgroundTaskStarted(bg) => &bg.output_file,
         ToolOutput::TaskOutput(to) => match to {
             xai_tool_types::TaskOutputOutput::Result(r) => {
-                if let Some(obj) = structured.as_object_mut() {
-                    obj.insert("task_id".to_string(), Value::String(r.task_id.clone()));
-                    obj.insert("command".to_string(), Value::String(r.command.clone()));
-                    obj.insert("status".to_string(), Value::String(r.status.clone()));
-                    obj.insert("exit_code".to_string(), r.exit_code.map(Value::from).unwrap_or(Value::Null));
-                    obj.insert("duration_secs".to_string(), json!(r.duration_secs));
-                    obj.insert("output".to_string(), Value::String(r.output.clone()));
-                    obj.insert("output_file".to_string(), Value::String(r.output_file.clone()));
-                    obj.insert("truncated".to_string(), Value::Bool(r.truncated));
-                    obj.insert("raw_output_bytes".to_string(), json!(r.raw_output_bytes));
-                }
+                structured = json!({
+                    "type": "TaskOutput",
+                    "task_id": r.task_id,
+                    "command": r.command,
+                    "status": r.status,
+                    "exit_code": r.exit_code,
+                    "duration_secs": r.duration_secs,
+                    "output": r.output,
+                    "output_file": r.output_file,
+                    "truncated": r.truncated,
+                    "raw_output_bytes": r.raw_output_bytes
+                });
                 &r.output_file
             }
             xai_tool_types::TaskOutputOutput::TaskNotFound(msg) => {
-                if let Some(obj) = structured.as_object_mut() {
-                    obj.insert("error".to_string(), Value::String(msg.clone()));
-                }
+                structured = json!({
+                    "type": "TaskOutput",
+                    "error": msg
+                });
                 ""
             }
             _ => "",
         },
         _ => "",
     };
-
     let summary = if result.prompt_text.trim().is_empty() {
         match &result.output {
             ToolOutput::Bash(b) if b.total_bytes > 0 => {

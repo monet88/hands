@@ -1,18 +1,11 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
-mod host;
-mod mcp;
-mod plugin;
-mod secrets;
-mod service;
-mod setup;
-mod ui;
-mod watch;
+use hands::{host, mcp, service, setup, ui, watch};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::host::{APP, DISPLAY};
+use hands::host::{APP, DISPLAY};
 
 const USAGE: &str = "\
 Hands — unofficial ChatGPT plugin (local tools, no model)

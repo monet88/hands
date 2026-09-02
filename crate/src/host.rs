@@ -17,7 +17,7 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
-pub const UPSTREAM_BASE_COMMIT: &str = env!("UPSTREAM_BASE_COMMIT");
+pub const UPSTREAM_BASE_COMMIT: &str = "26f9001";
 pub const DEV_GIT_REV: &str = env!("DEV_GIT_REV");
 
 fn home_dir() -> PathBuf {
