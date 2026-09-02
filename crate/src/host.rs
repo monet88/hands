@@ -17,30 +17,45 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
+pub const UPSTREAM_BASE_COMMIT: &str = "26f9001";
+pub const DEV_GIT_REV: &str = env!("DEV_GIT_REV");
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// XDG on Unix (`~/.config/hands`). `%APPDATA%\hands` on Windows.
-pub fn config_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        return dirs::config_dir()
-            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
-            .join(APP);
+fn hands_config_dir_override() -> Option<PathBuf> {
+    match std::env::var("HANDS_CONFIG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir.trim())),
+        _ => None,
     }
-    home_dir().join(".config").join(APP)
+}
+
+/// Config dir: $HANDS_CONFIG_DIR if set, else XDG on Unix (`~/.config/hands`), `%APPDATA%\hands` on Windows.
+pub fn config_dir() -> PathBuf {
+    if let Some(dir) = hands_config_dir_override() {
+        return dir;
+    }
+    #[cfg(windows)]
+    let base = dirs::config_dir()
+        .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
+        .join(APP);
+    #[cfg(not(windows))]
+    let base = home_dir().join(".config").join(APP);
+    base
 }
 
 pub fn tunnel_client_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        return dirs::config_dir()
-            .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
-            .join("tunnel-client");
+    if let Some(dir) = hands_config_dir_override() {
+        return dir.join("tunnel-client");
     }
-    home_dir().join(".config/tunnel-client")
+    #[cfg(windows)]
+    let base = dirs::config_dir()
+        .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
+        .join("tunnel-client");
+    #[cfg(not(windows))]
+    let base = home_dir().join(".config/tunnel-client");
+    base
 }
 
 pub fn workspace_file() -> PathBuf {

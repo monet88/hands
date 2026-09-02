@@ -15,14 +15,17 @@ use crate::host;
 
 pub const HEALTH_LISTEN: &str = "127.0.0.1:18780";
 pub const HEALTH_BASE: &str = "http://127.0.0.1:18780";
+#[cfg(unix)]
 pub const MCP_LISTEN: &str = "127.0.0.1:8787";
 pub const MCP_BASE: &str = "http://127.0.0.1:8787";
 pub const PROFILE: &str = "hands";
+#[cfg(target_os = "macos")]
 const LABEL: &str = "dev.hands.tunnel";
 #[cfg(target_os = "macos")]
 const MCP_LABEL: &str = "dev.hands.mcp";
 #[cfg(target_os = "macos")]
 const WATCH_LABEL: &str = "dev.hands.watch";
+#[cfg(target_os = "macos")]
 const LEGACY_LABEL: &str = "ai.grok.harness.tunnel";
 const LEGACY_PROFILE: &str = "grok-harness";
 
@@ -194,6 +197,8 @@ pub fn status_json(workspace: &Path) -> serde_json::Value {
         "name": host::DISPLAY,
         "unofficial": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "upstream_base": host::UPSTREAM_BASE_COMMIT,
+        "git_revision": host::DEV_GIT_REV,
         "workspace": workspace.display().to_string(),
         "pin": pin.as_ref().map(|p| p.display().to_string()),
         "tunnel_ready": ready(),
@@ -375,6 +380,7 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn log_dir() -> PathBuf {
     host::config_dir().join("logs")
 }
@@ -841,6 +847,7 @@ fn uninstall_mcp() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn stop_unmanaged() {
     let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
         return;
@@ -899,6 +906,7 @@ fn run_ok(bin: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

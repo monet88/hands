@@ -125,6 +125,14 @@ pub fn face(name: &str) -> Face {
             destructive: true,
             idempotent: true,
         },
+        "list_terminal_tasks" => Face {
+            title: "List tasks",
+            invoking: "Listing tasks...",
+            invoked: "Listed tasks",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+        },
         _ => Face {
             title: "Hands tool",
             invoking: "Working…",

@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
+use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 
 use crate::host;
 use crate::plugin;
@@ -181,7 +182,7 @@ impl McpHost {
         }
     }
 
-    async fn handle_rpc(&self, msg: Value) -> Option<Value> {
+    pub async fn handle_rpc(&self, msg: Value) -> Option<Value> {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let Some(id) = msg.get("id").cloned() else {
             return None;
@@ -220,7 +221,7 @@ impl McpHost {
             "capabilities": plugin::initialize_capabilities(),
             "serverInfo": {
                 "name": SERVER_NAME,
-                "version": SERVER_VERSION,
+                "version": format!("{}+{}.{}", SERVER_VERSION, host::UPSTREAM_BASE_COMMIT, host::DEV_GIT_REV),
             },
             "instructions": plugin::initialize_instructions(
                 &self.workspace().display().to_string()
@@ -247,6 +248,14 @@ impl McpHost {
                         }
                     },
                     "required": ["path"]
+                }),
+            ),
+            plugin::tool_descriptor(
+                "list_terminal_tasks",
+                "List all running and completed background terminal tasks in the current session. Returns task IDs, commands, status, exit codes, and output metadata.",
+                json!({
+                    "type": "object",
+                    "properties": {}
                 }),
             ),
         ];
@@ -295,6 +304,74 @@ impl McpHost {
                 })),
             };
         }
+        if name == "list_terminal_tasks" {
+            let bridge = self.bridge().await.map_err(|e| (-32603, e, Value::Null))?;
+            let tasks = bridge.list_background_tasks().await;
+
+            let mut projected = Vec::new();
+            let mut summary_lines = Vec::new();
+
+            for t in tasks {
+                let status = if t.completed {
+                    if t.explicitly_killed {
+                        "cancelled"
+                    } else if t.signal.as_deref() == Some("timeout") {
+                        "timed_out"
+                    } else if t.exit_code == Some(0) {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                } else {
+                    "running"
+                };
+                let raw_summary = if let Some(desc) = t.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                    desc
+                } else if let Some(display) = t.display_command.as_deref().filter(|d| !d.trim().is_empty()) {
+                    display
+                } else {
+                    &t.command
+                };
+                let bounded_summary = if raw_summary.len() > 120 {
+                    let boundary = raw_summary.floor_char_boundary(117);
+                    format!("{}...", &raw_summary[..boundary])
+                } else {
+                    raw_summary.to_string()
+                };
+
+                summary_lines.push(format!(
+                    "- ID: {}\n  Status: {}\n  Command: {}\n  Exit Code: {:?}",
+                    t.task_id, status, bounded_summary, t.exit_code
+                ));
+
+                projected.push(json!({
+                    "task_id": t.task_id,
+                    "status": status,
+                    "command": bounded_summary,
+                    "cwd": t.cwd,
+                    "exit_code": t.exit_code,
+                    "output_file": t.output_file.display().to_string(),
+                    "duration_secs": t.duration_secs(),
+                    "completed": t.completed,
+                    "truncated": t.truncated,
+                    "total_bytes": t.output_total_bytes,
+                }));
+            }
+
+            let text = if projected.is_empty() {
+                "Total tasks: 0".to_string()
+            } else {
+                format!("Total tasks: {}\n{}", projected.len(), summary_lines.join("\n"))
+            };
+
+            return Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "structuredContent": {
+                    "tasks": projected
+                },
+                "isError": false
+            }));
+        }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         let call_id = format!(
             "mcp-{}",
@@ -305,16 +382,101 @@ impl McpHost {
             .await
             .map_err(|e| (-32603, e, Value::Null))?;
         match bridge.call(name, arguments, &call_id).await {
-            Ok(result) => Ok(json!({
-                "content": [{ "type": "text", "text": result.prompt_text }],
-                "isError": false
-            })),
+            Ok(result) => {
+                let is_error = result.output.is_error();
+                let (structured, summary_text) = shape_tool_result(&result);
+                Ok(json!({
+                    "content": [{ "type": "text", "text": summary_text }],
+                    "structuredContent": structured,
+                    "isError": is_error
+                }))
+            }
             Err(e) => Ok(json!({
                 "content": [{ "type": "text", "text": e.to_string() }],
                 "isError": true
             })),
         }
     }
+}
+
+#[inline]
+fn kb(n: usize) -> usize {
+    (n + 1023) / 1024
+}
+
+pub fn truncate_output_text(text: &str, max_bytes: usize, output_file: &str) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let half = max_bytes / 2;
+    let head_boundary = text.floor_char_boundary(half);
+    let head = &text[..head_boundary];
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(half));
+    let tail = &text[tail_start..];
+    let total_kb = kb(text.len());
+    let head_kb = kb(head_boundary);
+    let tail_kb = kb(text.len() - tail_start);
+    let file_hint = if !output_file.is_empty() {
+        format!(" Full output saved to {output_file}.")
+    } else {
+        String::new()
+    };
+    format!("{head}\n\n[Output truncated: showing first {head_kb}KB and last {tail_kb}KB of {total_kb}KB.{file_hint}]\n\n{tail}")
+}
+
+pub fn shape_tool_result(result: &ToolRunResult) -> (Value, String) {
+    let mut structured = serde_json::to_value(&result.output).unwrap_or_else(|_| json!({}));
+    let output_file: &str = match &result.output {
+        ToolOutput::Bash(b) => {
+            let output_str = String::from_utf8_lossy(&b.output).into_owned();
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("output".to_string(), Value::String(output_str));
+            }
+            &b.output_file
+        }
+        ToolOutput::BackgroundTaskStarted(bg) => &bg.output_file,
+        ToolOutput::TaskOutput(to) => match to {
+            xai_tool_types::TaskOutputOutput::Result(r) => {
+                structured = json!({
+                    "type": "TaskOutput",
+                    "task_id": r.task_id,
+                    "command": r.command,
+                    "status": r.status,
+                    "exit_code": r.exit_code,
+                    "duration_secs": r.duration_secs,
+                    "output": r.output,
+                    "output_file": r.output_file,
+                    "truncated": r.truncated,
+                    "raw_output_bytes": r.raw_output_bytes
+                });
+                &r.output_file
+            }
+            xai_tool_types::TaskOutputOutput::TaskNotFound(msg) => {
+                structured = json!({
+                    "type": "TaskOutput",
+                    "error": msg
+                });
+                ""
+            }
+            _ => "",
+        },
+        _ => "",
+    };
+    let summary = if result.prompt_text.trim().is_empty() {
+        match &result.output {
+            ToolOutput::Bash(b) if b.total_bytes > 0 => {
+                format!("(output captured in file, exit code: {})", b.exit_code)
+            }
+            ToolOutput::BackgroundTaskStarted(bg) => {
+                format!("Background task started with ID: {}. Output streaming to {}.", bg.task_id, bg.output_file)
+            }
+            _ => result.prompt_text.clone(),
+        }
+    } else {
+        truncate_output_text(&result.prompt_text, 256, output_file)
+    };
+
+    (structured, summary)
 }
 
 fn rpc_error(id: Value, code: i64, message: String) -> Value {

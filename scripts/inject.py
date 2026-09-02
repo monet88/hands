@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +29,26 @@ def main() -> int:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(crate_src, dest)
+    rev = None
+    import os
+    if os.environ.get("DEV_GIT_REV"):
+        rev = os.environ["DEV_GIT_REV"].strip()
+    else:
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", str(src_repo), "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            )
+            rev = out.decode().strip()
+        except Exception as e:
+            print(f"error: failed to resolve Hands source revision from {src_repo}: {e}", file=sys.stderr)
+            return 1
+
+    if not rev:
+        print(f"error: empty source revision resolved from {src_repo}", file=sys.stderr)
+        return 1
+
+    (dest / ".hands-source-rev").write_text(rev + "\n")
 
     root = grok_build / "Cargo.toml"
     text = root.read_text()

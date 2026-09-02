@@ -1,18 +1,11 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
-mod host;
-mod mcp;
-mod plugin;
-mod secrets;
-mod service;
-mod setup;
-mod ui;
-mod watch;
+use hands::{host, mcp, service, setup, ui, watch};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::host::{APP, DISPLAY};
+use hands::host::{APP, DISPLAY};
 
 const USAGE: &str = "\
 Hands — unofficial ChatGPT plugin (local tools, no model)
@@ -69,7 +62,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
             }
             "--open" | "--ui" => open = true,
             "-V" | "--version" => {
-                println!("{APP} {}", env!("CARGO_PKG_VERSION"));
+                println!("{APP} {} (upstream: {}, rev: {})", env!("CARGO_PKG_VERSION"), host::UPSTREAM_BASE_COMMIT, host::DEV_GIT_REV);
                 std::process::exit(0);
             }
             "-h" | "--help" => return Err(USAGE.trim_end().to_string()),
