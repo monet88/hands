@@ -250,6 +250,20 @@ impl McpHost {
                     "required": ["path"]
                 }),
             ),
+            plugin::tool_descriptor(
+                "list_terminal_tasks",
+                "List all running and completed background terminal tasks in the current session. Returns task IDs, commands, status, and exit codes.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "status_filter": {
+                            "type": "string",
+                            "enum": ["all", "running", "completed", "failed"],
+                            "description": "Optional filter by task status. Defaults to 'all'."
+                        }
+                    }
+                }),
+            ),
         ];
         let defs = self
             .bridge()
@@ -295,6 +309,72 @@ impl McpHost {
                     "isError": true
                 })),
             };
+        }
+        if name == "list_terminal_tasks" {
+            let bridge = self.bridge().await.map_err(|e| (-32603, e, Value::Null))?;
+            let tasks = bridge.list_background_tasks().await;
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let filter = arguments.get("status_filter").and_then(Value::as_str).unwrap_or("all");
+
+            let mut projected = Vec::new();
+            let mut summary_lines = Vec::new();
+
+            for t in tasks {
+                let status = if t.completed {
+                    if t.explicitly_killed {
+                        "cancelled"
+                    } else if t.signal.as_deref() == Some("timeout") {
+                        "timed_out"
+                    } else if t.exit_code == Some(0) {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                } else {
+                    "running"
+                };
+
+                let matches = match filter {
+                    "running" => status == "running",
+                    "completed" => status == "completed",
+                    "failed" => status == "failed" || status == "timed_out",
+                    _ => true,
+                };
+
+                if !matches {
+                    continue;
+                }
+
+                let cmd = t.display_command.clone().unwrap_or(t.command.clone());
+                summary_lines.push(format!(
+                    "- ID: {}\n  Status: {}\n  Command: {}\n  Exit Code: {:?}",
+                    t.task_id, status, cmd, t.exit_code
+                ));
+
+                projected.push(json!({
+                    "task_id": t.task_id,
+                    "status": status,
+                    "command": cmd,
+                    "exit_code": t.exit_code,
+                    "output_file": t.output_file.display().to_string(),
+                    "duration_secs": t.duration_secs(),
+                    "completed": t.completed,
+                }));
+            }
+
+            let text = if projected.is_empty() {
+                format!("Total tasks: 0 (filter: {filter})")
+            } else {
+                format!("Total tasks: {} (filter: {filter})\n{}", projected.len(), summary_lines.join("\n"))
+            };
+
+            return Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "structuredContent": {
+                    "tasks": projected
+                },
+                "isError": false
+            }));
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         let call_id = format!(
