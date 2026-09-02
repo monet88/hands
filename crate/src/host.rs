@@ -17,19 +17,24 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
-pub const UPSTREAM_BASE_COMMIT: &str = "26f9001";
+pub const UPSTREAM_BASE_COMMIT: &str = env!("UPSTREAM_BASE_COMMIT");
 pub const DEV_GIT_REV: &str = env!("DEV_GIT_REV");
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn hands_config_dir_override() -> Option<PathBuf> {
+    match std::env::var("HANDS_CONFIG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir.trim())),
+        _ => None,
+    }
+}
+
 /// Config dir: $HANDS_CONFIG_DIR if set, else XDG on Unix (`~/.config/hands`), `%APPDATA%\hands` on Windows.
 pub fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HANDS_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = hands_config_dir_override() {
+        return dir;
     }
     #[cfg(windows)]
     let base = dirs::config_dir()
@@ -41,10 +46,8 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn tunnel_client_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HANDS_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir).join("tunnel-client");
-        }
+    if let Some(dir) = hands_config_dir_override() {
+        return dir.join("tunnel-client");
     }
     #[cfg(windows)]
     let base = dirs::config_dir()

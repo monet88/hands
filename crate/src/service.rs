@@ -842,7 +842,7 @@ fn install_mcp() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn uninstall_mcp() -> Result<(), String> {
     Ok(())
 }

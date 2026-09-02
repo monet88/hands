@@ -59,8 +59,10 @@ async fn test_list_terminal_tasks_schema_and_face() {
     assert_eq!(list_tool["_meta"]["openai/toolInvocation/invoked"], "Listed tasks");
 
     let props = &list_tool["inputSchema"]["properties"];
-    assert!(props.get("status_filter").is_some());
-
+    assert!(
+        props.get("status_filter").is_none(),
+        "list_terminal_tasks must not expose status_filter"
+    );
     // Explicitly prove no execution_mode or yield_after_ms is exposed anywhere
     assert!(
         props.get("execution_mode").is_none(),
@@ -146,9 +148,7 @@ async fn test_list_terminal_tasks_lifecycle_recovery_and_kill() {
             "tools/call",
             json!({
                 "name": "list_terminal_tasks",
-                "arguments": {
-                    "status_filter": "running"
-                }
+                "arguments": {}
             }),
         )
         .await;
@@ -165,33 +165,18 @@ async fn test_list_terminal_tasks_lifecycle_recovery_and_kill() {
         .expect("must find our task_id in list_terminal_tasks");
 
     assert_eq!(found["status"], "running");
+    assert_eq!(found["completed"], false);
     assert!(found["command"].as_str().unwrap().to_lowercase().contains("sleep"));
     assert!(found["output_file"].is_string());
+    assert!(found["cwd"].is_string(), "must include cwd in snapshot");
+    assert!(found["duration_secs"].is_number(), "must include duration_secs");
+    assert!(found["truncated"].is_boolean(), "must include truncated");
+    assert!(found["total_bytes"].is_number(), "must include total_bytes");
 
     // Verify bounded snapshot does not expose secrets/environment variables
     assert!(found.get("env").is_none(), "must not expose env");
     assert!(found.get("environment").is_none(), "must not expose environment");
     assert!(found.get("secrets").is_none(), "must not expose secrets");
-
-    // Filter by completed should NOT match our running task
-    let completed_list = harness
-        .rpc(
-            "tools/call",
-            json!({
-                "name": "list_terminal_tasks",
-                "arguments": {
-                    "status_filter": "completed"
-                }
-            }),
-        )
-        .await;
-    let completed_tasks = completed_list["result"]["structuredContent"]["tasks"]
-        .as_array()
-        .unwrap();
-    assert!(
-        !completed_tasks.iter().any(|t| t["task_id"] == task_id),
-        "running task should not show up under completed filter"
-    );
 
     // Stop/kill the task using the recovered task_id
     let kill_resp = harness
@@ -216,9 +201,7 @@ async fn test_list_terminal_tasks_lifecycle_recovery_and_kill() {
             "tools/call",
             json!({
                 "name": "list_terminal_tasks",
-                "arguments": {
-                    "status_filter": "all"
-                }
+                "arguments": {}
             }),
         )
         .await;
@@ -233,6 +216,10 @@ async fn test_list_terminal_tasks_lifecycle_recovery_and_kill() {
 
     assert_eq!(settled["completed"], true);
     assert_eq!(settled["status"], "cancelled");
+    assert!(settled["cwd"].is_string());
+    assert!(settled["duration_secs"].is_number());
+    assert!(settled["truncated"].is_boolean());
+    assert!(settled["total_bytes"].is_number());
 }
 
 #[tokio::test]
@@ -287,9 +274,7 @@ async fn test_list_terminal_tasks_completed_discovery() {
             "tools/call",
             json!({
                 "name": "list_terminal_tasks",
-                "arguments": {
-                    "status_filter": "completed"
-                }
+                "arguments": {}
             }),
         )
         .await;
@@ -309,8 +294,11 @@ async fn test_list_terminal_tasks_completed_discovery() {
     assert_eq!(found["exit_code"], 0);
 
     // Verify bounded fields
-    assert!(found["duration_secs"].is_number());
+    assert!(found["cwd"].is_string(), "snapshot must contain cwd");
+    assert!(found["duration_secs"].is_number(), "snapshot must contain duration_secs");
     assert!(found["output_file"].is_string());
+    assert!(found["truncated"].is_boolean(), "snapshot must contain truncated");
+    assert!(found["total_bytes"].is_number(), "snapshot must contain total_bytes");
     assert!(found.get("env").is_none());
     assert!(found.get("environment").is_none());
 }

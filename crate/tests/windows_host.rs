@@ -201,3 +201,60 @@ async fn test_upstream_direct_dispatch_architecture_contract() {
     // Ensure UPSTREAM_BASE_COMMIT is 26f9001
     assert_eq!(host::UPSTREAM_BASE_COMMIT, "26f9001");
 }
+
+#[tokio::test]
+#[serial]
+async fn test_windows_command_resolution_no_cwd_preemption() {
+    let base_temp = TempDir::new().expect("base tempdir");
+    let ws_dir = base_temp.path().join("workspace");
+    std::fs::create_dir_all(&ws_dir).expect("create ws dir");
+
+    // Place dummy script in workspace matching common shell/command names
+    #[cfg(windows)]
+    {
+        let fake_cmd = ws_dir.join("powershell.bat");
+        std::fs::write(&fake_cmd, "@echo off\necho CWD_SCRIPT_PREEMPTED\n").expect("write fake script");
+    }
+    #[cfg(not(windows))]
+    {
+        let fake_cmd = ws_dir.join("sh");
+        std::fs::write(&fake_cmd, "#!/bin/sh\necho CWD_SCRIPT_PREEMPTED\n").expect("write fake script");
+    }
+
+    let harness = TestHarness::new_with_dir(base_temp);
+    let set_ws = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "set_workspace",
+                "arguments": {
+                    "path": ws_dir.to_str().unwrap()
+                }
+            }),
+        )
+        .await;
+    assert_eq!(set_ws["result"]["isError"], false);
+
+    // Run safe command
+    #[cfg(windows)]
+    let test_cmd = "powershell -NoProfile -Command \"Write-Output 'SAFE_RESOLVED'\"";
+    #[cfg(not(windows))]
+    let test_cmd = "echo 'SAFE_RESOLVED'";
+
+    let run_res = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_terminal_cmd",
+                "arguments": {
+                    "command": test_cmd,
+                    "description": "Verify no cwd script preemption"
+                }
+            }),
+        )
+        .await;
+    assert_eq!(run_res["result"]["isError"], false);
+    let text = run_res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("SAFE_RESOLVED"), "output must contain SAFE_RESOLVED: {text}");
+    assert!(!text.contains("CWD_SCRIPT_PREEMPTED"), "cwd script must not preempt system command: {text}");
+}
