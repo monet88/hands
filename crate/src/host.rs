@@ -32,11 +32,12 @@ pub fn config_dir() -> PathBuf {
         }
     }
     #[cfg(windows)]
-    return dirs::config_dir()
+    let base = dirs::config_dir()
         .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
         .join(APP);
     #[cfg(not(windows))]
-    home_dir().join(".config").join(APP)
+    let base = home_dir().join(".config").join(APP);
+    base
 }
 
 pub fn tunnel_client_dir() -> PathBuf {
@@ -46,11 +47,12 @@ pub fn tunnel_client_dir() -> PathBuf {
         }
     }
     #[cfg(windows)]
-    return dirs::config_dir()
+    let base = dirs::config_dir()
         .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
         .join("tunnel-client");
     #[cfg(not(windows))]
-    home_dir().join(".config/tunnel-client")
+    let base = home_dir().join(".config/tunnel-client");
+    base
 }
 
 pub fn workspace_file() -> PathBuf {
