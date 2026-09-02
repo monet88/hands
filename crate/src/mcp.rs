@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
+use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 
 use crate::host;
 use crate::plugin;
@@ -305,16 +306,99 @@ impl McpHost {
             .await
             .map_err(|e| (-32603, e, Value::Null))?;
         match bridge.call(name, arguments, &call_id).await {
-            Ok(result) => Ok(json!({
-                "content": [{ "type": "text", "text": result.prompt_text }],
-                "isError": false
-            })),
+            Ok(result) => {
+                let is_error = result.output.is_error();
+                let (structured, summary_text) = shape_tool_result(&result);
+                Ok(json!({
+                    "content": [{ "type": "text", "text": summary_text }],
+                    "structuredContent": structured,
+                    "isError": is_error
+                }))
+            }
             Err(e) => Ok(json!({
                 "content": [{ "type": "text", "text": e.to_string() }],
                 "isError": true
             })),
         }
     }
+}
+
+pub fn truncate_output_text(text: &str, max_bytes: usize, output_file: &str) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let half = max_bytes / 2;
+    let head_boundary = text.floor_char_boundary(half);
+    let head = &text[..head_boundary];
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(half));
+    let tail = &text[tail_start..];
+    let total_kb = (text.len() + 1023) / 1024;
+    let head_kb = (head_boundary + 1023) / 1024;
+    let tail_kb = (text.len() - tail_start + 1023) / 1024;
+    let file_hint = if !output_file.is_empty() {
+        format!(" Full output saved to {output_file}.")
+    } else {
+        String::new()
+    };
+    format!("{head}
+
+[Output truncated: showing first {head_kb}KB and last {tail_kb}KB of {total_kb}KB.{file_hint}]
+
+{tail}")
+}
+
+pub fn shape_tool_result(result: &ToolRunResult) -> (Value, String) {
+    let mut structured = serde_json::to_value(&result.output).unwrap_or_else(|_| json!({}));
+    let output_file: &str = match &result.output {
+        ToolOutput::Bash(b) => {
+            let output_str = String::from_utf8_lossy(&b.output).into_owned();
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("output".to_string(), Value::String(output_str));
+            }
+            &b.output_file
+        }
+        ToolOutput::BackgroundTaskStarted(bg) => &bg.output_file,
+        ToolOutput::TaskOutput(to) => match to {
+            xai_tool_types::TaskOutputOutput::Result(r) => {
+                if let Some(obj) = structured.as_object_mut() {
+                    obj.insert("task_id".to_string(), Value::String(r.task_id.clone()));
+                    obj.insert("command".to_string(), Value::String(r.command.clone()));
+                    obj.insert("status".to_string(), Value::String(r.status.clone()));
+                    obj.insert("exit_code".to_string(), r.exit_code.map(Value::from).unwrap_or(Value::Null));
+                    obj.insert("duration_secs".to_string(), json!(r.duration_secs));
+                    obj.insert("output".to_string(), Value::String(r.output.clone()));
+                    obj.insert("output_file".to_string(), Value::String(r.output_file.clone()));
+                    obj.insert("truncated".to_string(), Value::Bool(r.truncated));
+                    obj.insert("raw_output_bytes".to_string(), json!(r.raw_output_bytes));
+                }
+                &r.output_file
+            }
+            xai_tool_types::TaskOutputOutput::TaskNotFound(msg) => {
+                if let Some(obj) = structured.as_object_mut() {
+                    obj.insert("error".to_string(), Value::String(msg.clone()));
+                }
+                ""
+            }
+            _ => "",
+        },
+        _ => "",
+    };
+
+    let summary = if result.prompt_text.trim().is_empty() {
+        match &result.output {
+            ToolOutput::Bash(b) if b.total_bytes > 0 => {
+                format!("(output captured in file, exit code: {})", b.exit_code)
+            }
+            ToolOutput::BackgroundTaskStarted(bg) => {
+                format!("Background task started with ID: {}. Output streaming to {}.", bg.task_id, bg.output_file)
+            }
+            _ => result.prompt_text.clone(),
+        }
+    } else {
+        truncate_output_text(&result.prompt_text, 4096, output_file)
+    };
+
+    (structured, summary)
 }
 
 fn rpc_error(id: Value, code: i64, message: String) -> Value {

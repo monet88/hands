@@ -26,6 +26,7 @@ tokio = { workspace = true, features = [
     "sync",
 ] }
 xai-grok-tools = { path = "../xai-grok-tools" }
+xai-tool-types = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
