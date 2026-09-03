@@ -27,6 +27,8 @@ async fn test_run_command_tool_descriptor_and_list() {
     assert!(schema["properties"]["stdin"].is_object());
     assert!(schema["properties"]["timeout_ms"].is_object());
     assert!(schema["properties"]["env"].is_object());
+    let timeout_desc = schema["properties"]["timeout_ms"]["description"].as_str().unwrap();
+    assert!(timeout_desc.contains("deadline"), "timeout_ms must describe process runtime deadline: {timeout_desc}");
 
     let req = schema["required"].as_array().expect("required array");
     assert!(req.iter().any(|v| v == "command"));
@@ -493,11 +495,15 @@ async fn test_run_command_minimal_timeout() {
 
     assert_eq!(resp["result"]["isError"], false);
     let structured = &resp["result"]["structuredContent"];
-    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["execution_state"], "timed_out");
     assert_eq!(structured["command_started"], true);
-    assert_eq!(structured["command_completed"], true);
+    assert_eq!(structured["command_completed"], false);
     assert_eq!(structured["timed_out"], true);
     assert_eq!(structured["exit_code"], -1);
+    assert!(structured["stdout"].is_string());
+    assert!(structured["stderr"].is_string());
+    assert!(structured["stdout_truncated"].is_boolean());
+    assert!(structured["stderr_truncated"].is_boolean());
 }
 #[tokio::test]
 #[serial]
@@ -616,7 +622,9 @@ async fn test_run_command_timeout_with_detached_descendant() {
     let elapsed = start.elapsed();
     assert_eq!(resp["result"]["isError"], false);
     let structured = &resp["result"]["structuredContent"];
-    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["execution_state"], "timed_out");
+    assert_eq!(structured["command_started"], true);
+    assert_eq!(structured["command_completed"], false);
     assert_eq!(structured["timed_out"], true);
     assert_eq!(structured["exit_code"], -1);
     assert!(
@@ -710,4 +718,43 @@ async fn test_run_command_output_exceeding_max_raw_bytes_drains_without_broken_p
         hands::run_command::MAX_RAW_OUTPUT_BYTES,
         "captured raw stdout should fill up to MAX_RAW_OUTPUT_BYTES"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_repeated_timeouts_cleanup_and_bounded() {
+    let harness = TestHarness::new();
+
+    #[cfg(windows)]
+    let (cmd, args) = ("powershell", vec!["-NoProfile", "-Command", "Start-Sleep -Milliseconds 2000"]);
+    #[cfg(not(windows))]
+    let (cmd, args) = ("sleep", vec!["2"]);
+
+    for _ in 0..3 {
+        let resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "run_command",
+                    "arguments": {
+                        "command": cmd,
+                        "args": args.clone(),
+                        "timeout_ms": 100
+                    }
+                }),
+            )
+            .await;
+
+        assert_eq!(resp["result"]["isError"], false);
+        let structured = &resp["result"]["structuredContent"];
+        assert_eq!(structured["execution_state"], "timed_out");
+        assert_eq!(structured["command_started"], true);
+        assert_eq!(structured["command_completed"], false);
+        assert_eq!(structured["timed_out"], true);
+        assert_eq!(structured["exit_code"], -1);
+        let stdout = structured["stdout"].as_str().unwrap();
+        let stderr = structured["stderr"].as_str().unwrap();
+        assert!(stdout.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES);
+        assert!(stderr.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES);
+    }
 }

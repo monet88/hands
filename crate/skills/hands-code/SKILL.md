@@ -26,6 +26,6 @@ Do not ask the user in chat to confirm each edit. Call the tool. ChatGPT already
 
 ## Commands
 
-Use `is_background: true` for builds, tests, servers, or anything that may exceed ~15s. Foreground auto-backgrounds on timeout; then poll `get_task_output`. Stop with `kill_task`.
-
+Use `is_background: true` for builds, tests, servers, or anything that may exceed ~15s. Foreground `run_terminal_cmd` auto-backgrounds when its foreground wait budget expires (~15s) without killing or restarting the process; this handoff is not a timeout. Poll `get_task_output` for background tasks, or stop with `kill_task`.
+For `run_command`, `timeout_ms` specifies a total process runtime deadline after which the child process is terminated.
 Prefer one `apply_patch` over many tiny `search_replace` calls.

@@ -22,8 +22,8 @@ any shell. The executable path and each argument are passed to the OS verbatim â
 no shell quoting, no shell metacharacter expansion, and no shell interpretation. \
 Use run_terminal_cmd when shell semantics (pipes, globs, redirection, batch scripts) \
 are required. Shell scripts (.cmd, .bat) are rejected. Pre-spawn validation failures \
-report execution_state=not_started. Completed commands report execution_state=completed.";
-
+report execution_state=not_started. Completed commands report execution_state=completed. \
+Timed out commands report execution_state=timed_out once process cleanup is proven.";
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024; // 1 MB
@@ -57,7 +57,7 @@ pub fn input_schema() -> Value {
             },
             "timeout_ms": {
                 "type": "integer",
-                "description": "Optional foreground timeout in milliseconds (default 120000, max 600000)."
+                "description": "Optional total process runtime deadline in milliseconds (default 120000, max 600000). Distinct from foreground wait budgets: this deadline applies to the process runtime."
             },
             "env": {
                 "type": "object",
@@ -298,8 +298,8 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
 
     let wait_res = tokio::time::timeout(validated.timeout, child.wait()).await;
 
-    let (exit_code, timed_out) = match wait_res {
-        Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+    let (exit_code, timed_out, execution_state, command_completed) = match wait_res {
+        Ok(Ok(status)) => (status.code().unwrap_or(-1), false, "completed", true),
         Ok(Err(e)) => {
             stdout_handle.abort();
             stderr_handle.abort();
@@ -307,7 +307,7 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             return json!({
                 "content": [{ "type": "text", "text": err_msg }],
                 "structuredContent": {
-                    "execution_state": "failed",
+                    "execution_state": "outcome_unknown",
                     "command_started": true,
                     "command_completed": false,
                     "exit_code": Value::Null,
@@ -319,9 +319,13 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             });
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            (-1, true)
+            let kill_res = child.kill().await;
+            let wait_after_kill = child.wait().await;
+            if kill_res.is_ok() && wait_after_kill.is_ok() {
+                (-1, true, "timed_out", false)
+            } else {
+                (-1, true, "outcome_unknown", false)
+            }
         }
     };
 
@@ -377,9 +381,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     json!({
         "content": [{ "type": "text", "text": content_text }],
         "structuredContent": {
-            "execution_state": "completed",
+            "execution_state": execution_state,
             "command_started": true,
-            "command_completed": true,
+            "command_completed": command_completed,
             "exit_code": exit_code,
             "timed_out": timed_out,
             "stdout": stdout_str,

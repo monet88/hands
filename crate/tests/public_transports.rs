@@ -332,6 +332,39 @@ fn test_public_mcp_stdio_process_boundary() {
         outside_stdio_path,
         "effective cwd must report Repo B over stdio"
     );
+
+    // 10. tools/call run_command over stdio with process timeout
+    let timeout_cmd_req = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": ["-c", "import time; time.sleep(5)"],
+                "timeout_ms": 100
+            }
+        }
+    });
+    line = serde_json::to_string(&timeout_cmd_req).unwrap();
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    resp_line.clear();
+    reader.read_line(&mut resp_line).expect("read timeout run_command response");
+    let resp: Value = serde_json::from_str(&resp_line).expect("parse timeout run_command json");
+    assert_eq!(resp["id"], 10);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        resp["result"]["structuredContent"]["execution_state"], "timed_out",
+        "terminal process timeout must report execution_state 'timed_out'"
+    );
+    assert_eq!(resp["result"]["structuredContent"]["command_started"], true);
+    assert_eq!(resp["result"]["structuredContent"]["command_completed"], false);
+    assert_eq!(resp["result"]["structuredContent"]["timed_out"], true);
+    assert_eq!(resp["result"]["structuredContent"]["exit_code"], -1);
 }
 
 fn pick_free_port() -> u16 {
@@ -582,4 +615,30 @@ fn test_public_mcp_http_process_boundary() {
         outside_http_path,
         "effective cwd must report Repo B over HTTP"
     );
+
+    // 7. tools/call run_command over HTTP with process timeout
+    let timeout_http_req = json!({
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": ["-c", "import time; time.sleep(5)"],
+                "timeout_ms": 100
+            }
+        }
+    });
+    let resp = http_post_rpc(port, &timeout_http_req).expect("http run_command timeout rpc");
+    assert_eq!(resp["id"], 17);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        resp["result"]["structuredContent"]["execution_state"], "timed_out",
+        "http run_command process timeout must report execution_state 'timed_out'"
+    );
+    assert_eq!(resp["result"]["structuredContent"]["command_started"], true);
+    assert_eq!(resp["result"]["structuredContent"]["command_completed"], false);
+    assert_eq!(resp["result"]["structuredContent"]["timed_out"], true);
+    assert_eq!(resp["result"]["structuredContent"]["exit_code"], -1);
 }

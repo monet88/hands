@@ -307,6 +307,10 @@ async fn test_auto_background_on_timeout_identity_and_no_restart() {
         structured["status"], "running",
         "auto-backgrounded task must be returned as running: {resp}"
     );
+    assert_ne!(
+        structured["status"], "timed_out",
+        "auto-background handoff must never be reported as timed_out"
+    );
 
     let task_id = structured["task_id"]
         .as_str()
