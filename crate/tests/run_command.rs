@@ -758,3 +758,78 @@ async fn test_run_command_repeated_timeouts_cleanup_and_bounded() {
         assert!(stderr.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES);
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_timeout_direct_child_cleaned_up() {
+    let harness = TestHarness::new();
+    let pid_file = harness.temp.path().join("child_to_kill.pid");
+    let pid_file_str = pid_file.display().to_string().replace('\\', "/");
+
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    let script = format!(
+        "import os, time; open('{}', 'w').write(str(os.getpid())); time.sleep(10)",
+        pid_file_str
+    );
+
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": ["-c", script],
+                    "timeout_ms": 500
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "timed_out");
+    assert_eq!(structured["command_started"], true);
+    assert_eq!(structured["command_completed"], false);
+    assert_eq!(structured["timed_out"], true);
+    assert_eq!(structured["exit_code"], -1);
+
+    assert!(pid_file.exists(), "child pid file must have been written before timeout");
+    let pid_str = std::fs::read_to_string(&pid_file).expect("read pid file");
+    let pid: u32 = pid_str.trim().parse().expect("parse pid integer");
+
+    // Give OS scheduler a moment to complete process termination
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    #[cfg(windows)]
+    {
+        // Verify via PowerShell Get-Process that process is gone
+        let check_out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid),
+            ])
+            .output()
+            .expect("check child process existence");
+        let stdout = String::from_utf8_lossy(&check_out.stdout).trim().to_string();
+        assert!(
+            stdout.is_empty(),
+            "direct child process (pid {pid}) must NOT still be running after timeout return: found '{stdout}'"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let check_out = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output();
+        let still_alive = check_out.map(|o| o.status.success()).unwrap_or(false);
+        assert!(!still_alive, "direct child process (pid {pid}) must NOT still be running after timeout return");
+    }
+}
