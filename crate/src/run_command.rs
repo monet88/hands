@@ -78,7 +78,11 @@ pub struct ValidatedInput {
 }
 
 fn validate_input(params: &Value, default_workdir: &Path) -> Result<ValidatedInput, String> {
-    let cmd_val = params.get("command").and_then(Value::as_str).unwrap_or("").trim();
+    let cmd_val = match params.get("command") {
+        Some(Value::String(s)) => s.trim(),
+        Some(_) => return Err("command must be a string".into()),
+        None => return Err("command must not be empty".into()),
+    };
     if cmd_val.is_empty() {
         return Err("command must not be empty".into());
     }
@@ -97,54 +101,74 @@ fn validate_input(params: &Value, default_workdir: &Path) -> Result<ValidatedInp
 
     let mut args = Vec::new();
     if let Some(args_val) = params.get("args") {
-        let arr = args_val.as_array().ok_or("args must be an array of strings")?;
-        if arr.len() > 2000 {
-            return Err("args array exceeds maximum length of 2000 items".into());
-        }
-        for item in arr {
-            let s = item.as_str().ok_or("all args items must be strings")?;
-            args.push(s.to_string());
+        if !args_val.is_null() {
+            let arr = args_val.as_array().ok_or("args must be an array of strings")?;
+            if arr.len() > 2000 {
+                return Err("args array exceeds maximum length of 2000 items".into());
+            }
+            for item in arr {
+                let s = item.as_str().ok_or("all args items must be strings")?;
+                args.push(s.to_string());
+            }
         }
     }
 
-    let workdir = if let Some(wd_val) = params.get("workdir").and_then(Value::as_str) {
-        let p = PathBuf::from(wd_val.trim());
-        let resolved = if p.is_absolute() {
-            p
-        } else {
-            default_workdir.join(p)
-        };
-        if !resolved.is_dir() {
-            return Err(format!("workdir '{}' is not a valid directory", resolved.display()));
+    let workdir = match params.get("workdir") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(wd_val)) => {
+            let s = wd_val.trim();
+            if s.is_empty() {
+                return Err("workdir must not be empty".into());
+            }
+            let p = PathBuf::from(s);
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                default_workdir.join(p)
+            };
+            if !resolved.is_dir() {
+                return Err(format!("workdir '{}' is not a valid directory", resolved.display()));
+            }
+            Some(dunce::canonicalize(&resolved).unwrap_or(resolved))
         }
-        Some(dunce::canonicalize(&resolved).unwrap_or(resolved))
-    } else {
-        None
+        Some(_) => return Err("workdir must be a string".into()),
     };
 
-    let stdin = if let Some(stdin_val) = params.get("stdin").and_then(Value::as_str) {
-        if stdin_val.len() > MAX_STDIN_BYTES {
-            return Err(format!("stdin exceeds maximum size limit of {} bytes", MAX_STDIN_BYTES));
+    let stdin = match params.get("stdin") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(stdin_val)) => {
+            if stdin_val.len() > MAX_STDIN_BYTES {
+                return Err(format!("stdin exceeds maximum size limit of {} bytes", MAX_STDIN_BYTES));
+            }
+            Some(stdin_val.clone())
         }
-        Some(stdin_val.to_string())
-    } else {
-        None
+        Some(_) => return Err("stdin must be a string".into()),
     };
 
-    let timeout_ms = params
-        .get("timeout_ms")
-        .or_else(|| params.get("timeout"))
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .min(MAX_TIMEOUT_MS);
+    let timeout_val = params.get("timeout_ms").or_else(|| params.get("timeout"));
+    let timeout_ms = match timeout_val {
+        Some(Value::Null) | None => DEFAULT_TIMEOUT_MS,
+        Some(v) => {
+            let n = v.as_u64().ok_or("timeout_ms must be a positive integer")?;
+            if n == 0 {
+                return Err("timeout_ms must be greater than 0".into());
+            }
+            if n > MAX_TIMEOUT_MS {
+                return Err(format!("timeout_ms exceeds maximum limit of {} ms", MAX_TIMEOUT_MS));
+            }
+            n
+        }
+    };
     let timeout = Duration::from_millis(timeout_ms);
 
     let mut env = HashMap::new();
     if let Some(env_val) = params.get("env") {
-        let obj = env_val.as_object().ok_or("env must be a JSON object of key-value string pairs")?;
-        for (k, v) in obj {
-            let v_str = v.as_str().ok_or(format!("env value for key '{}' must be a string", k))?;
-            env.insert(k.clone(), v_str.to_string());
+        if !env_val.is_null() {
+            let obj = env_val.as_object().ok_or("env must be a JSON object of key-value string pairs")?;
+            for (k, v) in obj {
+                let v_str = v.as_str().ok_or(format!("env value for key '{}' must be a string", k))?;
+                env.insert(k.clone(), v_str.to_string());
+            }
         }
     }
 
@@ -297,31 +321,34 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     let stdout_str = String::from_utf8_lossy(&stdout_raw).into_owned();
     let stderr_str = String::from_utf8_lossy(&stderr_raw).into_owned();
 
-    let truncated_stdout = if stdout_str.len() > MAX_OUTPUT_BYTES {
-        crate::mcp::truncate_output_text(&stdout_str, MAX_OUTPUT_BYTES, "")
-    } else {
-        stdout_str.clone()
-    };
-
     let mut summary_lines = Vec::new();
     if timed_out {
         summary_lines.push(format!("Command timed out after {}ms", validated.timeout.as_millis()));
     }
     if !stdout_str.is_empty() {
-        summary_lines.push(truncated_stdout);
+        let text = if stdout_str.len() > MAX_OUTPUT_BYTES {
+            crate::mcp::truncate_output_text(&stdout_str, MAX_OUTPUT_BYTES, "")
+        } else {
+            stdout_str.clone()
+        };
+        summary_lines.push(text);
     }
     if !stderr_str.is_empty() {
-        let truncated_stderr = if stderr_str.len() > MAX_OUTPUT_BYTES {
+        let text = if stderr_str.len() > MAX_OUTPUT_BYTES {
             crate::mcp::truncate_output_text(&stderr_str, MAX_OUTPUT_BYTES, "")
         } else {
             stderr_str.clone()
         };
-        summary_lines.push(format!("stderr: {truncated_stderr}"));
+        summary_lines.push(format!("stderr: {text}"));
     }
     summary_lines.push(format!("exit: {exit_code}"));
 
-    let content_text = summary_lines.join("\n");
-
+    let combined = summary_lines.join("\n");
+    let content_text = if combined.len() > MAX_OUTPUT_BYTES {
+        crate::mcp::truncate_output_text(&combined, MAX_OUTPUT_BYTES, "")
+    } else {
+        combined
+    };
     json!({
         "content": [{ "type": "text", "text": content_text }],
         "structuredContent": {

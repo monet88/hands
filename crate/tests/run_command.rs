@@ -130,6 +130,94 @@ async fn test_run_command_pre_spawn_validation_rejects_invalid_args() {
         .await;
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+
+    // 5. Malformed schema: workdir as number or empty string
+    for bad_wd in &[json!(123), json!("   ")] {
+        let resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "run_command",
+                    "arguments": {
+                        "command": "echo",
+                        "workdir": bad_wd
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+    }
+
+    // 6. Malformed schema: stdin as number
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": "echo",
+                    "stdin": 123
+                }
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+
+    // 7. Malformed schema: timeout_ms invalid types or ranges
+    for bad_timeout in &[json!("bogus"), json!(-1), json!(0), json!(1_000_000)] {
+        let resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "run_command",
+                    "arguments": {
+                        "command": "echo",
+                        "timeout_ms": bad_timeout
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+    }
+
+    // 8. Malformed schema: args not an array or containing non-strings
+    for bad_args in &[json!("not-an-array"), json!([123])] {
+        let resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "run_command",
+                    "arguments": {
+                        "command": "echo",
+                        "args": bad_args
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+    }
+
+    // 9. Malformed schema: env not an object or containing non-string values
+    for bad_env in &[json!("not-an-object"), json!({"KEY": 123})] {
+        let resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "run_command",
+                    "arguments": {
+                        "command": "echo",
+                        "env": bad_env
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["execution_state"], "not_started");
+    }
 }
 
 #[tokio::test]
@@ -213,6 +301,57 @@ async fn test_run_command_literal_argv_and_zero_exit() {
     assert_eq!(structured["exit_code"], 0);
     let hash = structured["stdout"].as_str().expect("hash string").trim();
     assert_eq!(hash.len(), 40, "git hash-object must output 40-char SHA1");
+
+    // Test literal argv preserving spaces, quotes, $, JSON, Unicode, newlines, leading dashes, metacharacters
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+    let literal_args = vec![
+        "-c".to_string(),
+        "import sys, json; print(json.dumps(sys.argv[1:]))".to_string(),
+        "space arg".to_string(),
+        "\"quotes\"".to_string(),
+        "$PATH".to_string(),
+        "{\"a\":1}".to_string(),
+        "unicode-✓".to_string(),
+        "line1\nline2".to_string(),
+        "--leading".to_string(),
+        "&|<>".to_string(),
+    ];
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": literal_args
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["exit_code"], 0);
+    let stdout = structured["stdout"].as_str().expect("stdout string").trim();
+    let parsed: Vec<String> = serde_json::from_str(stdout).expect("parse json output from python");
+    assert_eq!(
+        parsed,
+        vec![
+            "space arg",
+            "\"quotes\"",
+            "$PATH",
+            "{\"a\":1}",
+            "unicode-✓",
+            "line1\nline2",
+            "--leading",
+            "&|<>"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -350,4 +489,54 @@ async fn test_run_command_bounded_output() {
     let content_text = resp["result"]["content"][0]["text"].as_str().expect("content text");
     assert!(content_text.contains("[Output truncated: showing first"));
     assert!(content_text.len() < stdout.len(), "content text must be bounded");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_combined_output_bounded_shared_budget() {
+    let harness = TestHarness::new();
+
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    // Generate 30KB on stdout and 30KB on stderr (total 60KB > MAX_OUTPUT_BYTES = 40KB)
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": [
+                        "-c",
+                        "import sys; sys.stdout.write('A' * 30000); sys.stderr.write('B' * 30000)"
+                    ]
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["exit_code"], 0);
+
+    let stdout = structured["stdout"].as_str().expect("stdout string");
+    let stderr = structured["stderr"].as_str().expect("stderr string");
+    assert_eq!(stdout.len(), 30_000, "raw stdout should be 30KB");
+    assert_eq!(stderr.len(), 30_000, "raw stderr should be 30KB");
+
+    let content_text = resp["result"]["content"][0]["text"].as_str().expect("content text");
+    assert!(
+        content_text.contains("[Output truncated: showing first"),
+        "combined content text must be truncated under shared budget"
+    );
+    assert!(
+        content_text.len() <= hands::run_command::MAX_OUTPUT_BYTES + 300,
+        "content text length ({}) must not exceed shared budget",
+        content_text.len()
+    );
 }
