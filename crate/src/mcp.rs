@@ -2,7 +2,7 @@
 //! No extra crates: ChatGPT tunnel-client speaks stdio; Inspector can use HTTP.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,7 +58,10 @@ impl McpHost {
 
     fn workspace_info_result(&self) -> Value {
         let cwd = self.workspace();
-        let mut lines = vec![format!("workspace: {}", cwd.display())];
+        let mut lines = vec![
+            format!("default workspace: {}", cwd.display()),
+            "note: Explicit absolute targets or commands with an explicit workdir execute in their specified target without changing this default workspace.".into(),
+        ];
         let recent: Vec<String> = host::read_recent()
             .into_iter()
             .filter(|p| p != &cwd)
@@ -79,6 +82,8 @@ impl McpHost {
             "content": [{ "type": "text", "text": lines.join("\n") }],
             "structuredContent": {
                 "workspace": cwd.display().to_string(),
+                "default_workspace": cwd.display().to_string(),
+                "is_default": true,
                 "recent": recent,
             },
             "isError": false
@@ -234,7 +239,7 @@ impl McpHost {
         let mut tools = vec![
             plugin::tool_descriptor(
                 "workspace_info",
-                "Use this when you need the active local workspace root and recently used folders. Call before other tools if the workspace might have changed.",
+                "Use this to inspect the default Workspace root and recently used folders. Relative operations resolve against this default Workspace; explicit paths/workdirs target their specified location.",
                 json!({ "type": "object", "properties": {} }),
             ),
             plugin::tool_descriptor(
@@ -293,10 +298,11 @@ impl McpHost {
                 Ok(cwd) => Ok(json!({
                     "content": [{
                         "type": "text",
-                        "text": format!("workspace pinned: {}\nLater tools use this folder until set_workspace is called again.", cwd.display())
+                        "text": format!("default workspace pinned: {}\nRelative operations resolve against this default workspace; explicit paths and workdirs target their specified locations.", cwd.display())
                     }],
                     "structuredContent": {
-                        "workspace": cwd.display().to_string()
+                        "workspace": cwd.display().to_string(),
+                        "default_workspace": cwd.display().to_string()
                     },
                     "isError": false
                 })),
@@ -385,6 +391,7 @@ impl McpHost {
             "mcp-{}",
             self.call_seq.fetch_add(1, Ordering::Relaxed)
         );
+        let active_workspace = self.workspace();
         let bridge = self
             .bridge()
             .await
@@ -393,6 +400,7 @@ impl McpHost {
             Ok(result) => {
                 let is_error = result.output.is_error();
                 let (structured, summary_text) = shape_tool_result(&result);
+                let structured = enrich_context_metadata(structured, &result, &active_workspace);
                 Ok(json!({
                     "content": [{ "type": "text", "text": summary_text }],
                     "structuredContent": structured,
@@ -405,6 +413,41 @@ impl McpHost {
             })),
         }
     }
+}
+
+fn enrich_context_metadata(mut structured: Value, result: &ToolRunResult, default_ws: &Path) -> Value {
+    if let Some(obj) = structured.as_object_mut() {
+        let ws_str = default_ws.display().to_string();
+        obj.insert("default_workspace".to_string(), Value::String(ws_str));
+
+        match &result.output {
+            ToolOutput::Bash(b) => {
+                obj.insert("cwd".to_string(), Value::String(b.current_dir.clone()));
+            }
+            ToolOutput::ReadFile(rf) => {
+                if let xai_grok_tools::types::output::ReadFileOutput::FileContent(fc) = rf {
+                    obj.insert(
+                        "target_path".to_string(),
+                        Value::String(fc.absolute_path.display().to_string()),
+                    );
+                }
+            }
+            ToolOutput::SearchReplace(xai_grok_tools::types::output::SearchReplaceOutput::EditsApplied(ea)) => {
+                obj.insert(
+                    "target_path".to_string(),
+                    Value::String(ea.absolute_path.display().to_string()),
+                );
+            }
+            ToolOutput::ListDir(xai_grok_tools::types::output::ListDirOutput::Content(ldc)) => {
+                obj.insert(
+                    "target_path".to_string(),
+                    Value::String(ldc.absolute_root_path.display().to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
+    structured
 }
 
 #[inline]

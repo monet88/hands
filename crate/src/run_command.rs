@@ -221,7 +221,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
                     "command_started": false,
                     "command_completed": false,
                     "exit_code": Value::Null,
-                    "error": err_msg
+                    "error": err_msg,
+                    "cwd": active_workspace.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
                 },
                 "isError": true
             });
@@ -257,7 +259,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
                     "command_started": false,
                     "command_completed": false,
                     "exit_code": Value::Null,
-                    "error": err_msg
+                    "error": err_msg,
+                    "cwd": cwd.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
                 },
                 "isError": true
             });
@@ -307,7 +311,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
                     "command_started": true,
                     "command_completed": false,
                     "exit_code": Value::Null,
-                    "error": err_msg
+                    "error": err_msg,
+                    "cwd": cwd.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
                 },
                 "isError": true
             });
@@ -379,7 +385,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             "stdout": stdout_str,
             "stderr": stderr_str,
             "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated
+            "stderr_truncated": stderr_truncated,
+            "cwd": cwd.display().to_string(),
+            "default_workspace": active_workspace.display().to_string()
         },
         "isError": false
     })

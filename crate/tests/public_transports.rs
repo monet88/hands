@@ -269,6 +269,17 @@ fn test_public_mcp_stdio_process_boundary() {
     assert_eq!(resp["result"]["isError"], false);
     assert_eq!(resp["result"]["structuredContent"]["execution_state"], "completed");
     assert_eq!(resp["result"]["structuredContent"]["exit_code"], 0);
+    let expected_stdio_ws = dunce::canonicalize(switched_ws.path()).unwrap().display().to_string();
+    assert_eq!(
+        resp["result"]["structuredContent"]["default_workspace"].as_str().unwrap(),
+        expected_stdio_ws,
+        "stdio run_command must report default_workspace"
+    );
+    assert_eq!(
+        resp["result"]["structuredContent"]["cwd"].as_str().unwrap(),
+        expected_stdio_ws,
+        "stdio run_command must report effective execution cwd"
+    );
     let stdout = resp["result"]["structuredContent"]["stdout"].as_str().expect("stdout");
     let parsed: Vec<String> = serde_json::from_str(stdout.trim()).expect("parse stdout json");
     assert_eq!(
@@ -283,6 +294,43 @@ fn test_public_mcp_stdio_process_boundary() {
             "--leading",
             "&|<>"
         ]
+    );
+
+    // 9. tools/call run_command over stdio with explicit workdir outside default workspace
+    let outside_stdio_dir = TempDir::new().expect("outside stdio dir");
+    let outside_stdio_path = dunce::canonicalize(outside_stdio_dir.path()).unwrap().display().to_string();
+    let outside_cmd_req = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": ["-c", "import os; print('OUTSIDE_STDIO_OK')"],
+                "workdir": outside_stdio_path
+            }
+        }
+    });
+    line = serde_json::to_string(&outside_cmd_req).unwrap();
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    resp_line.clear();
+    reader.read_line(&mut resp_line).expect("read outside run_command response");
+    let resp: Value = serde_json::from_str(&resp_line).expect("parse outside run_command json");
+    assert_eq!(resp["id"], 9);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        resp["result"]["structuredContent"]["default_workspace"].as_str().unwrap(),
+        expected_stdio_ws,
+        "default_workspace must remain Repo A over stdio"
+    );
+    assert_eq!(
+        resp["result"]["structuredContent"]["cwd"].as_str().unwrap(),
+        outside_stdio_path,
+        "effective cwd must report Repo B over stdio"
     );
 }
 
@@ -478,6 +526,17 @@ fn test_public_mcp_http_process_boundary() {
     assert_eq!(resp["result"]["isError"], false);
     assert_eq!(resp["result"]["structuredContent"]["execution_state"], "completed");
     assert_eq!(resp["result"]["structuredContent"]["exit_code"], 0);
+    let expected_http_ws = dunce::canonicalize(switched_ws.path()).unwrap().display().to_string();
+    assert_eq!(
+        resp["result"]["structuredContent"]["default_workspace"].as_str().unwrap(),
+        expected_http_ws,
+        "http run_command must report default_workspace"
+    );
+    assert_eq!(
+        resp["result"]["structuredContent"]["cwd"].as_str().unwrap(),
+        expected_http_ws,
+        "http run_command must report effective execution cwd"
+    );
     let stdout = resp["result"]["structuredContent"]["stdout"].as_str().expect("stdout");
     let parsed: Vec<String> = serde_json::from_str(stdout.trim()).expect("parse stdout json");
     assert_eq!(
@@ -492,5 +551,35 @@ fn test_public_mcp_http_process_boundary() {
             "--leading",
             "&|<>"
         ]
+    );
+
+    // 6. tools/call run_command over HTTP with explicit workdir outside default workspace
+    let outside_http_dir = TempDir::new().expect("outside http dir");
+    let outside_http_path = dunce::canonicalize(outside_http_dir.path()).unwrap().display().to_string();
+    let outside_http_req = json!({
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": ["-c", "import os; print('OUTSIDE_HTTP_OK')"],
+                "workdir": outside_http_path
+            }
+        }
+    });
+    let resp = http_post_rpc(port, &outside_http_req).expect("http run_command outside rpc");
+    assert_eq!(resp["id"], 16);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        resp["result"]["structuredContent"]["default_workspace"].as_str().unwrap(),
+        expected_http_ws,
+        "default_workspace must remain Repo A over HTTP"
+    );
+    assert_eq!(
+        resp["result"]["structuredContent"]["cwd"].as_str().unwrap(),
+        outside_http_path,
+        "effective cwd must report Repo B over HTTP"
     );
 }
