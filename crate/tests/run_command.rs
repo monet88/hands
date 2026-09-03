@@ -1,4 +1,5 @@
 mod common;
+use std::path::Path;
 use common::TestHarness;
 use serde_json::json;
 use serial_test::serial;
@@ -300,7 +301,35 @@ async fn test_run_command_literal_argv_and_zero_exit() {
     assert_eq!(structured["execution_state"], "completed");
     assert_eq!(structured["exit_code"], 0);
     let hash = structured["stdout"].as_str().expect("hash string").trim();
-    assert_eq!(hash.len(), 40, "git hash-object must output 40-char SHA1");
+    // Exact SHA1 of sentinel: 04d493ce47b40bc9dcd8635d7e78f30a2cdfb5ce
+    // (empty input would yield e69de29bb2d1d6434b8b29ae775ad8c2e48c5391)
+    assert_eq!(
+        hash, "04d493ce47b40bc9dcd8635d7e78f30a2cdfb5ce",
+        "git hash-object must output exact SHA1 derived from stdin"
+    );
+
+    // Direct verbatim stdin roundtrip with python
+    let py_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": py_cmd,
+                    "args": ["-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+                    "stdin": sentinel
+                }
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["stdout"], sentinel, "stdin must be piped verbatim to child stdout");
 
     // Test literal argv preserving spaces, quotes, $, JSON, Unicode, newlines, leading dashes, metacharacters
     let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
@@ -390,18 +419,24 @@ async fn test_run_command_env_and_workdir_isolation() {
     let temp_sub = harness.temp.path().join("subfolder");
     std::fs::create_dir_all(&temp_sub).unwrap();
 
-    // Run git rev-parse --show-toplevel inside subfolder
-    // Notice: env values and stdin are NOT echoed back in structuredContent metadata
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    let script = "import os, json; print(json.dumps({'env': os.environ.get('CUSTOM_ENV_VAR'), 'cwd': os.path.realpath(os.getcwd())}))";
     let resp = harness
         .rpc(
             "tools/call",
             json!({
                 "name": "run_command",
                 "arguments": {
-                    "command": "git",
-                    "args": ["status", "--short"],
+                    "command": python_cmd,
+                    "args": ["-c", script],
                     "workdir": temp_sub.display().to_string(),
                     "env": {
+                        "CUSTOM_ENV_VAR": "custom_env_val",
                         "SECRET_ENV_VAR_TEST": "secret_value_must_not_leak"
                     },
                     "stdin": "secret_stdin_must_not_leak"
@@ -413,6 +448,16 @@ async fn test_run_command_env_and_workdir_isolation() {
     assert_eq!(resp["result"]["isError"], false);
     let structured = &resp["result"]["structuredContent"];
     assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["exit_code"], 0);
+
+    let stdout = structured["stdout"].as_str().expect("stdout string").trim();
+    let parsed: serde_json::Value = serde_json::from_str(stdout).expect("parse json output from python");
+    assert_eq!(parsed["env"], "custom_env_val", "env var must be applied to child process");
+
+    let actual_cwd = dunce::canonicalize(Path::new(parsed["cwd"].as_str().unwrap())).unwrap();
+    let expected_cwd = dunce::canonicalize(&temp_sub).unwrap();
+    assert_eq!(actual_cwd, expected_cwd, "workdir must be applied to child process");
+
     // Acceptance criterion: Environment values and stdin are never echoed back merely as execution metadata.
     assert!(structured.get("env").is_none());
     assert!(structured.get("stdin").is_none());
@@ -539,4 +584,72 @@ async fn test_run_command_combined_output_bounded_shared_budget() {
         "content text length ({}) must not exceed shared budget",
         content_text.len()
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_timeout_with_detached_descendant() {
+    let harness = TestHarness::new();
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    // Child spawns descendant that sleeps 2s holding pipes, while parent sleeps 10s.
+    // When 100ms timeout fires, child is killed and reader tasks are aborted, returning bounded.
+    let script = "import subprocess, time; subprocess.Popen(['python', '-c', 'import time; time.sleep(2)']); time.sleep(10)";
+    let start = std::time::Instant::now();
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": ["-c", script],
+                    "timeout_ms": 100
+                }
+            }),
+        )
+        .await;
+    let elapsed = start.elapsed();
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["timed_out"], true);
+    assert_eq!(structured["exit_code"], -1);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "call must return bounded within deadline, elapsed was {:?}",
+        elapsed
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_truncation_flags() {
+    let harness = TestHarness::new();
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": ["-c", "import sys; print('out'); sys.stderr.write('err\n')"]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["stdout_truncated"], false);
+    assert_eq!(structured["stderr_truncated"], false);
 }

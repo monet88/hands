@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -185,27 +186,30 @@ fn validate_input(params: &Value, default_workdir: &Path) -> Result<ValidatedInp
 async fn read_bounded<R: AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: usize,
-) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
+    capture: Arc<Mutex<(Vec<u8>, bool)>>,
+) {
     let mut chunk = [0u8; 4096];
-    let mut truncated = false;
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                let remaining = max_bytes.saturating_sub(buf.len());
+                let mut guard = capture.lock().unwrap();
+                let remaining = max_bytes.saturating_sub(guard.0.len());
                 if remaining > 0 {
                     let to_take = n.min(remaining);
-                    buf.extend_from_slice(&chunk[..to_take]);
-                }
-                if buf.len() >= max_bytes {
-                    truncated = true;
+                    guard.0.extend_from_slice(&chunk[..to_take]);
+                    if n > remaining {
+                        guard.1 = true;
+                        break;
+                    }
+                } else if n > 0 {
+                    guard.1 = true;
+                    break;
                 }
             }
             Err(_) => break,
         }
     }
-    (buf, truncated)
 }
 
 pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
@@ -274,19 +278,19 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
+    let stdout_capture = Arc::new(Mutex::new((Vec::new(), false)));
+    let stdout_capture_clone = Arc::clone(&stdout_capture);
     let stdout_handle = tokio::spawn(async move {
         if let Some(r) = stdout_pipe {
-            read_bounded(r, MAX_RAW_OUTPUT_BYTES).await
-        } else {
-            (Vec::new(), false)
+            read_bounded(r, MAX_RAW_OUTPUT_BYTES, stdout_capture_clone).await;
         }
     });
 
+    let stderr_capture = Arc::new(Mutex::new((Vec::new(), false)));
+    let stderr_capture_clone = Arc::clone(&stderr_capture);
     let stderr_handle = tokio::spawn(async move {
         if let Some(r) = stderr_pipe {
-            read_bounded(r, MAX_RAW_OUTPUT_BYTES).await
-        } else {
-            (Vec::new(), false)
+            read_bounded(r, MAX_RAW_OUTPUT_BYTES, stderr_capture_clone).await;
         }
     });
 
@@ -295,6 +299,8 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     let (exit_code, timed_out) = match wait_res {
         Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
         Ok(Err(e)) => {
+            stdout_handle.abort();
+            stderr_handle.abort();
             let err_msg = format!("Process wait error: {e}");
             return json!({
                 "content": [{ "type": "text", "text": err_msg }],
@@ -315,8 +321,23 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
         }
     };
 
-    let (stdout_raw, _) = stdout_handle.await.unwrap_or_default();
-    let (stderr_raw, _) = stderr_handle.await.unwrap_or_default();
+    if timed_out {
+        stdout_handle.abort();
+        stderr_handle.abort();
+    } else {
+        let join_timeout = Duration::from_millis(500);
+        let _ = tokio::time::timeout(join_timeout, stdout_handle).await;
+        let _ = tokio::time::timeout(join_timeout, stderr_handle).await;
+    }
+
+    let (stdout_raw, stdout_truncated) = {
+        let guard = stdout_capture.lock().unwrap();
+        (guard.0.clone(), guard.1)
+    };
+    let (stderr_raw, stderr_truncated) = {
+        let guard = stderr_capture.lock().unwrap();
+        (guard.0.clone(), guard.1)
+    };
 
     let stdout_str = String::from_utf8_lossy(&stdout_raw).into_owned();
     let stderr_str = String::from_utf8_lossy(&stderr_raw).into_owned();
@@ -358,7 +379,9 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             "exit_code": exit_code,
             "timed_out": timed_out,
             "stdout": stdout_str,
-            "stderr": stderr_str
+            "stderr": stderr_str,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated
         },
         "isError": false
     })
