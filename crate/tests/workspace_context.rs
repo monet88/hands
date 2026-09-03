@@ -217,3 +217,84 @@ async fn test_issue_50_explicit_absolute_file_target_outside_workspace() {
         "relative read_file must resolve from default workspace"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn test_issue_50_run_command_error_path_preserves_default_workspace_and_explicit_cwd() {
+    let harness = TestHarness::new();
+    let default_ws_path = dunce::canonicalize(harness.temp.path()).unwrap();
+    let default_ws_str = default_ws_path.display().to_string();
+
+    let repo_b = TempDir::new().expect("repo b tempdir");
+    let repo_b_path = dunce::canonicalize(repo_b.path()).unwrap();
+    let repo_b_str = repo_b_path.display().to_string();
+
+    let run_cmd_res = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": "nonexistent_executable_12345",
+                    "args": [],
+                    "workdir": repo_b_str
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(run_cmd_res["result"]["isError"], true);
+    let structured = &run_cmd_res["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "not_started");
+    assert_eq!(structured["command_started"], false);
+    assert_eq!(
+        structured["default_workspace"].as_str().unwrap(),
+        default_ws_str,
+        "default_workspace must remain Repo A on error path"
+    );
+    assert_eq!(
+        structured["cwd"].as_str().unwrap(),
+        repo_b_str,
+        "cwd must report Repo B on error path"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_issue_50_explicit_absolute_list_dir_outside_workspace() {
+    let harness = TestHarness::new();
+    let default_ws_path = dunce::canonicalize(harness.temp.path()).unwrap();
+    let default_ws_str = default_ws_path.display().to_string();
+
+    let outside_dir = TempDir::new().expect("outside tempdir");
+    let outside_dir_canonical = dunce::canonicalize(outside_dir.path()).unwrap();
+    let outside_dir_str = outside_dir_canonical.display().to_string();
+
+    let dummy_file = outside_dir_canonical.join("test_entry.txt");
+    std::fs::write(&dummy_file, "content").unwrap();
+
+    let list_res = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "list_dir",
+                "arguments": {
+                    "target_directory": outside_dir_str
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(list_res["result"]["isError"], false);
+    let structured = &list_res["result"]["structuredContent"];
+    assert_eq!(
+        structured["default_workspace"].as_str().unwrap(),
+        default_ws_str,
+        "list_dir must report default_workspace"
+    );
+    assert_eq!(
+        structured["target_path"].as_str().unwrap(),
+        outside_dir_str,
+        "list_dir target_path must report explicit outside directory"
+    );
+}

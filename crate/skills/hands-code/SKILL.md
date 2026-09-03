@@ -9,10 +9,13 @@ Do not ask the user in chat to confirm each edit. Call the tool. ChatGPT already
 
 ## Workspace
 
-1. Call `workspace_info` first if the folder might be wrong.
-2. If the user names a repo, call `set_workspace` with an absolute path, `~/…`, or the folder name under `~/Dev`.
-3. Do not invent paths. If `set_workspace` fails, use `recent` from `workspace_info` or ask once.
-
+1. The pinned Workspace is the default/implicit context for relative operations.
+2. Explicit absolute paths and explicit `workdir` may target elsewhere without repinning the Workspace.
+3. Call `workspace_info` first if the folder might be wrong.
+4. If the user names a repo to switch to, call `set_workspace` with an absolute path, `~/…`, or the folder name under `~/Dev`.
+5. Do not invent paths. If `set_workspace` fails, use `recent` from `workspace_info` or ask once.
+6. Command results should be interpreted using `cwd` plus `default_workspace`.
+7. File-operation results should use `target_path` plus `default_workspace` when available.
 ## Edit
 
 - Existing file: `read_file`, then `search_replace`.
