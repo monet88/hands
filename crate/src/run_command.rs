@@ -188,7 +188,7 @@ async fn read_bounded<R: AsyncRead + Unpin>(
     max_bytes: usize,
     capture: Arc<Mutex<(Vec<u8>, bool)>>,
 ) {
-    let mut chunk = [0u8; 4096];
+    let mut chunk = [0u8; 65536];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
@@ -200,11 +200,9 @@ async fn read_bounded<R: AsyncRead + Unpin>(
                     guard.0.extend_from_slice(&chunk[..to_take]);
                     if n > remaining {
                         guard.1 = true;
-                        break;
                     }
-                } else if n > 0 {
+                } else {
                     guard.1 = true;
-                    break;
                 }
             }
             Err(_) => break,

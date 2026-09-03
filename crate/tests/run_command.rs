@@ -653,3 +653,61 @@ async fn test_run_command_truncation_flags() {
     assert_eq!(structured["stdout_truncated"], false);
     assert_eq!(structured["stderr_truncated"], false);
 }
+
+#[tokio::test]
+#[serial]
+async fn test_run_command_output_exceeding_max_raw_bytes_drains_without_broken_pipe() {
+    let harness = TestHarness::new();
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    // Child writes 9 MiB (> MAX_RAW_OUTPUT_BYTES = 8 MiB) in 64 KiB chunks.
+    // Prior to fix, read_bounded broke out after 8 MiB, closing pipe and causing BrokenPipeError.
+    // With fix, pipe stays open, child completes successfully with exit code 0,
+    // stdout_truncated is true, and captured stdout length is bounded by MAX_RAW_OUTPUT_BYTES.
+    let script = "import sys\nchunk = b'X' * 65536\nfor _ in range(144):\n    sys.stdout.buffer.write(chunk)\nsys.stdout.buffer.flush()\n";
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": ["-c", script]
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["command_started"], true);
+    assert_eq!(structured["command_completed"], true);
+    assert_eq!(structured["timed_out"], false);
+    assert_eq!(
+        structured["exit_code"], 0,
+        "child writing >8 MiB must exit 0 without BrokenPipeError"
+    );
+    assert_eq!(
+        structured["stdout_truncated"], true,
+        "stdout_truncated must be true when output exceeds MAX_RAW_OUTPUT_BYTES"
+    );
+    assert_eq!(structured["stderr_truncated"], false);
+
+    let stdout = structured["stdout"].as_str().expect("stdout string");
+    assert!(
+        stdout.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES,
+        "captured raw stdout must not exceed MAX_RAW_OUTPUT_BYTES ({} bytes, got {})",
+        hands::run_command::MAX_RAW_OUTPUT_BYTES,
+        stdout.len()
+    );
+    assert_eq!(
+        stdout.len(),
+        hands::run_command::MAX_RAW_OUTPUT_BYTES,
+        "captured raw stdout should fill up to MAX_RAW_OUTPUT_BYTES"
+    );
+}
