@@ -104,6 +104,7 @@ fn test_public_mcp_stdio_process_boundary() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"read_file"));
     assert!(names.contains(&"run_terminal_cmd"));
+    assert!(names.contains(&"run_command"));
     assert!(names.contains(&"workspace_info"));
 
     // 3. tools/call workspace_info
@@ -226,6 +227,63 @@ fn test_public_mcp_stdio_process_boundary() {
     assert_eq!(resp["result"]["isError"], false);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("STDIO_TERMINAL_OK"), "output must contain STDIO_TERMINAL_OK: {text}");
+
+    // 8. tools/call run_command over stdio with literal argv
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+    let run_cmd_req = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": [
+                    "-c",
+                    "import sys, json; print(json.dumps(sys.argv[1:]))",
+                    "space arg",
+                    "\"quotes\"",
+                    "$PATH",
+                    "{\"a\":1}",
+                    "unicode-✓",
+                    "line1\nline2",
+                    "--leading",
+                    "&|<>"
+                ]
+            }
+        }
+    });
+    line = serde_json::to_string(&run_cmd_req).unwrap();
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    resp_line.clear();
+    reader.read_line(&mut resp_line).expect("read run_command response");
+    let resp: Value = serde_json::from_str(&resp_line).expect("parse run_command json");
+    assert_eq!(resp["id"], 8);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(resp["result"]["structuredContent"]["execution_state"], "completed");
+    assert_eq!(resp["result"]["structuredContent"]["exit_code"], 0);
+    let stdout = resp["result"]["structuredContent"]["stdout"].as_str().expect("stdout");
+    let parsed: Vec<String> = serde_json::from_str(stdout.trim()).expect("parse stdout json");
+    assert_eq!(
+        parsed,
+        vec![
+            "space arg",
+            "\"quotes\"",
+            "$PATH",
+            "{\"a\":1}",
+            "unicode-✓",
+            "line1\nline2",
+            "--leading",
+            "&|<>"
+        ]
+    );
 }
 
 fn pick_free_port() -> u16 {
@@ -327,6 +385,7 @@ fn test_public_mcp_http_process_boundary() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"workspace_info"));
     assert!(names.contains(&"run_terminal_cmd"));
+    assert!(names.contains(&"run_command"));
 
     // 3. tools/call run_terminal_cmd
     #[cfg(windows)]
@@ -384,4 +443,54 @@ fn test_public_mcp_http_process_boundary() {
     assert_eq!(resp["result"]["isError"], false);
     let content = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(content.contains("Switched HTTP workspace content!"));
+
+    // 5. tools/call run_command over HTTP
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+    let run_cmd_req = json!({
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": python_cmd,
+                "args": [
+                    "-c",
+                    "import sys, json; print(json.dumps(sys.argv[1:]))",
+                    "space arg",
+                    "\"quotes\"",
+                    "$PATH",
+                    "{\"a\":1}",
+                    "unicode-✓",
+                    "line1\nline2",
+                    "--leading",
+                    "&|<>"
+                ]
+            }
+        }
+    });
+    let resp = http_post_rpc(port, &run_cmd_req).expect("http run_command rpc");
+    assert_eq!(resp["id"], 15);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(resp["result"]["structuredContent"]["execution_state"], "completed");
+    assert_eq!(resp["result"]["structuredContent"]["exit_code"], 0);
+    let stdout = resp["result"]["structuredContent"]["stdout"].as_str().expect("stdout");
+    let parsed: Vec<String> = serde_json::from_str(stdout.trim()).expect("parse stdout json");
+    assert_eq!(
+        parsed,
+        vec![
+            "space arg",
+            "\"quotes\"",
+            "$PATH",
+            "{\"a\":1}",
+            "unicode-✓",
+            "line1\nline2",
+            "--leading",
+            "&|<>"
+        ]
+    );
 }

@@ -117,6 +117,14 @@ pub fn face(name: &str) -> Face {
             destructive: true,
             idempotent: false,
         },
+        "run_command" => Face {
+            title: "Run native command",
+            invoking: "Running native command…",
+            invoked: "Native command finished",
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+        },
         "kill_task" => Face {
             title: "Stop command",
             invoking: "Stopping command…",
