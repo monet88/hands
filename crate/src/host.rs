@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value, json};
 
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::computer::local::{LocalFs, LocalTerminalBackend};
@@ -17,6 +20,12 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
+const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+thread_local! {
+    static CONFIG_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
@@ -24,6 +33,9 @@ fn home_dir() -> PathBuf {
 
 /// XDG on Unix (`~/.config/hands`). `%APPDATA%\hands` on Windows.
 pub fn config_dir() -> PathBuf {
+    if let Some(p) = CONFIG_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
     #[cfg(windows)]
     {
         return dirs::config_dir()
@@ -49,6 +61,143 @@ pub fn workspace_file() -> PathBuf {
 
 pub fn mcp_socket() -> PathBuf {
     config_dir().join("mcp.sock")
+}
+
+fn sessions_file() -> PathBuf {
+    config_dir().join("sessions.json")
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// ChatGPT plugin host id: `_meta["openai/session"]` on `tools/call`.
+pub fn openai_session(params: &Value) -> Option<String> {
+    let meta = params.get("_meta")?;
+    let raw = meta
+        .get("openai/session")
+        .or_else(|| meta.get("openai/conversationId"))
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+struct SessionPin {
+    path: PathBuf,
+    at: u64,
+}
+
+fn load_sessions() -> HashMap<String, SessionPin> {
+    let Ok(text) = std::fs::read_to_string(sessions_file()) else {
+        return HashMap::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(obj) = v.get("sessions").and_then(Value::as_object) else {
+        return HashMap::new();
+    };
+    let cutoff = now_secs().saturating_sub(SESSION_TTL_SECS);
+    let mut out = HashMap::new();
+    for (id, entry) in obj {
+        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let at = entry.get("at").and_then(Value::as_u64).unwrap_or(0);
+        let p = PathBuf::from(path);
+        if at >= cutoff && p.is_dir() {
+            out.insert(id.clone(), SessionPin { path: p, at });
+        }
+    }
+    out
+}
+
+fn save_sessions(map: &HashMap<String, SessionPin>) {
+    let mut sessions = Map::new();
+    for (id, pin) in map {
+        sessions.insert(
+            id.clone(),
+            json!({
+                "path": pin.path.display().to_string(),
+                "at": pin.at,
+            }),
+        );
+    }
+    let body = json!({ "sessions": sessions });
+    if let Some(parent) = sessions_file().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(sessions_file(), text);
+    }
+}
+
+fn with_sessions<T>(f: impl FnOnce(&mut HashMap<String, SessionPin>) -> T) -> T {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = load_sessions();
+    let out = f(&mut map);
+    save_sessions(&map);
+    out
+}
+
+pub fn get_session_workspace(session: &str) -> Option<PathBuf> {
+    if session.is_empty() {
+        return None;
+    }
+    with_sessions(|map| map.get(session).map(|p| p.path.clone()))
+}
+
+fn put_session_workspace(session: &str, cwd: &Path) {
+    let path = cwd.to_path_buf();
+    let at = now_secs();
+    with_sessions(|map| {
+        map.insert(
+            session.to_string(),
+            SessionPin { path, at },
+        );
+    });
+}
+
+/// `set_workspace` from ChatGPT: pin this conversation only.
+/// No `openai/session` → write the CLI pin file (old behavior).
+pub fn pin_for_chat(session: Option<&str>, dir: &Path) -> Result<PathBuf, String> {
+    match session {
+        Some(id) if !id.is_empty() => {
+            if !dir.is_dir() {
+                return Err(format!("not a directory: {}", dir.display()));
+            }
+            let cwd = dunce::canonicalize(dir).map_err(|e| format!("canonicalize: {e}"))?;
+            push_recent(&cwd);
+            put_session_workspace(id, &cwd);
+            Ok(cwd)
+        }
+        _ => pin_workspace(dir),
+    }
+}
+
+/// Cwd for one MCP tool call: `workspace` arg → chat session map → CLI pin.
+pub fn resolve_call_workspace(
+    fallback: &Path,
+    session: Option<&str>,
+    workspace_arg: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(raw) = workspace_arg {
+        return resolve_project(raw);
+    }
+    if let Some(id) = session.filter(|s| !s.is_empty()) {
+        if let Some(p) = get_session_workspace(id) {
+            return Ok(p);
+        }
+    }
+    Ok(resolve_workspace(fallback))
 }
 
 /// Copy `~/.config/grok-harness` once if the new dir is empty.
@@ -247,4 +396,77 @@ pub async fn build_bridge(cwd: PathBuf) -> Result<ToolBridge, String> {
     ToolBridge::finalize_builder(builder, allowlist(), session_context(cwd))
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn with_test_config<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    CONFIG_OVERRIDE.with(|c| *c.borrow_mut() = Some(dir.to_path_buf()));
+    let out = f();
+    CONFIG_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_session_reads_host_meta() {
+        let params = json!({
+            "name": "read_file",
+            "arguments": {},
+            "_meta": { "openai/session": " conv-aaa " }
+        });
+        assert_eq!(openai_session(&params).as_deref(), Some("conv-aaa"));
+        assert!(openai_session(&json!({ "name": "x" })).is_none());
+    }
+
+    #[test]
+    fn two_chats_do_not_share_pin() {
+        let tmp = std::env::temp_dir().join(format!("hands-session-{}", std::process::id()));
+        let cfg = tmp.join("cfg");
+        let a = tmp.join("repo-a");
+        let b = tmp.join("repo-b");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        with_test_config(&cfg, || {
+            pin_workspace(&a).unwrap();
+            let wa = pin_for_chat(Some("chat-a"), &a).unwrap();
+            let wb = pin_for_chat(Some("chat-b"), &b).unwrap();
+            assert_eq!(wa, dunce::canonicalize(&a).unwrap());
+            assert_eq!(wb, dunce::canonicalize(&b).unwrap());
+            assert_eq!(
+                resolve_call_workspace(&a, Some("chat-a"), None).unwrap(),
+                wa
+            );
+            assert_eq!(
+                resolve_call_workspace(&a, Some("chat-b"), None).unwrap(),
+                wb
+            );
+            let pin = read_pinned_workspace().unwrap();
+            assert_eq!(pin, dunce::canonicalize(&a).unwrap());
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn workspace_arg_wins_over_session() {
+        let tmp = std::env::temp_dir().join(format!("hands-wsarg-{}", std::process::id()));
+        let cfg = tmp.join("cfg");
+        let a = tmp.join("repo-a");
+        let b = tmp.join("repo-b");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        with_test_config(&cfg, || {
+            pin_for_chat(Some("chat-a"), &a).unwrap();
+            let got = resolve_call_workspace(&a, Some("chat-a"), Some(b.to_str().unwrap())).unwrap();
+            assert_eq!(got, dunce::canonicalize(&b).unwrap());
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

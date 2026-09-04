@@ -1,10 +1,11 @@
 //! MCP JSON-RPC over stdio (newline-delimited) and Streamable HTTP POST /mcp.
 //! No extra crates: ChatGPT tunnel-client speaks stdio; Inspector can use HTTP.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -14,6 +15,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
 
+use crate::edit;
 use crate::host;
 use crate::plugin;
 use crate::ui;
@@ -24,7 +26,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct McpHost {
     fallback_cwd: PathBuf,
-    cached: Mutex<Option<(PathBuf, ToolBridge)>>,
+    cached: Mutex<HashMap<(String, PathBuf), ToolBridge>>,
     call_seq: AtomicU64,
 }
 
@@ -32,7 +34,7 @@ impl McpHost {
     pub fn new(fallback_cwd: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             fallback_cwd,
-            cached: Mutex::new(None),
+            cached: Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(1),
         })
     }
@@ -41,22 +43,48 @@ impl McpHost {
         host::resolve_workspace(&self.fallback_cwd)
     }
 
+    fn cwd_for(&self, session: Option<&str>, workspace_arg: Option<&str>) -> Result<PathBuf, String> {
+        host::resolve_call_workspace(&self.fallback_cwd, session, workspace_arg)
+    }
+
     async fn bridge(&self) -> Result<ToolBridge, String> {
-        let cwd = self.workspace();
+        self.bridge_for("", self.workspace()).await
+    }
+
+    async fn bridge_for(&self, session: &str, cwd: PathBuf) -> Result<ToolBridge, String> {
+        let key = (session.to_string(), cwd.clone());
         let mut cache = self.cached.lock().await;
-        if let Some((path, bridge)) = cache.as_ref()
-            && path == &cwd
-        {
+        if let Some(bridge) = cache.get(&key) {
             return Ok(bridge.clone());
         }
-        let bridge = host::build_bridge(cwd.clone()).await?;
-        *cache = Some((cwd, bridge.clone()));
+        let bridge = host::build_bridge(cwd).await?;
+        cache.insert(key, bridge.clone());
         Ok(bridge)
     }
 
-    fn workspace_info_result(&self) -> Value {
-        let cwd = self.workspace();
+    async fn drop_session_cache(&self, session: &str) {
+        let mut cache = self.cached.lock().await;
+        cache.retain(|(s, _), _| s != session);
+    }
+
+    fn workspace_info_result(&self, session: Option<&str>, workspace_arg: Option<&str>) -> Value {
+        let cwd = match self.cwd_for(session, workspace_arg) {
+            Ok(p) => p,
+            Err(e) => {
+                return json!({
+                    "content": [{ "type": "text", "text": e }],
+                    "isError": true
+                });
+            }
+        };
         let mut lines = vec![format!("workspace: {}", cwd.display())];
+        match session {
+            Some(id) => lines.push(format!("session: {id} (this chat only)")),
+            None => lines.push(
+                "session: (none — this chat shares the CLI pin; pass workspace on later calls)"
+                    .into(),
+            ),
+        }
         let recent: Vec<String> = host::read_recent()
             .into_iter()
             .filter(|p| p != &cwd)
@@ -77,17 +105,21 @@ impl McpHost {
             "content": [{ "type": "text", "text": lines.join("\n") }],
             "structuredContent": {
                 "workspace": cwd.display().to_string(),
+                "session": session,
                 "recent": recent,
             },
             "isError": false
         })
     }
 
-    async fn switch_workspace(&self, raw: &str) -> Result<PathBuf, String> {
+    async fn switch_workspace(
+        &self,
+        session: Option<&str>,
+        raw: &str,
+    ) -> Result<PathBuf, String> {
         let path = host::resolve_project(raw)?;
-        let cwd = host::pin_workspace(&path)?;
-        let mut cache = self.cached.lock().await;
-        *cache = None;
+        let cwd = host::pin_for_chat(session, &path)?;
+        self.drop_session_cache(session.unwrap_or("")).await;
         Ok(cwd)
     }
 
@@ -237,7 +269,7 @@ impl McpHost {
             ),
             plugin::tool_descriptor(
                 "set_workspace",
-                "Use this when the user wants another repo, including while they are not at the machine. Pins the active workspace. Accepts an absolute path, ~/path, or a short name resolved under ~/Dev (e.g. bunko).",
+                "Use this when the user wants another repo, including while they are not at the machine. Pins the workspace for THIS ChatGPT conversation only. Other chats keep their folder. Accepts an absolute path, ~/path, or a short name resolved under ~/Dev (e.g. bunko).",
                 json!({
                     "type": "object",
                     "properties": {
@@ -269,50 +301,94 @@ impl McpHost {
             .get("name")
             .and_then(Value::as_str)
             .ok_or((-32602, "tools/call requires name".into(), Value::Null))?;
+        let session = host::openai_session(&params);
+        note_chat_session(session.as_deref());
+        let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+        let workspace_arg = take_workspace_arg(&mut arguments);
+
         if name == "workspace_info" {
-            return Ok(self.workspace_info_result());
+            return Ok(self.workspace_info_result(session.as_deref(), workspace_arg.as_deref()));
         }
         if name == "set_workspace" {
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "set_workspace requires path".into(), Value::Null))?;
-            return match self.switch_workspace(path).await {
-                Ok(cwd) => Ok(json!({
-                    "content": [{
-                        "type": "text",
-                        "text": format!("workspace pinned: {}\nLater tools use this folder until set_workspace is called again.", cwd.display())
-                    }],
-                    "structuredContent": {
-                        "workspace": cwd.display().to_string()
-                    },
-                    "isError": false
-                })),
+            return match self.switch_workspace(session.as_deref(), path).await {
+                Ok(cwd) => {
+                    let isolated = session.is_some();
+                    let extra = if isolated {
+                        "Pinned for this ChatGPT conversation only. Other chats keep their folder."
+                    } else {
+                        "Host sent no openai/session — pinned globally. Pass workspace on later calls so other chats do not share this folder."
+                    };
+                    Ok(json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!("workspace pinned: {}\n{extra}", cwd.display())
+                        }],
+                        "structuredContent": {
+                            "workspace": cwd.display().to_string(),
+                            "session": session,
+                            "isolated": isolated
+                        },
+                        "isError": false
+                    }))
+                }
                 Err(e) => Ok(json!({
                     "content": [{ "type": "text", "text": e }],
                     "isError": true
                 })),
             };
         }
-        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+        let cwd = self
+            .cwd_for(session.as_deref(), workspace_arg.as_deref())
+            .map_err(|e| (-32602, e, Value::Null))?;
         let call_id = format!(
             "mcp-{}",
             self.call_seq.fetch_add(1, Ordering::Relaxed)
         );
         let bridge = self
-            .bridge()
+            .bridge_for(session.as_deref().unwrap_or(""), cwd.clone())
             .await
             .map_err(|e| (-32603, e, Value::Null))?;
         match bridge.call(name, arguments, &call_id).await {
-            Ok(result) => Ok(json!({
-                "content": [{ "type": "text", "text": result.prompt_text }],
-                "isError": false
-            })),
+            Ok(result) => Ok(edit::mcp_result(
+                &result.output,
+                &result.prompt_text,
+                &cwd,
+            )),
             Err(e) => Ok(json!({
                 "content": [{ "type": "text", "text": e.to_string() }],
                 "isError": true
             })),
+        }
+    }
+}
+
+fn take_workspace_arg(arguments: &mut Value) -> Option<String> {
+    let obj = arguments.as_object_mut()?;
+    let raw = obj.remove("workspace")?;
+    let s = raw.as_str()?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn note_chat_session(session: Option<&str>) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    match session {
+        Some(s) => {
+            let show: String = s.chars().take(16).collect();
+            eprintln!("Hands chat session {show} (per-conversation workspace)");
+        }
+        None => {
+            eprintln!("Hands chat session: none — CLI pin / workspace arg");
         }
     }
 }

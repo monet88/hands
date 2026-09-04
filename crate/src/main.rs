@@ -1,5 +1,6 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
+mod edit;
 mod host;
 mod mcp;
 mod plugin;
@@ -198,7 +199,7 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
         Cmd::McpHttp { addr } => mcp::McpHost::new(fallback).serve_http(addr).await,
         Cmd::List | Cmd::Call { .. } => {
             let cwd = host::resolve_workspace(&fallback);
-            let bridge = host::build_bridge(cwd).await?;
+            let bridge = host::build_bridge(cwd.clone()).await?;
             match cmd {
                 Cmd::List => {
                     let defs = bridge.tool_definitions().await;
@@ -226,7 +227,10 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                         .call(&tool, params, "hands-1")
                         .await
                         .map_err(|e| e.to_string())?;
-                    println!("{}", result.prompt_text);
+                    println!(
+                        "{}",
+                        crate::edit::text(&result.output, &result.prompt_text, &cwd)
+                    );
                     Ok(())
                 }
                 _ => unreachable!(),

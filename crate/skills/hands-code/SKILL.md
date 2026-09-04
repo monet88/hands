@@ -9,9 +9,12 @@ Do not ask the user in chat to confirm each edit. Call the tool. ChatGPT already
 
 ## Workspace
 
+Each ChatGPT conversation has its own folder. `set_workspace` in this chat does not change other chats.
+
 1. Call `workspace_info` first if the folder might be wrong.
 2. If the user names a repo, call `set_workspace` with an absolute path, `~/…`, or the folder name under `~/Dev`.
 3. Do not invent paths. If `set_workspace` fails, use `recent` from `workspace_info` or ask once.
+4. If `workspace_info` has `"session": null`, pass `workspace` on later tool calls (same path) so another chat cannot steal the pin.
 
 ## Edit
 
@@ -19,6 +22,7 @@ Do not ask the user in chat to confirm each edit. Call the tool. ChatGPT already
 - New file: `write`.
 - Several hunks or files: `apply_patch`.
 - Plan: `todo_write`.
+- Edit results include a unified diff (ChatGPT shows it as an inline card). Use that; do not re-read the whole file unless the diff is truncated. Do not paste the diff back in chat.
 - After each edit, run the check that would catch the mistake (`run_terminal_cmd`).
 
 ## Commands

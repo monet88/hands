@@ -1,10 +1,18 @@
-//! ChatGPT plugin chrome: titles, annotations, invocation text, skills snapshot.
+//! ChatGPT plugin chrome: titles, annotations, invocation text, skills, widgets.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const SKILL_MD: &str = include_str!("../skills/hands-code/SKILL.md");
 const SKILL_URI: &str = "skill://hands/hands-code/SKILL.md";
+pub const DIFF_URI: &str = "ui://widget/diff-v1.html";
+const DIFF_HTML: &str = include_str!("widgets/diff.html");
+const DIFF_MIME_CHATGPT: &str = "text/html+skybridge";
+const DIFF_MIME_APPS: &str = "text/html;profile=mcp-app";
+
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "search_replace" | "write" | "apply_patch")
+}
 
 pub struct Face {
     pub title: &'static str,
@@ -136,13 +144,54 @@ pub fn face(name: &str) -> Face {
     }
 }
 
+const WORKSPACE_ARG: &str = "Optional folder for this call only (absolute, ~/…, or name under ~/Dev). Needed when the host does not send openai/session. Hands strips this before the file tool runs.";
+
+fn with_workspace_field(mut schema: Value) -> Value {
+    if !schema.is_object() {
+        schema = json!({ "type": "object", "properties": {} });
+    }
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return schema;
+    }
+    if schema.get("properties").is_none() {
+        schema["properties"] = json!({});
+    }
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.insert(
+            "workspace".into(),
+            json!({
+                "type": "string",
+                "description": WORKSPACE_ARG
+            }),
+        );
+    }
+    schema
+}
+
 pub fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
     let f = face(name);
+    let mut meta = json!({
+        "openai/toolInvocation/invoking": f.invoking,
+        "openai/toolInvocation/invoked": f.invoked,
+    });
+    if is_edit_tool(name) {
+        meta["ui"] = json!({ "resourceUri": DIFF_URI });
+        meta["openai/outputTemplate"] = json!(DIFF_URI);
+        meta["openai/resultCanProduceWidget"] = json!(true);
+        meta["openai/widgetAccessible"] = json!(false);
+        meta["openai/widgetDescription"] =
+            json!("Inline unified diff of the file just written on this machine.");
+    }
+    let schema = if name == "set_workspace" {
+        input_schema
+    } else {
+        with_workspace_field(input_schema)
+    };
     json!({
         "name": name,
         "title": f.title,
         "description": description,
-        "inputSchema": input_schema,
+        "inputSchema": schema,
         "annotations": {
             "title": f.title,
             "readOnlyHint": f.read_only,
@@ -150,9 +199,41 @@ pub fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Va
             "openWorldHint": false,
             "idempotentHint": f.idempotent,
         },
-        "_meta": {
-            "openai/toolInvocation/invoking": f.invoking,
-            "openai/toolInvocation/invoked": f.invoked,
+        "_meta": meta
+    })
+}
+
+fn widget_resource_meta() -> Value {
+    json!({
+        "ui": {
+            "prefersBorder": true,
+            "csp": {
+                "connectDomains": [],
+                "resourceDomains": [],
+            }
+        },
+        "openai/widgetPrefersBorder": true,
+        "openai/widgetDescription": "Unified diff of the edit that just landed.",
+        "openai/widgetCSP": {
+            "connect_domains": [],
+            "resource_domains": [],
+        }
+    })
+}
+
+/// `_meta` on a successful edit `tools/call` so ChatGPT hydrates the iframe.
+pub fn diff_result_meta() -> Value {
+    json!({
+        "ui": { "resourceUri": DIFF_URI },
+        "openai/outputTemplate": DIFF_URI,
+        "openai.com/widget": {
+            "type": "resource",
+            "resource": {
+                "uri": DIFF_URI,
+                "mimeType": DIFF_MIME_CHATGPT,
+                "text": DIFF_HTML,
+                "_meta": widget_resource_meta()
+            }
         }
     })
 }
@@ -162,18 +243,20 @@ pub fn initialize_capabilities() -> Value {
         "tools": { "listChanged": false },
         "resources": { "listChanged": false },
         "extensions": {
-            "io.modelcontextprotocol/skills": {}
+            "io.modelcontextprotocol/skills": {},
+            "io.modelcontextprotocol/ui": {}
         }
     })
 }
 
 pub fn initialize_instructions(workspace: &str) -> String {
     format!(
-        "Hands: local coding tools, no model. Workspace: {workspace}. \
-         Use skill hands-code. Call workspace_info first; set_workspace to switch \
-         (absolute, ~/…, or name under ~/Dev). Reads auto-run. File edits are routine. \
-         Shell/kill may confirm unless ChatGPT Apps → Hands → Never ask (or Always allow). \
-         After edits, rerun the failing check. Long commands: background + get_task_output."
+        "Hands: local coding tools, no model. Default folder: {workspace}. \
+         Each ChatGPT conversation has its own workspace (openai/session). \
+         set_workspace in this chat does not change other chats. \
+         If unsure, pass workspace on later tool calls. Use skill hands-code. \
+         Reads auto-run. File edits are routine. Shell/kill may confirm unless \
+         Apps → Hands → Never ask. Long commands: background + get_task_output."
     )
 }
 
@@ -207,27 +290,100 @@ pub fn skills_get(params: &Value) -> Result<Value, (i64, String, Value)> {
     Ok(json!({ "skill": skill_entry() }))
 }
 
+fn diff_resource(mime: &str) -> Value {
+    json!({
+        "uri": DIFF_URI,
+        "name": "edit-diff",
+        "title": "Edit diff",
+        "mimeType": mime,
+        "description": "Inline unified diff after search_replace, write, or apply_patch",
+        "_meta": widget_resource_meta()
+    })
+}
+
 pub fn resources_list() -> Value {
     json!({
-        "resources": [{
-            "uri": SKILL_URI,
-            "name": "hands-code",
-            "mimeType": "text/markdown",
-            "description": "Hands local coding workflow"
-        }]
+        "resources": [
+            {
+                "uri": SKILL_URI,
+                "name": "hands-code",
+                "mimeType": "text/markdown",
+                "description": "Hands local coding workflow"
+            },
+            diff_resource(DIFF_MIME_CHATGPT)
+        ]
     })
 }
 
 pub fn resources_read(params: &Value) -> Result<Value, (i64, String, Value)> {
     let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-    if uri != SKILL_URI {
-        return Err((-32602, format!("unknown resource uri: {uri}"), Value::Null));
+    if uri == SKILL_URI {
+        return Ok(json!({
+            "contents": [{
+                "uri": SKILL_URI,
+                "mimeType": "text/markdown",
+                "text": SKILL_MD
+            }]
+        }));
     }
-    Ok(json!({
-        "contents": [{
-            "uri": SKILL_URI,
-            "mimeType": "text/markdown",
-            "text": SKILL_MD
-        }]
-    }))
+    if uri == DIFF_URI {
+        return Ok(json!({
+            "contents": [
+                {
+                    "uri": DIFF_URI,
+                    "mimeType": DIFF_MIME_CHATGPT,
+                    "text": DIFF_HTML,
+                    "_meta": widget_resource_meta()
+                },
+                {
+                    "uri": DIFF_URI,
+                    "mimeType": DIFF_MIME_APPS,
+                    "text": DIFF_HTML,
+                    "_meta": widget_resource_meta()
+                }
+            ]
+        }));
+    }
+    Err((-32602, format!("unknown resource uri: {uri}"), Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_tools_advertise_widget() {
+        let d = tool_descriptor("search_replace", "edit", json!({ "type": "object" }));
+        assert_eq!(d["_meta"]["openai/outputTemplate"], DIFF_URI);
+        assert_eq!(d["_meta"]["ui"]["resourceUri"], DIFF_URI);
+        assert!(d["inputSchema"]["properties"].get("workspace").is_some());
+        assert!(d["inputSchema"]["properties"]["workspace"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("openai/session"));
+        let read = tool_descriptor("read_file", "read", json!({ "type": "object" }));
+        assert!(read["_meta"].get("openai/outputTemplate").is_none());
+        let set = tool_descriptor(
+            "set_workspace",
+            "pin",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        );
+        assert!(set["inputSchema"]["properties"].get("workspace").is_none());
+    }
+
+    #[test]
+    fn diff_resource_is_readable() {
+        let list = resources_list();
+        let uris: Vec<&str> = list["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["uri"].as_str())
+            .collect();
+        assert!(uris.contains(&DIFF_URI));
+        let got = resources_read(&json!({ "uri": DIFF_URI })).unwrap();
+        let html = got["contents"][0]["text"].as_str().unwrap();
+        assert!(html.contains("ui/notifications/tool-result"));
+        assert_eq!(got["contents"][0]["mimeType"], DIFF_MIME_CHATGPT);
+    }
 }
