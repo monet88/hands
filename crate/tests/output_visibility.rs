@@ -157,3 +157,45 @@ async fn test_get_task_output_structured_framing() {
         "structuredContent must carry error information: {structured}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn test_edit_diff_preserves_authoritative_structured_payload() {
+    let harness = TestHarness::new();
+    let target = harness.temp.path().join("edit-diff.txt");
+    std::fs::write(&target, "hello\n").expect("write edit fixture");
+
+    let resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "search_replace",
+                "arguments": {
+                    "file_path": target,
+                    "old_string": "hello",
+                    "new_string": "hello world"
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["isError"], false, "edit failed: {resp}");
+    let result = &resp["result"];
+    let structured = &result["structuredContent"];
+
+    assert_eq!(
+        structured["type"], "SearchReplace",
+        "typed ToolOutput must remain authoritative: {structured}"
+    );
+    assert_eq!(structured["kind"], "edited");
+    assert!(structured["default_workspace"].is_string());
+    assert!(structured["target_path"].is_string());
+
+    let diff = structured["diff"].as_str().expect("edit diff string");
+    assert!(diff.contains("-hello"), "missing removed line in diff: {diff}");
+    assert!(diff.contains("+hello world"), "missing added line in diff: {diff}");
+    assert!(
+        result["_meta"]["openai/outputTemplate"].is_string(),
+        "edit result must retain upstream widget metadata: {result}"
+    );
+}

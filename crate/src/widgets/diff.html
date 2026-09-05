@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: var(--color-background-primary, Canvas);
+    --fg: var(--color-text-primary, CanvasText);
+    --muted: var(--color-text-secondary, color-mix(in srgb, CanvasText 55%, Canvas));
+    --line: var(--color-border-primary, color-mix(in srgb, CanvasText 12%, Canvas));
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, sans-serif;
+  }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.4 var(--sans);
+  }
+  .card { padding: 10px 12px 8px; }
+  .head {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .path { font-weight: 600; word-break: break-all; }
+  .stat { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .addn { color: #16a34a; }
+  .deln { color: #dc2626; }
+  html[data-theme="dark"] .addn { color: #4ade80; }
+  html[data-theme="dark"] .deln { color: #f87171; }
+  .diff {
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font: 12px/1.45 var(--mono);
+  }
+  .hunk { padding: 2px 0; }
+  .row {
+    white-space: pre;
+    padding: 0 10px;
+    min-height: 1.45em;
+  }
+  .row.m { color: var(--muted); background: color-mix(in srgb, var(--fg) 6%, var(--bg)); }
+  .row.h { color: var(--muted); }
+  .row.a { background: color-mix(in srgb, #22c55e 16%, var(--bg)); }
+  .row.d { background: color-mix(in srgb, #ef4444 16%, var(--bg)); }
+  .empty { color: var(--muted); padding: 8px 0; }
+</style>
+</head>
+<body>
+  <div class="card" id="root"><div class="empty">Loading diff…</div></div>
+  <script>
+(function () {
+  const VERSION = "2026-01-26";
+  let nextId = 1;
+  const pending = new Map();
+
+  function post(msg) {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(msg, "*");
+    }
+  }
+  function request(method, params) {
+    const id = nextId++;
+    return new Promise(function (resolve, reject) {
+      pending.set(id, { resolve: resolve, reject: reject });
+      post({ jsonrpc: "2.0", id: id, method: method, params: params });
+    });
+  }
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+  function applyHost(params) {
+    const ctx = (params && (params.hostContext || params)) || {};
+    const vars = (ctx.styles && ctx.styles.variables) || ctx.themeVariables || {};
+    Object.keys(vars).forEach(function (k) {
+      if (vars[k]) document.documentElement.style.setProperty(k, vars[k]);
+    });
+    if (ctx.theme) document.documentElement.setAttribute("data-theme", ctx.theme);
+    if (ctx.locale) document.documentElement.lang = ctx.locale;
+  }
+  function payloadOf(params) {
+    if (!params) return null;
+    if (params.structuredContent) return params.structuredContent;
+    if (params.toolOutput) return params.toolOutput;
+    return params;
+  }
+  function rowsHtml(diff) {
+    const lines = String(diff || "").split("\n");
+    let html = "";
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === "" && i === lines.length - 1) continue;
+      let k = "x";
+      let t = line;
+      if (line.indexOf("@@") === 0) { k = "m"; }
+      else if (line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0) { k = "h"; }
+      else if (line.indexOf("+") === 0) { k = "a"; t = line.slice(1); }
+      else if (line.indexOf("-") === 0) { k = "d"; t = line.slice(1); }
+      else if (line.indexOf("\\") === 0) { continue; }
+      else if (line.charAt(0) === " ") { t = line.slice(1); }
+      html += '<div class="row ' + k + '">' + esc(t) + "</div>";
+    }
+    return html || '<div class="empty">No textual change</div>';
+  }
+  function render(data) {
+    if (!data) return;
+    const path = data.path || (data.files && data.files[0] && data.files[0].path) || "file";
+    const added = Number(data.added || 0);
+    const removed = Number(data.removed || 0);
+    const kind = data.kind || "edited";
+    const nfiles = (data.files && data.files.length) || 1;
+    const title = nfiles > 1 ? nfiles + " files" : path;
+    const root = document.getElementById("root");
+    root.innerHTML =
+      '<div class="head"><span class="path">' + esc(kind + " " + title) + '</span>' +
+      '<span class="stat">' +
+      (added ? '<span class="addn">+' + added + "</span> " : "") +
+      (removed ? '<span class="deln">−' + removed + "</span>" : "") +
+      "</span></div>" +
+      '<div class="diff">' + rowsHtml(data.diff) + "</div>";
+    try {
+      post({
+        jsonrpc: "2.0",
+        method: "ui/notifications/size-changed",
+        params: {
+          width: document.body.scrollWidth,
+          height: document.body.scrollHeight
+        }
+      });
+    } catch (e) {}
+  }
+  function fromGlobals() {
+    const o = window.openai;
+    if (!o) return;
+    if (o.toolOutput) render(o.toolOutput);
+    else if (o.toolResponseMetadata && o.toolResponseMetadata.diff) render(o.toolResponseMetadata);
+  }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    const m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id != null && pending.has(m.id) && m.method == null) {
+      const p = pending.get(m.id);
+      pending.delete(m.id);
+      if (m.error) p.reject(m.error);
+      else p.resolve(m.result);
+      return;
+    }
+    if (m.method === "ui/initialize" && m.id != null) {
+      applyHost(m.params);
+      post({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: VERSION } });
+      return;
+    }
+    if (m.method === "ui/notifications/tool-result") render(payloadOf(m.params));
+    if (m.method === "ui/notifications/host-context-changed") applyHost(m.params);
+  });
+  window.addEventListener("openai:set_globals", fromGlobals);
+
+  function boot() {
+    fromGlobals();
+    const init = request("ui/initialize", {
+      protocolVersion: VERSION,
+      appInfo: { name: "Hands diff", version: "1" },
+      appCapabilities: { availableDisplayModes: ["inline"] }
+    });
+    const timeout = new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error("timeout")); }, 600);
+    });
+    Promise.race([init, timeout]).then(function (res) {
+      applyHost(res);
+      post({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+      if (res && res.toolResult) render(payloadOf(res.toolResult));
+    }).catch(function () {
+      post({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+      post({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+    });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();
+  </script>
+</body>
+</html>

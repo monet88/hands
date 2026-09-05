@@ -1,7 +1,7 @@
 # Integration Policy
 
 ## 1. Upstream Baseline and Direct Dispatch
-- The integration baseline for this repository is upstream commit `26f9001` with direct dispatch through `ToolBridge`.
+- The integration baseline for this repository is upstream commit `c059e0d` with direct dispatch through `ToolBridge`.
 - Hands operates as a lean CLI and MCP server bridging directly to `xai_grok_tools` without intermediate virtual execution engines, proxy routers, or multi-thousand-line execution abstractions.
 
 ## 2. Non-Restoration of Closed #31 Implementation Machinery

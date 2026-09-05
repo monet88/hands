@@ -1,6 +1,6 @@
 //! Hands — unofficial ChatGPT plugin. Local coding tools. No model.
 
-use hands::{host, mcp, run_command, service, setup, ui, watch};
+use hands::{edit, host, mcp, run_command, service, setup, ui, watch};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -232,7 +232,10 @@ async fn run(fallback: PathBuf, cmd: Cmd) -> Result<(), String> {
                         .call(&tool, params, "hands-1")
                         .await
                         .map_err(|e| e.to_string())?;
-                    println!("{}", result.prompt_text);
+                    println!(
+                        "{}",
+                        edit::text(&result.output, &result.prompt_text, &cwd)
+                    );
                     Ok(())
                 }
                 _ => unreachable!(),

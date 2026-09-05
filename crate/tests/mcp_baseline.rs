@@ -27,8 +27,8 @@ async fn test_mcp_initialize() {
         .as_str()
         .expect("serverInfo.version string");
     assert!(
-        version.contains("+26f9001."),
-        "serverInfo.version '{version}' must contain upstream provenance +26f9001.<rev>"
+        version.contains("+c059e0d."),
+        "serverInfo.version '{version}' must contain upstream provenance +c059e0d.<rev>"
     );
 
     assert_eq!(resp["result"]["capabilities"]["tools"]["listChanged"], false);
@@ -195,12 +195,12 @@ async fn test_mcp_error_handling() {
 
 #[test]
 fn test_git_ancestry_provenance() {
-    assert_eq!(host::UPSTREAM_BASE_COMMIT, "26f9001");
+    assert_eq!(host::UPSTREAM_BASE_COMMIT, "c059e0d");
     let status = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", "26f9001", "HEAD"])
+        .args(["merge-base", "--is-ancestor", "c059e0d", "HEAD"])
         .status();
     if let Ok(s) = status {
-        assert!(s.success(), "HEAD must descend from upstream commit 26f9001");
+        assert!(s.success(), "HEAD must descend from upstream commit c059e0d");
     }
 }
 
@@ -218,7 +218,7 @@ fn test_host_and_service_provenance_and_isolation() {
     );
 
     let status = service::status_json(config_dir.path());
-    assert_eq!(status["upstream_base"], "26f9001");
+    assert_eq!(status["upstream_base"], "c059e0d");
     assert_eq!(status["git_revision"], host::DEV_GIT_REV);
 
     // Assert provenance git_revision matches .hands-source-rev or hands source git rev

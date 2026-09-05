@@ -162,8 +162,8 @@ async fn test_upstream_direct_dispatch_architecture_contract() {
         "Must NOT introduce yield_after_ms"
     );
 
-    // Ensure UPSTREAM_BASE_COMMIT is 26f9001
-    assert_eq!(host::UPSTREAM_BASE_COMMIT, "26f9001");
+    // Ensure UPSTREAM_BASE_COMMIT tracks the merged upstream baseline.
+    assert_eq!(host::UPSTREAM_BASE_COMMIT, "c059e0d");
 }
 
 #[tokio::test]

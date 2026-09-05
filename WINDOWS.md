@@ -1,12 +1,12 @@
 # Hands on Windows — Setup & Audit Guide
 
-Tài liệu ghi lại toàn bộ các bước cấu hình, build và vận hành bản Hands từ Upstream (`nghyane/hands` commit `26f9001`) trên Windows.
+Tài liệu ghi lại toàn bộ các bước cấu hình, build và vận hành bản Hands từ Upstream (`nghyane/hands` commit `c059e0d`) trên Windows.
 
 ---
 
 ## 1. Kiểm tra Upstream (Audit)
 * **Upstream URL:** `https://github.com/nghyane/hands.git`
-* **Commit:** [`26f9001`](https://github.com/nghyane/hands/commit/26f9001f7330e9910193fe125264f2adee0ced51) (`feat: unattended ChatGPT coding path`).
+* **Commit:** [`c059e0d`](https://github.com/nghyane/hands/commit/c059e0de80a2b91d511af9120db0612fda2326ba) (`feat: native edit diffs and per-chat workspace`).
 * **Trạng thái:** Đồng bộ 100% với nhánh `upstream/main`.
 
 ---
