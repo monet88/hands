@@ -9,19 +9,23 @@ Do not ask the user in chat to confirm each edit. Call the tool. ChatGPT already
 
 ## Workspace
 
-1. The pinned Workspace is the default/implicit context for relative operations.
-2. Explicit absolute paths and explicit `workdir` may target elsewhere without repinning the Workspace.
-3. Call `workspace_info` first if the folder might be wrong.
-4. If the user names a repo to switch to, call `set_workspace` with an absolute path, `~/…`, or the folder name under `~/Dev`.
-5. Do not invent paths. If `set_workspace` fails, use `recent` from `workspace_info` or ask once.
-6. Command results should be interpreted using `cwd` plus `default_workspace`.
-7. File-operation results should use `target_path` plus `default_workspace` when available.
+Each ChatGPT conversation has its own folder. `set_workspace` in this chat does not change other chats.
+
+1. Call `workspace_info` first if the folder might be wrong.
+2. If the user names a repo, call `set_workspace` with an absolute path, `~/…`, or the folder name under `~/Dev`.
+3. Do not invent paths. If `set_workspace` fails, use `recent` from `workspace_info` or ask once.
+4. If `workspace_info` has `"session": null`, pass `workspace` on later tool calls (same path) so another chat cannot steal the pin.
+5. The resolved per-chat Workspace is the default/implicit context for relative operations.
+6. Explicit absolute paths and explicit `workdir` may target elsewhere without repinning the Workspace.
+7. Command results should be interpreted using `cwd` plus `default_workspace` when available.
+8. File-operation results should use `target_path` plus `default_workspace` when available.
 ## Edit
 
 - Existing file: `read_file`, then `search_replace`.
 - New file: `write`.
 - Several hunks or files: `apply_patch`.
 - Plan: `todo_write`.
+- Edit results include a unified diff (ChatGPT shows it as an inline card). Use that; do not re-read the whole file unless the diff is truncated. Do not paste the diff back in chat.
 - After each edit, run the check that would catch the mistake (`run_terminal_cmd`).
 
 ## Commands

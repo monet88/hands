@@ -46,6 +46,7 @@ jobs:
           echo hello > "$tmp/n.txt"
           "$bin" use "$tmp"
           "$bin" call read_file '{"target_file":"n.txt"}' | grep -q hello
+          "$bin" call search_replace '{"file_path":"n.txt","old_string":"hello","new_string":"hello world"}' | grep -E -q '^\+hello world'
 
       - uses: actions/upload-artifact@v4
         with:

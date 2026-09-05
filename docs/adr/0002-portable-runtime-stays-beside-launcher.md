@@ -1,0 +1,5 @@
+# Portable runtime stays beside the launcher
+
+The Runtime Bundle is materialized under `runtime\<version>\` in the same writable Portable App Root as `Hands.exe`, rather than being silently redirected to `%LOCALAPPDATA%`. This preserves the explicit portable-app contract and makes runtime contents inspectable; user credentials remain in the existing user-scoped secret/config locations, and a non-writable launcher directory is an explicit startup error rather than a hidden storage fallback.
+
+Before each owned runtime start, after single-instance and port-conflict checks, the launcher invokes the selected bundle's Config Authority to prepare a command profile bound to that bundle's canonical executable path. Preparation is idempotent, reuses Machine Credentials, and succeeds before the tunnel is spawned; moving the Portable App Root or running a prior release must not leave the profile pointing at an old or removed runtime. A manual move or rollback starts with Exit, and the next launch refreshes an enabled Start at Login entry to the launcher at its current path while leaving a disabled entry disabled.

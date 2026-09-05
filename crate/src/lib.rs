@@ -1,3 +1,4 @@
+pub mod edit;
 pub mod host;
 pub mod mcp;
 pub mod plugin;

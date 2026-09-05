@@ -62,14 +62,14 @@ ChatGPT, not Hands, shows Confirm. MCP cannot turn that off.
 | Tool | Role |
 |---|---|
 | `workspace_info` | current pin + recent |
-| `set_workspace` | pin another folder (works from ChatGPT, including away) |
+| `set_workspace` | pin this ChatGPT chat only (other chats keep their folder) |
 | `read_file` | read |
 | `grep` | search contents |
 | `list_dir` | tree |
 | `glob` | find files by name |
-| `search_replace` | edit existing |
-| `write` | create / overwrite |
-| `apply_patch` | multi-hunk patch |
+| `search_replace` | edit existing; ChatGPT shows a diff card |
+| `write` | create / overwrite; ChatGPT shows a diff card |
+| `apply_patch` | multi-hunk patch; ChatGPT shows a diff card |
 | `todo_write` | task list |
 | `run_terminal_cmd` | tests / git / shell; long FG auto-backgrounds |
 | `get_task_output` | poll background job |
