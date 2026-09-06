@@ -65,6 +65,7 @@ def validate_cargo_toml_state(grok_build_path: Path) -> None:
 def validate_grok_build_status(
     grok_build_path: Path,
     expected_patch_targets: set[str],
+    allow_dirty_lockfile: bool = False,
 ) -> None:
     res = run_git(["status", "--porcelain"], cwd=grok_build_path)
     if res.returncode != 0:
@@ -85,6 +86,10 @@ def validate_grok_build_status(
             continue
 
         if path_str == "Cargo.lock":
+            if not allow_dirty_lockfile:
+                raise RuntimeError(
+                    f"unexpected modified/untracked Cargo.lock in grok-build checkout: {raw_line.strip()}"
+                )
             continue
 
         if path_str == "crates/codegen/hands" or path_str.startswith("crates/codegen/hands/"):
@@ -95,6 +100,23 @@ def validate_grok_build_status(
         )
 
 
+def normalize_diff(text: str) -> str:
+    lines = []
+    found_diff = False
+    for line in text.replace("\r\n", "\n").splitlines(keepends=True):
+        if not found_diff:
+            if line.startswith("diff --git "):
+                found_diff = True
+            else:
+                continue
+        # Skip git index header which contains repository-size-dependent object hash abbreviations
+        # (e.g. "index ec4e53c9..527a0d3c 100644" vs "index ec4e53c..527a0d3 100644")
+        if line.startswith("index ") and ".." in line:
+            continue
+        lines.append(line)
+    return "".join(lines)
+
+
 def verify_target_diffs(
     grok_build_path: Path,
     patch_files: list[Path],
@@ -102,16 +124,28 @@ def verify_target_diffs(
     for patch in patch_files:
         patch_text = patch.read_text(encoding="utf-8")
         target = get_patch_target(patch_text)
-        res = run_git(["diff", "--", target], cwd=grok_build_path)
+        res = run_git(
+            [
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.mnemonicprefix=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--",
+                target,
+            ],
+            cwd=grok_build_path,
+        )
         if res.returncode != 0:
             raise RuntimeError(f"failed to diff patch target {target}: {res.stderr.strip()}")
-        diff_norm = res.stdout.replace("\r\n", "\n").strip()
-        patch_norm = patch_text.replace("\r\n", "\n").strip()
-        if diff_norm != patch_norm:
+        diff_norm = normalize_diff(res.stdout)
+        patch_norm = normalize_diff(patch_text)
+        if not diff_norm or diff_norm != patch_norm:
             raise RuntimeError(
                 f"patch target {target} diverged from versioned patch {patch.name}"
             )
-
 
 def verify_and_patch(
     grok_build_path: Path,
@@ -162,11 +196,11 @@ def verify_and_patch(
         # Verify that all target files match the versioned patch set bit-for-bit
         verify_target_diffs(grok_build_path, patch_files)
         # Verify that no other unexpected modifications exist
-        validate_grok_build_status(grok_build_path, expected_targets)
+        validate_grok_build_status(grok_build_path, expected_targets, allow_dirty_lockfile=True)
         return
 
     # 3. If not already applied, the working directory must not have unexpected modifications
-    validate_grok_build_status(grok_build_path, expected_patch_targets=set())
+    validate_grok_build_status(grok_build_path, expected_patch_targets=set(), allow_dirty_lockfile=False)
 
     # 4. Check all patches can apply cleanly
     for patch in patch_files:
@@ -192,7 +226,7 @@ def verify_and_patch(
 
     # 6. Post-apply verification: verify bit-for-bit diff and clean status
     verify_target_diffs(grok_build_path, patch_files)
-    validate_grok_build_status(grok_build_path, expected_targets)
+    validate_grok_build_status(grok_build_path, expected_targets, allow_dirty_lockfile=True)
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -209,12 +243,6 @@ def main() -> int:
         default=None,
         help="Path to patches directory (defaults to patches/grok-build relative to Hands repo)",
     )
-    parser.add_argument(
-        "--expected-sha",
-        type=str,
-        default=PINNED_GROK_BUILD_SHA,
-        help=f"Expected pinned grok-build commit SHA (defaults to {PINNED_GROK_BUILD_SHA})",
-    )
     args = parser.parse_args()
 
     hands_repo = Path(__file__).resolve().parent.parent
@@ -224,9 +252,8 @@ def main() -> int:
         verify_and_patch(
             grok_build_path=args.grok_build_dir.resolve(),
             patches_dir=patches_dir.resolve(),
-            expected_sha=args.expected_sha,
+            expected_sha=PINNED_GROK_BUILD_SHA,
         )
-        print(f"grok-build patches verified/applied in {args.grok_build_dir}")
         return 0
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)

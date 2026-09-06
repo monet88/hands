@@ -89,15 +89,24 @@ fn render_search(applied: &SearchReplaceEditsApplied, workspace: &Path) -> Rende
             .as_deref()
             .map(|s| s.split_inclusive('\n').collect());
 
+        let mut line_counts = std::collections::HashMap::new();
         for detail in &applied.edits.details {
-            let suffix = file_lines.as_deref().and_then(|lines| {
-                derive_suffix(
-                    lines,
-                    detail.new_line,
-                    &detail.line_prefix,
-                    &detail.new_string,
-                )
-            });
+            *line_counts.entry(detail.new_line).or_insert(0) += 1;
+        }
+
+        for detail in &applied.edits.details {
+            let suffix = if line_counts.get(&detail.new_line).copied().unwrap_or(0) > 1 {
+                None
+            } else {
+                file_lines.as_deref().and_then(|lines| {
+                    derive_suffix(
+                        lines,
+                        detail.new_line,
+                        &detail.line_prefix,
+                        &detail.new_string,
+                    )
+                })
+            };
             let (old, new) = snippet(detail, suffix);
             let (a, r) = line_diff(&old, &new);
             added += a;
@@ -249,6 +258,7 @@ fn snippet(detail: &SearchReplaceEditDetail, suffix: Option<&str>) -> (String, S
     if let Some(sfx) = suffix {
         let (old_sfx, new_sfx) = if sfx.is_empty()
             && detail.new_string.ends_with('\n')
+            && !detail.old_string.is_empty()
             && !detail.old_string.ends_with('\n')
         {
             ("\n", "")
@@ -273,7 +283,7 @@ fn snippet(detail: &SearchReplaceEditDetail, suffix: Option<&str>) -> (String, S
         && !detail.context_after.starts_with('\n')
         && !detail.context_after.starts_with("\r\n")
     {
-        let old_needs_nl = !detail.old_string.ends_with('\n') && !detail.old_string.ends_with("\r\n");
+        let old_needs_nl = !detail.old_string.is_empty() && !detail.old_string.ends_with('\n') && !detail.old_string.ends_with("\r\n");
         let new_needs_nl = !detail.new_string.ends_with('\n') && !detail.new_string.ends_with("\r\n");
         let old_sep = if old_needs_nl { "\n" } else { "" };
         let new_sep = if new_needs_nl { "\n" } else { "" };

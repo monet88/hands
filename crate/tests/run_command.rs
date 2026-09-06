@@ -647,22 +647,24 @@ async fn test_run_command_timeout_with_detached_descendant() {
     // Tree-ownership proof is Windows-only (see above); on other platforms the
     // bounded timed_out return is the whole assertion.
     #[cfg(windows)]
-    if pid_file.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                let check = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid)])
-                    .output();
-                if let Ok(out) = check {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    assert!(
-                        stdout.trim().is_empty(),
-                        "descendant PID {} must not be alive after run_command timeout",
-                        pid
-                    );
-                }
-            }
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) && !pid_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert!(pid_file.exists(), "descendant PID file must exist before timeout check");
+        let pid_str = std::fs::read_to_string(&pid_file).expect("read pid file");
+        let pid: u32 = pid_str.trim().parse().expect("parse pid");
+        let check = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid)])
+            .output()
+            .expect("check process");
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "descendant PID {} must not be alive after run_command timeout",
+            pid
+        );
     }
 }
 
@@ -702,26 +704,45 @@ async fn test_run_command_success_preserves_descendant() {
     assert_eq!(structured["command_completed"], true);
     assert_eq!(structured["exit_code"], 0);
 
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) && !pid_file.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(pid_file.exists(), "descendant PID file must exist");
+    let pid_str = std::fs::read_to_string(&pid_file).expect("read pid");
+    let pid: u32 = pid_str.trim().parse().expect("parse pid");
+
+    struct ProcessKiller(u32);
+    impl Drop for ProcessKiller {
+        fn drop(&mut self) {
+            #[cfg(windows)]
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &format!("Stop-Process -Id {} -Force -ErrorAction SilentlyContinue", self.0)])
+                .output();
+            #[cfg(not(windows))]
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .output();
+        }
+    }
+    let _killer = ProcessKiller(pid);
+
     #[cfg(windows)]
     {
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(5) && !pid_file.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(pid_file.exists(), "descendant PID file must exist");
-        let pid_str = std::fs::read_to_string(&pid_file).expect("read pid");
-        let pid: u32 = pid_str.trim().parse().expect("parse pid");
-
         let check = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid)])
             .output()
             .expect("check descendant process");
         let out = String::from_utf8_lossy(&check.stdout).trim().to_string();
         assert_eq!(out, pid.to_string(), "descendant PID {pid} must still be running after successful completion");
-
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("Stop-Process -Id {} -Force -ErrorAction SilentlyContinue", pid)])
-            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let check = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("check descendant process");
+        assert!(check.status.success(), "descendant PID {pid} must still be running after successful completion");
     }
 }
 #[tokio::test]

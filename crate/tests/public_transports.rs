@@ -646,7 +646,7 @@ fn test_public_mcp_http_process_boundary() {
 fn spawn_stdio_hands(
     env_overrides: &[(&str, &str)],
 ) -> (
-    Child,
+    ProcessGuard,
     std::process::ChildStdin,
     BufReader<std::process::ChildStdout>,
     TempDir,
@@ -697,7 +697,7 @@ fn spawn_stdio_hands(
     let resp: Value = serde_json::from_str(&resp_line).expect("parse init json");
     assert_eq!(resp["id"], 1);
 
-    (child, stdin, reader, config_dir, workspace)
+    (ProcessGuard(child), stdin, reader, config_dir, workspace)
 }
 
 fn stdio_call_with_meta(
@@ -932,8 +932,7 @@ fn test_public_stdio_search_replace_all_four_cases() {
 #[test]
 #[serial]
 fn test_public_stdio_run_command_descendant_timeout_and_captured_output() {
-    let (child, mut stdin, mut reader, _config, workspace) = spawn_stdio_hands(&[]);
-    let _guard = ProcessGuard(child);
+    let (_guard, mut stdin, mut reader, _config, workspace) = spawn_stdio_hands(&[]);
 
     let pid_file = workspace.path().join("child.pid");
     let pid_file_str = pid_file.display().to_string().replace('\\', "/");
@@ -1023,8 +1022,7 @@ fn test_public_stdio_run_command_descendant_timeout_and_captured_output() {
 fn test_public_stdio_run_terminal_cmd_explicit_timeout_and_handoff_clocks() {
     // 1. Explicit short timeout before handoff (no background replacement)
     {
-        let (child, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
-        let _guard = ProcessGuard(child);
+        let (_guard, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
 
         #[cfg(windows)]
         let cmd = r#"powershell -NoProfile -Command "Start-Sleep -Seconds 10""#;
@@ -1058,9 +1056,8 @@ fn test_public_stdio_run_terminal_cmd_explicit_timeout_and_handoff_clocks() {
 
     // 2. Handoff before a longer explicit runtime deadline: task identity survives and settles to timed_out
     {
-        let (child, mut stdin, mut reader, _config, _workspace) =
+        let (_guard, mut stdin, mut reader, _config, _workspace) =
             spawn_stdio_hands(&[("GROK_FOREGROUND_BLOCK_BUDGET_MS", "300")]);
-        let _guard = ProcessGuard(child);
 
         #[cfg(windows)]
         let cmd = r#"powershell -NoProfile -Command "Start-Sleep -Seconds 20""#;
@@ -1109,9 +1106,8 @@ fn test_public_stdio_run_terminal_cmd_explicit_timeout_and_handoff_clocks() {
 #[test]
 #[serial]
 fn test_public_stdio_run_terminal_cmd_omitted_timeout_auto_yield_and_task_recovery() {
-    let (child, mut stdin, mut reader, _config, workspace) =
+    let (_guard, mut stdin, mut reader, _config, workspace) =
         spawn_stdio_hands(&[("GROK_FOREGROUND_BLOCK_BUDGET_MS", "300")]);
-    let _guard = ProcessGuard(child);
 
     let marker_file = workspace.path().join("auto_yield_marker.txt");
     let marker_str = marker_file.display().to_string().replace('\\', "/");
@@ -1185,8 +1181,7 @@ fn test_public_stdio_run_terminal_cmd_omitted_timeout_auto_yield_and_task_recove
 #[test]
 #[serial]
 fn test_public_stdio_session_tasks_survive_workspace_switch_and_roundtrip() {
-    let (child, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
-    let _guard = ProcessGuard(child);
+    let (_guard, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
 
     let session = json!({ "openai/session": "seam1-session-workspace-test" });
 
@@ -1372,8 +1367,7 @@ fn test_public_stdio_session_tasks_survive_workspace_switch_and_roundtrip() {
 #[test]
 #[serial]
 fn test_public_stdio_run_command_large_output_bounding_and_drain() {
-    let (child, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
-    let _guard = ProcessGuard(child);
+    let (_guard, mut stdin, mut reader, _config, _workspace) = spawn_stdio_hands(&[]);
 
     let python_cmd = if Command::new("python").arg("--version").output().is_ok() {
         "python"
@@ -1478,8 +1472,7 @@ fn test_public_stdio_run_command_large_output_bounding_and_drain() {
 #[test]
 #[serial]
 fn test_public_stdio_run_command_pre_spawn_rejects_cmd_and_bat() {
-    let (child, mut stdin, mut reader, _config, workspace) = spawn_stdio_hands(&[]);
-    let _guard = ProcessGuard(child);
+    let (_guard, mut stdin, mut reader, _config, workspace) = spawn_stdio_hands(&[]);
 
     let cmd_marker = workspace.path().join("cmd_marker.txt");
     let bat_marker = workspace.path().join("bat_marker.txt");

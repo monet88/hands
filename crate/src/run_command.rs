@@ -497,12 +497,12 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             });
         }
         Err(_) => {
+            let _kill_res = child.kill().await;
             #[cfg(windows)]
             let tree_kill_res = process_group.kill();
-            let kill_res = child.kill().await;
             let wait_after_kill = child.wait().await;
             #[cfg(windows)]
-            let settled = if tree_kill_res.is_ok() && kill_res.is_ok() && wait_after_kill.is_ok() {
+            let settled = if tree_kill_res.is_ok() && wait_after_kill.is_ok() {
                 let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
                 let mut all_dead = false;
                 loop {
@@ -529,7 +529,7 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             // Non-Windows keeps the prior direct-child contract: kill, reap,
             // report. No group is ever enrolled (see spawn above).
             #[cfg(not(windows))]
-            let settled = kill_res.is_ok() && wait_after_kill.is_ok();
+            let settled = _kill_res.is_ok() && wait_after_kill.is_ok();
             if settled {
                 (-1, true, "timed_out", false)
             } else {
@@ -559,19 +559,23 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
 
     let (stdout_str, stderr_str, stdout_is_truncated, stderr_is_truncated) = if stdout_lossy.len() + stderr_lossy.len() > MAX_OUTPUT_BYTES {
         let budget_each = MAX_OUTPUT_BYTES / 2;
+        let mut did_trunc_out = false;
         let truncated_stdout = if stdout_lossy.len() > budget_each {
+            did_trunc_out = true;
             crate::mcp::truncate_output_text(&stdout_lossy, budget_each, "")
         } else {
             stdout_lossy.into_owned()
         };
         let remaining_budget = MAX_OUTPUT_BYTES.saturating_sub(truncated_stdout.len());
+        let mut did_trunc_err = false;
         let truncated_stderr = if stderr_lossy.len() > remaining_budget {
+            did_trunc_err = true;
             crate::mcp::truncate_output_text(&stderr_lossy, remaining_budget, "")
         } else {
             stderr_lossy.into_owned()
         };
-        let out_trunc = stdout_truncated || truncated_stdout.len() != stdout_raw.len();
-        let err_trunc = stderr_truncated || truncated_stderr.len() != stderr_raw.len();
+        let out_trunc = stdout_truncated || did_trunc_out;
+        let err_trunc = stderr_truncated || did_trunc_err;
         (truncated_stdout, truncated_stderr, out_trunc, err_trunc)
     } else {
         (stdout_lossy.into_owned(), stderr_lossy.into_owned(), stdout_truncated, stderr_truncated)
@@ -627,6 +631,6 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     json!({
         "content": [{ "type": "text", "text": content_text }],
         "structuredContent": structured,
-        "isError": cleanup_error.is_some()
+        "isError": cleanup_error.is_some() || execution_state == "outcome_unknown"
     })
 }

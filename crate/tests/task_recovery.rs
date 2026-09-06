@@ -560,8 +560,11 @@ async fn test_set_workspace_preserves_session_terminal_backend_and_tasks() {
 #[serial]
 async fn test_completed_task_history_survives_workspace_roundtrip() {
     let harness = TestHarness::new();
+    let initial_cwd = dunce::canonicalize(harness.temp.path())
+        .unwrap_or_else(|_| harness.temp.path().to_path_buf())
+        .display()
+        .to_string();
     let session_header = json!({ "openai/session": "chat-completed-roundtrip-456" });
-
     // Run a short background task to completion
     #[cfg(windows)]
     let cmd = "powershell -NoProfile -Command \"Write-Output 'ROUNDTRIP_OK'\"";
@@ -656,5 +659,9 @@ async fn test_completed_task_history_survives_workspace_roundtrip() {
     let found_task = found.unwrap();
     assert_eq!(found_task["completed"], true);
     assert_eq!(found_task["status"], "completed");
-    assert!(found_task["cwd"].is_string());
+    assert_eq!(
+        found_task["cwd"].as_str().unwrap_or(""),
+        initial_cwd,
+        "completed task must preserve original cwd"
+    );
 }

@@ -110,15 +110,25 @@ impl McpHost {
             self.touch_session(session).await;
             return Ok(bridge.clone());
         }
-        let backend = {
+        let (backend, is_new) = {
             let mut backends = self.backends.lock().await;
+            let exists = backends.contains_key(session);
             let entry = backends
                 .entry(session.to_string())
                 .or_insert_with(|| (Arc::new(LocalTerminalBackend::new()), Instant::now()));
             entry.1 = Instant::now();
-            entry.0.clone()
+            (entry.0.clone(), !exists)
         };
-        let bridge = host::build_bridge_with_backend(cwd, backend).await?;
+        let bridge = match host::build_bridge_with_backend(cwd, backend).await {
+            Ok(b) => b,
+            Err(e) => {
+                if is_new {
+                    let mut backends = self.backends.lock().await;
+                    backends.remove(session);
+                }
+                return Err(e);
+            }
+        };
         cache.insert(key, bridge.clone());
         self.evict_sessions_over_cap(&mut cache, session).await;
         Ok(bridge)
@@ -151,19 +161,6 @@ impl McpHost {
     }
 
     /// True when the session backend still owns a running background task.
-    /// A session with live tasks is not inactive: removing its backend would
-    /// drop the last `LocalTerminalBackend` senders and the upstream actor
-    /// would shut down, killing the still-running task. Completed-only
-    /// history remains evictable past the cap, as documented.
-    async fn session_has_live_tasks(
-        backends: &HashMap<String, (Arc<LocalTerminalBackend>, Instant)>,
-        session: &str,
-    ) -> bool {
-        match backends.get(session) {
-            Some((backend, _)) => backend.list_tasks().await.iter().any(|t| !t.completed),
-            None => false,
-        }
-    }
 
     /// Reclaim idle sessions past the cap, oldest-inactive first. Removes the
     /// victim's cached bridges and backend together. Immune: the session being
@@ -178,34 +175,35 @@ impl McpHost {
         cache: &mut HashMap<(String, PathBuf), ToolBridge>,
         current: &str,
     ) {
-        let mut backends = self.backends.lock().await;
-        if backends.len() <= MAX_SESSION_BACKENDS {
-            return;
-        }
-        let victims = {
+        let victim_candidates = {
+            let backends = self.backends.lock().await;
+            if backends.len() <= MAX_SESSION_BACKENDS {
+                return;
+            }
             let inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            session_eviction_order(
+            let victims = session_eviction_order(
                 backends.iter().map(|(s, (_, t))| (s.clone(), *t)).collect(),
                 &inflight,
                 current,
                 backends.len() - MAX_SESSION_BACKENDS,
-            )
+            );
+            victims
+                .into_iter()
+                .filter_map(|v| backends.get(&v).map(|(b, _)| (v, b.clone())))
+                .collect::<Vec<_>>()
         };
-        for victim in victims {
-            // A call may have started (guard up, task not yet started).
+        for (victim, backend) in victim_candidates {
             if self.is_inflight(&victim) {
                 continue;
             }
-            // A live background task outlives its RPC: never evict its owner.
-            if Self::session_has_live_tasks(&backends, &victim).await {
+            if backend.list_tasks().await.iter().any(|t| !t.completed) {
                 continue;
             }
-            // Final boundary recheck: an RPC may have entered between the
-            // checks above. Its guard is already visible; skip if so.
             if self.is_inflight(&victim) {
                 continue;
             }
             cache.retain(|(s, _), _| s != &victim);
+            let mut backends = self.backends.lock().await;
             backends.remove(&victim);
         }
     }
@@ -976,6 +974,33 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    struct EnvGuard {
+        var: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(var: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(var);
+            unsafe {
+                std::env::set_var(var, val);
+            }
+            Self { var, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe {
+                    std::env::set_var(self.var, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.var);
+                },
+            }
+        }
+    }
     fn aged_sessions(n: usize) -> Vec<(String, Instant)> {
         // s0 oldest, s{n-1} newest; deterministic without sleeps.
         let now = Instant::now();
@@ -1049,11 +1074,7 @@ mod tests {
     async fn bridge_for_enforces_cap_across_many_sessions() {
         // End-to-end wiring: 70 real session bridges collapse to the cap, with
         // both maps bounded and the newest session retained.
-        let cfg = TempDir::new().unwrap();
-        let prev = std::env::var_os("HANDS_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg.path());
-        }
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
         let dir = TempDir::new().unwrap();
         let host = McpHost::new(dir.path().to_path_buf());
         for i in 0..70 {
@@ -1077,14 +1098,7 @@ mod tests {
             !host.backends.lock().await.contains_key("cap0"),
             "oldest reclaimed"
         );
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("HANDS_CONFIG_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HANDS_CONFIG_DIR");
-            },
-        }
+
     }
 
     #[tokio::test]
@@ -1092,11 +1106,7 @@ mod tests {
     async fn switch_workspace_keeps_session_backend_identity() {
         // Issue #62 stories 6-8: set_workspace must not replace the session's
         // terminal backend. Identity proven by Arc pointer equality.
-        let cfg = TempDir::new().unwrap();
-        let prev = std::env::var_os("HANDS_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg.path());
-        }
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
         let host = McpHost::new(dir_a.path().to_path_buf());
@@ -1127,14 +1137,7 @@ mod tests {
             ptr_before, ptr_after,
             "backend identity must survive set_workspace"
         );
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("HANDS_CONFIG_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HANDS_CONFIG_DIR");
-            },
-        }
+
     }
 
     fn set_old(
@@ -1172,11 +1175,7 @@ mod tests {
         // could reclaim the switching session's backend. Proved in three
         // phases: the unguarded window is genuinely catchable, the same guard
         // the fixed switch holds retains the backend, and release reclaims.
-        let cfg = TempDir::new().unwrap();
-        let prev = std::env::var_os("HANDS_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg.path());
-        }
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
         let dir_a = TempDir::new().unwrap();
         let host = McpHost::new(dir_a.path().to_path_buf());
         host.bridge_for("sw", dir_a.path().to_path_buf())
@@ -1242,14 +1241,7 @@ mod tests {
             "released idle session must be reclaimable"
         );
         let _ = dir_a;
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("HANDS_CONFIG_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HANDS_CONFIG_DIR");
-            },
-        }
+
     }
 
     #[tokio::test]
@@ -1259,11 +1251,7 @@ mod tests {
         // lose the switching backend mid-switch, panic, or deadlock. The
         // switching session stays newest here so between-switch idle eviction
         // cannot legitimately take it; the guard covers the switch itself.
-        let cfg = TempDir::new().unwrap();
-        let prev = std::env::var_os("HANDS_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg.path());
-        }
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
         let host = McpHost::new(dir_a.path().to_path_buf());
@@ -1307,14 +1295,7 @@ mod tests {
             host.backends.lock().await.contains_key("sw"),
             "sw survives the race"
         );
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("HANDS_CONFIG_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HANDS_CONFIG_DIR");
-            },
-        }
+
     }
 
     #[tokio::test]
@@ -1324,11 +1305,7 @@ mod tests {
         // evicting it would drop the last backend senders and kill the task.
         // Once the task is killed/completed and the session is otherwise idle,
         // it becomes evictable and the cap converges.
-        let cfg = TempDir::new().unwrap();
-        let prev = std::env::var_os("HANDS_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HANDS_CONFIG_DIR", cfg.path());
-        }
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
         let dir = TempDir::new().unwrap();
         let host = McpHost::new(dir.path().to_path_buf());
         let bridge = host
@@ -1405,13 +1382,6 @@ mod tests {
                 "victim bridges removed too"
             );
         }
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("HANDS_CONFIG_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HANDS_CONFIG_DIR");
-            },
-        }
+
     }
 }
