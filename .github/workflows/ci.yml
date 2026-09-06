@@ -19,8 +19,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: xai-org/grok-build
+          ref: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
           path: .grok-build
-
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config

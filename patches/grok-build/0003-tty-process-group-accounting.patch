@@ -1,0 +1,42 @@
+diff --git a/crates/codegen/xai-tty-utils/src/lib.rs b/crates/codegen/xai-tty-utils/src/lib.rs
+index a3cc9e4d..2d8eea90 100644
+--- a/crates/codegen/xai-tty-utils/src/lib.rs
++++ b/crates/codegen/xai-tty-utils/src/lib.rs
+@@ -848,8 +848,8 @@ impl ProcessGroup {
+         }
+     }
+ 
+-    /// Whether any process still exists in this group. `None` where the
+-    /// platform cannot say (Windows, `EPERM`); treat it as alive.
++    /// Whether any process still exists in this group. `None` when the
++    /// platform query cannot determine membership; callers must treat that as alive/unknown.
+     ///
+     /// Over-reports, never under-reports: an unreaped zombie is still a
+     /// process, so it counts as live. Filtering zombies out would let a
+@@ -868,7 +868,25 @@ impl ProcessGroup {
+         }
+         #[cfg(windows)]
+         {
+-            None
++            use std::mem::{size_of, zeroed};
++            use windows::Win32::System::JobObjects::{
++                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
++                QueryInformationJobObject,
++            };
++            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
++            let result = unsafe {
++                QueryInformationJobObject(
++                    Some(self.job),
++                    JobObjectBasicAccountingInformation,
++                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
++                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
++                    None,
++                )
++            };
++            match result {
++                Ok(()) => Some(info.ActiveProcesses > 0),
++                Err(_) => None,
++            }
+         }
+     }
+ 

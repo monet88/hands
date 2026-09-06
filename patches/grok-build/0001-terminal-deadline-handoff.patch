@@ -1,0 +1,337 @@
+diff --git a/crates/codegen/xai-grok-tools/src/computer/local/terminal.rs b/crates/codegen/xai-grok-tools/src/computer/local/terminal.rs
+index ec4e53c9..527a0d3c 100644
+--- a/crates/codegen/xai-grok-tools/src/computer/local/terminal.rs
++++ b/crates/codegen/xai-grok-tools/src/computer/local/terminal.rs
+@@ -42,7 +42,7 @@ const COMPLETED_TASK_TTL: Duration = Duration::from_secs(300);
+ /// SIGTERM → SIGKILL grace period.
+ const SIGTERM_GRACE: Duration = Duration::from_secs(1);
+ /// Max background task lifetime; 10 hours to support long monitor and bash runs.
+-const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
++pub(crate) const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
+ /// Max time an auto-backgroundable foreground command blocks the turn before it is
+ /// backgrounded (never killed), independent of `timeout`. Env: `GROK_FOREGROUND_BLOCK_BUDGET_MS`.
+ const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
+@@ -1844,7 +1844,7 @@ impl LocalTerminalActor {
+         }
+ 
+         // Auto-bg budget: a second timer, independent of `timeout`, that only
+-        // backgrounds, never kills; the `timeout` check below kills when auto-bg is off.
++        // backgrounds, never kills; the `timeout` check below terminates the process.
+         if !process.lifecycle.has_exited()
+             && matches!(
+                 process.bg_status,
+@@ -1859,16 +1859,6 @@ impl LocalTerminalActor {
+         }
+ 
+         if process.is_timed_out() && !process.lifecycle.has_exited() {
+-            if matches!(
+-                process.bg_status,
+-                BackgroundStatus::Foreground {
+-                    auto_bg_on_timeout: true
+-                }
+-            ) {
+-                self.transition_to_background(terminal_id, BackgroundReason::ForegroundTimeout);
+-                return;
+-            }
+-
+             send_sigterm_to_group(process);
+             process.mark_exited(ExitStatus {
+                 exit_code: None,
+@@ -1939,7 +1929,12 @@ impl LocalTerminalActor {
+             return false;
+         };
+         process.bg_status = BackgroundStatus::Backgrounded { reason };
+-        process.timeout = BACKGROUND_MAX_RUNTIME;
++        // If the task had no explicit timeout (it was set to BACKGROUND_MAX_RUNTIME
++        // at spawn), keep BACKGROUND_MAX_RUNTIME. If it had an explicit timeout
++        // (e.g. 800ms), preserve that explicit timeout as the total runtime deadline.
++        if process.timeout >= BACKGROUND_MAX_RUNTIME {
++            process.timeout = BACKGROUND_MAX_RUNTIME;
++        }
+         let result = Ok(process.to_result());
+         process.notify_waiters(result);
+         let tool_call_id = process.tool_call_id.clone();
+@@ -3505,7 +3500,7 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn test_auto_background_on_timeout() {
+-        let backend = LocalTerminalBackend::new();
++        let backend = LocalTerminalBackend::new_with_foreground_budget(Duration::from_millis(300));
+ 
+         let output_file =
+             std::env::temp_dir().join(format!("terminal-test-auto-bg-{}.out", std::process::id()));
+@@ -3513,9 +3508,9 @@ mod tests {
+ 
+         let request = TerminalRunRequest {
+             command: "sleep 60".to_string(),
+-            working_directory: PathBuf::from("/tmp"),
++            working_directory: std::env::temp_dir(),
+             env: HashMap::new(),
+-            timeout: Duration::from_millis(500),
++            timeout: Duration::from_secs(60),
+             output_byte_limit: 10000,
+             output_file: output_file.clone(),
+             notification_handle: ToolNotificationHandle::noop(),
+@@ -3527,7 +3522,6 @@ mod tests {
+             owner_session_id: None,
+             description: None,
+         };
+-
+         let result = backend.run(request).await.unwrap();
+ 
+         assert!(
+@@ -3792,7 +3786,7 @@ mod tests {
+ 
+         let request = TerminalRunRequest {
+             command: "sleep 60".to_string(),
+-            working_directory: PathBuf::from("/tmp"),
++            working_directory: std::env::temp_dir(),
+             env: HashMap::new(),
+             timeout: Duration::from_millis(800),
+             output_byte_limit: 10000,
+@@ -3810,22 +3804,33 @@ mod tests {
+         let start = Instant::now();
+         let result = backend.run(request).await.unwrap();
+         let elapsed = start.elapsed();
+-
+-        assert_eq!(result.signal.as_deref(), Some("auto_backgrounded"));
++        assert!(
++            result.timed_out,
++            "explicit timeout must be terminal even when auto_background_on_timeout is true"
++        );
++        assert_eq!(
++            result.signal.as_deref(),
++            Some("timeout"),
++            "signal should be timeout, got {:?}",
++            result.signal
++        );
+         assert!(
+             elapsed >= Duration::from_millis(500),
+             "Duration::MAX budget must not short-circuit at 100ms backend default (took {elapsed:?})"
+         );
+         assert!(
+             elapsed < Duration::from_secs(10),
+-            "should auto-bg around the 800ms timeout (took {elapsed:?})"
++            "should time out around the 800ms timeout (took {elapsed:?})"
+         );
+ 
+-        let outcome = backend.kill_task(tool_call_id).await;
+-        assert!(matches!(
+-            outcome,
+-            KillOutcome::Killed | KillOutcome::AlreadyExited
+-        ));
++        let snapshot = backend.get_task(tool_call_id).await;
++        if let Some(snap) = snapshot {
++            assert!(
++                snap.completed,
++                "timed out task should be marked completed, not running"
++            );
++        }
++
+         let _ = tokio::fs::remove_file(&output_file).await;
+     }
+ 
+@@ -4745,6 +4750,7 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(unix)]
+     #[test]
+     fn test_parse_login_env_capture() {
+         let stdout = "motd noise\n\x01/opt/rc/bin:/usr/bin\x01\
+@@ -4775,6 +4781,7 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(unix)]
+     #[test]
+     fn test_parse_login_env_capture_path_only() {
+         let (path, env) = parse_login_env_capture("\x01/usr/bin\x01");
+@@ -5603,4 +5610,187 @@ mod tests {
+             "owner_session_id should propagate from request to snapshot"
+         );
+     }
++    #[tokio::test]
++    async fn test_explicit_runtime_deadline_survives_auto_background_handoff() {
++        // Regression test for Issue #62:
++        // When a foreground command with explicit positive timeout auto-backgrounds at its
++        // foreground_block_budget, it must preserve the original requested timeout as its
++        // total runtime deadline instead of expanding to BACKGROUND_MAX_RUNTIME (10 hours).
++        let backend = LocalTerminalBackend::new_with_foreground_budget(Duration::from_millis(200));
++
++        let output_file = std::env::temp_dir().join(format!(
++            "terminal-test-explicit-deadline-{}.out",
++            std::process::id()
++        ));
++        let tool_call_id = "test-explicit-deadline-survives";
++
++        let explicit_timeout = Duration::from_millis(800);
++        let request = TerminalRunRequest {
++            command: "sleep 60".to_string(),
++            working_directory: std::env::temp_dir(),
++            env: HashMap::new(),
++            timeout: explicit_timeout,
++            output_byte_limit: 10000,
++            output_file: output_file.clone(),
++            notification_handle: ToolNotificationHandle::noop(),
++            tool_call_id: tool_call_id.to_string(),
++            display_command: None,
++            auto_background_on_timeout: true,
++            foreground_block_budget: Some(Duration::from_millis(200)),
++            kind: TaskKind::Bash,
++            owner_session_id: None,
++            description: None,
++        };
++
++        let start = Instant::now();
++        let result = backend.run(request).await.unwrap();
++        let elapsed = start.elapsed();
++
++        assert_eq!(result.signal.as_deref(), Some("auto_backgrounded"));
++        assert!(
++            elapsed < Duration::from_secs(2),
++            "should auto-bg after foreground budget (~200ms), took {elapsed:?}"
++        );
++
++        // Wait for process to hit the explicit timeout (800ms)
++        tokio::time::sleep(Duration::from_millis(900)).await;
++
++        let snapshot = backend
++            .get_task(tool_call_id)
++            .await
++            .expect("task snapshot should exist");
++
++        assert!(
++            snapshot.completed,
++            "task should have completed (timed out) at its explicit deadline rather than running for 10h"
++        );
++        assert_eq!(
++            snapshot.signal.as_deref(),
++            Some("timeout"),
++            "signal should reflect timeout after explicit deadline, got {:?}",
++            snapshot.signal
++        );
++
++        let _ = tokio::fs::remove_file(&output_file).await;
++    }
++
++    #[tokio::test]
++    async fn test_omitted_timeout_auto_yields_without_inheriting_foreground_default_deadline() {
++        // Regression test for Issue #62:
++        // When timeout is omitted or defaulted (explicit_timeout=false), auto-backgrounding
++        // must retain normal background task lifetime (BACKGROUND_MAX_RUNTIME) rather
++        // than prematurely killing the command when the foreground default deadline expires.
++        let backend = LocalTerminalBackend::new_with_foreground_budget(Duration::from_millis(200));
++
++        let output_file = std::env::temp_dir().join(format!(
++            "terminal-test-omitted-timeout-yields-{}.out",
++            std::process::id()
++        ));
++        let tool_call_id = "test-omitted-timeout-yields";
++
++        let request = TerminalRunRequest {
++            command: "sleep 60".to_string(),
++            working_directory: std::env::temp_dir(),
++            env: HashMap::new(),
++            timeout: BACKGROUND_MAX_RUNTIME,
++            output_byte_limit: 10000,
++            output_file: output_file.clone(),
++            notification_handle: ToolNotificationHandle::noop(),
++            tool_call_id: tool_call_id.to_string(),
++            display_command: None,
++            auto_background_on_timeout: true,
++            foreground_block_budget: Some(Duration::from_millis(200)),
++            kind: TaskKind::Bash,
++            owner_session_id: None,
++            description: None,
++        };
++
++        let start = Instant::now();
++        let result = backend.run(request).await.unwrap();
++        let elapsed = start.elapsed();
++
++        assert_eq!(result.signal.as_deref(), Some("auto_backgrounded"));
++        assert!(
++            elapsed < Duration::from_secs(2),
++            "should auto-bg after foreground budget (~200ms), took {elapsed:?}"
++        );
++
++        // Wait past the original 600ms foreground timeout
++        tokio::time::sleep(Duration::from_millis(800)).await;
++
++        let snapshot = backend
++            .get_task(tool_call_id)
++            .await
++            .expect("task snapshot should exist");
++
++        // Because explicit_timeout=false, the task must NOT have timed out at 600ms
++        assert!(
++            !snapshot.completed,
++            "omitted/default timeout task must continue running in background under BACKGROUND_MAX_RUNTIME"
++        );
++
++        let _ = backend.kill_task(tool_call_id).await;
++        let _ = tokio::fs::remove_file(&output_file).await;
++    }
++
++    #[tokio::test]
++    async fn test_omitted_timeout_with_zero_budget_auto_yields_at_foreground_default() {
++        // Regression test for Issue #62:
++        // When foreground_block_budget_ms = 0 (short budget disabled) and timeout is omitted,
++        // the handoff budget becomes the effective foreground default timeout (simulated here
++        // at 250ms). The command must NOT auto-bg before 250ms, MUST auto-yield at 250ms,
++        // and must then remain alive in the background under BACKGROUND_MAX_RUNTIME rather
++        // than timing out.
++        let backend = LocalTerminalBackend::new();
++
++        let output_file = std::env::temp_dir().join(format!(
++            "terminal-test-zero-budget-omitted-timeout-{}.out",
++            std::process::id()
++        ));
++        let tool_call_id = "test-zero-budget-omitted-timeout";
++
++        let fg_default_timeout = Duration::from_millis(250);
++        let request = TerminalRunRequest {
++            command: "sleep 60".to_string(),
++            working_directory: std::env::temp_dir(),
++            env: HashMap::new(),
++            timeout: BACKGROUND_MAX_RUNTIME,
++            output_byte_limit: 10000,
++            output_file: output_file.clone(),
++            notification_handle: ToolNotificationHandle::noop(),
++            tool_call_id: tool_call_id.to_string(),
++            display_command: None,
++            auto_background_on_timeout: true,
++            foreground_block_budget: Some(fg_default_timeout),
++            kind: TaskKind::Bash,
++            owner_session_id: None,
++            description: None,
++        };
++
++        let start = Instant::now();
++        let result = backend.run(request).await.unwrap();
++        let elapsed = start.elapsed();
++
++        assert_eq!(result.signal.as_deref(), Some("auto_backgrounded"));
++        assert!(
++            elapsed >= Duration::from_millis(200),
++            "must not auto-bg before foreground default timeout (~250ms), took {elapsed:?}"
++        );
++
++        // Wait past 250ms and verify process is still running under BACKGROUND_MAX_RUNTIME
++        tokio::time::sleep(Duration::from_millis(300)).await;
++
++        let snapshot = backend
++            .get_task(tool_call_id)
++            .await
++            .expect("task snapshot should exist");
++
++        assert!(
++            !snapshot.completed,
++            "task must remain alive in background under BACKGROUND_MAX_RUNTIME, not killed at default timeout"
++        );
++
++        let _ = backend.kill_task(tool_call_id).await;
++        let _ = tokio::fs::remove_file(&output_file).await;
++    }
+ }

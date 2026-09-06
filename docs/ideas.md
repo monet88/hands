@@ -27,7 +27,7 @@ Tài liệu lưu trữ các ý tưởng cải tiến, tính năng và kiến tr�
 [Người dùng click Hands.exe]
        │
        ├── Lần đầu tiên chạy (chưa có cấu hình):
-       │    1. Materialize Runtime Bundle gồm `hands.exe` và `tunnel-client.exe`
+       │    1. Materialize Runtime Bundle gồm `hands.exe`, `tunnel-client.exe` và pinned `rg.exe`
        │       vào `runtime\<version>\` ngay trong thư mục chứa `Hands.exe`.
        │    2. Hiển thị Dialog nhỏ gọn:
        │         - Control Plane API Key (sk-...)
@@ -66,7 +66,7 @@ Chuột phải vào Tray Icon của Hands:
    * Electron/WebView2 không được đưa vào chỉ để làm tray/settings nếu native WinForms đã đủ.
 
 2. **Runtime Bundle**
-   * Artifact phân phối là một file, nhưng runtime được phép gồm launcher + `hands.exe` + `tunnel-client.exe`.
+   * Artifact phân phối là một file, nhưng runtime được phép gồm launcher + `hands.exe` + `tunnel-client.exe` + pinned `rg.exe`.
    * Runtime Bundle nằm **cạnh launcher**, tại `runtime\<version>\` dưới thư mục chứa `Hands.exe`. Đây là portable app root; không silently redirect bundle sang `%LOCALAPPDATA%`.
    * Nếu launcher directory không writable, fail rõ ràng và yêu cầu đặt `Hands.exe` vào một thư mục writable thay vì phá portable semantics bằng fallback ẩn.
    * Giữ tối đa current + previous runtime version để hỗ trợ rollback thủ công; launcher version chạy đúng bundle version của chính nó.

@@ -467,3 +467,194 @@ async fn test_list_terminal_tasks_long_command_bounded_structured_content() {
         )
         .await;
 }
+
+#[tokio::test]
+#[serial]
+async fn test_set_workspace_preserves_session_terminal_backend_and_tasks() {
+    let harness = TestHarness::new();
+    let session_header = json!({ "openai/session": "chat-preserve-test-123" });
+
+    // Start a background task in the initial workspace
+    #[cfg(windows)]
+    let cmd = "powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"";
+    #[cfg(not(windows))]
+    let cmd = "sleep 30";
+
+    let bg_resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_terminal_cmd",
+                "arguments": {
+                    "command": cmd,
+                    "description": "Background task for session switch test",
+                    "is_background": true
+                },
+                "_meta": session_header
+            }),
+        )
+        .await;
+    assert_eq!(bg_resp["result"]["isError"], false, "bg_resp: {bg_resp}");
+    let task_id = bg_resp["result"]["structuredContent"]["task_id"]
+        .as_str()
+        .expect("task_id")
+        .to_string();
+
+    // Now switch workspace in this session
+    let new_dir = tempfile::TempDir::new().unwrap();
+    let new_dir_str = dunce::canonicalize(new_dir.path())
+        .unwrap()
+        .display()
+        .to_string();
+
+    let sw_resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "set_workspace",
+                "arguments": {
+                    "path": new_dir_str
+                },
+                "_meta": session_header
+            }),
+        )
+        .await;
+    assert_eq!(sw_resp["result"]["isError"], false);
+
+    // Query tasks in this session after workspace switch
+    let list_resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "list_terminal_tasks",
+                "arguments": {},
+                "_meta": session_header
+            }),
+        )
+        .await;
+    assert_eq!(list_resp["result"]["isError"], false);
+
+    let tasks = list_resp["result"]["structuredContent"]["tasks"]
+        .as_array()
+        .expect("tasks array");
+    let found = tasks.iter().find(|t| t["task_id"] == task_id);
+    assert!(
+        found.is_some(),
+        "task must survive set_workspace in the same session without being killed or dropped"
+    );
+
+    // Clean up task
+    let _ = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "kill_task",
+                "arguments": { "task_id": task_id },
+                "_meta": session_header
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_completed_task_history_survives_workspace_roundtrip() {
+    let harness = TestHarness::new();
+    let session_header = json!({ "openai/session": "chat-completed-roundtrip-456" });
+
+    // Run a short background task to completion
+    #[cfg(windows)]
+    let cmd = "powershell -NoProfile -Command \"Write-Output 'ROUNDTRIP_OK'\"";
+    #[cfg(not(windows))]
+    let cmd = "echo ROUNDTRIP_OK";
+
+    let bg_resp = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "run_terminal_cmd",
+                "arguments": {
+                    "command": cmd,
+                    "description": "Short task for roundtrip discovery",
+                    "is_background": true
+                },
+                "_meta": session_header
+            }),
+        )
+        .await;
+    assert_eq!(bg_resp["result"]["isError"], false);
+    let task_id = bg_resp["result"]["structuredContent"]["task_id"]
+        .as_str()
+        .expect("task_id")
+        .to_string();
+
+    // Wait until completed
+    let mut completed = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        let list_resp = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "list_terminal_tasks",
+                    "arguments": {},
+                    "_meta": session_header
+                }),
+            )
+            .await;
+        if let Some(tasks) = list_resp["result"]["structuredContent"]["tasks"].as_array() {
+            if let Some(t) = tasks.iter().find(|t| t["task_id"] == task_id) {
+                if t["completed"] == true {
+                    completed = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    assert!(completed, "task must complete within 10s");
+
+    // Switch workspace away and then back
+    let temp_a = tempfile::TempDir::new().unwrap();
+    let temp_b = tempfile::TempDir::new().unwrap();
+
+    for dir in [&temp_a, &temp_b] {
+        let dir_str = dunce::canonicalize(dir.path()).unwrap().display().to_string();
+        let sw = harness
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": "set_workspace",
+                    "arguments": { "path": dir_str },
+                    "_meta": session_header
+                }),
+            )
+            .await;
+        assert_eq!(sw["result"]["isError"], false);
+    }
+
+    // Query tasks after workspace round-trip: completed task must still be present with original CWD
+    let final_list = harness
+        .rpc(
+            "tools/call",
+            json!({
+                "name": "list_terminal_tasks",
+                "arguments": {},
+                "_meta": session_header
+            }),
+        )
+        .await;
+    assert_eq!(final_list["result"]["isError"], false);
+    let tasks = final_list["result"]["structuredContent"]["tasks"]
+        .as_array()
+        .expect("tasks array");
+    let found = tasks.iter().find(|t| t["task_id"] == task_id);
+    assert!(
+        found.is_some(),
+        "completed task must remain discoverable after workspace roundtrip"
+    );
+    let found_task = found.unwrap();
+    assert_eq!(found_task["completed"], true);
+    assert_eq!(found_task["status"], "completed");
+    assert!(found_task["cwd"].is_string());
+}

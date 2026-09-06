@@ -21,6 +21,7 @@ use xai_grok_tools::reminders::DEFAULT_REMINDER_TAG;
 pub const APP: &str = "hands";
 pub const DISPLAY: &str = "Hands";
 pub const UPSTREAM_BASE_COMMIT: &str = "c059e0d";
+pub const GROK_BUILD_PINNED_SHA: &str = "72a61251fcffb464bcc687aeb5a998e5a98ec0c9";
 pub const DEV_GIT_REV: &str = env!("DEV_GIT_REV");
 const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -406,11 +407,53 @@ fn session_context(cwd: PathBuf) -> SessionContext {
 }
 
 pub async fn build_bridge(cwd: PathBuf) -> Result<ToolBridge, String> {
+    build_bridge_with_backend(cwd, Arc::new(LocalTerminalBackend::new())).await
+}
+
+pub async fn build_bridge_with_backend(
+    cwd: PathBuf,
+    backend: Arc<LocalTerminalBackend>,
+) -> Result<ToolBridge, String> {
     let mut builder = ToolBridge::get_builder();
     builder.set_system_reminders_enabled(false);
-    ToolBridge::finalize_builder(builder, allowlist(), session_context(cwd))
+    let mut ctx = session_context(cwd);
+    ctx.backend = backend;
+    ToolBridge::finalize_builder(builder, allowlist(), ctx)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Resolve ripgrep for search tools without requiring a separate install.
+///
+/// Called once at the single-threaded process/startup boundary (`main`).
+/// Order: a valid explicit `RG_BIN_PATH` pointing at an existing file wins on
+/// all platforms; otherwise, bundled sibling `rg.exe` resolution beside the
+/// current executable is Windows-only (the packaged Windows Runtime Bundle layout).
+/// Any other fallback behavior remains upstream-owned (PATH and dev fallbacks
+/// inside `rg_path()`). Never writes to config/vendor directories.
+pub fn ensure_bundled_rg() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RG_BIN_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("rg.exe");
+            if candidate.is_file() {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    std::env::set_var("RG_BIN_PATH", &candidate);
+                }
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

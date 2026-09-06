@@ -1,0 +1,170 @@
+diff --git a/crates/codegen/xai-grok-tools/src/implementations/grok_build/bash/mod.rs b/crates/codegen/xai-grok-tools/src/implementations/grok_build/bash/mod.rs
+index 3feb4c3c..8f6918dc 100644
+--- a/crates/codegen/xai-grok-tools/src/implementations/grok_build/bash/mod.rs
++++ b/crates/codegen/xai-grok-tools/src/implementations/grok_build/bash/mod.rs
+@@ -1313,25 +1313,32 @@ impl BashTool {
+         params.auto_background_on_timeout && Self::background_enabled(params)
+     }
+ 
+-    /// Per-request FG auto-bg budget for the terminal when auto_bg is on.
++    /// Resolve foreground block budget for a concrete execution request.
+     ///
+-    /// - `None` when auto_bg is off, **or** when `foreground_block_budget_ms` is
+-    ///   unset — leave `TerminalRunRequest.foreground_block_budget` as `None` so
+-    ///   the terminal backend default applies (`GROK_FOREGROUND_BLOCK_BUDGET_MS`
+-    ///   / 15s). Do not materialize a fixed 15s here; that would override the env.
+-    /// - `Some(Duration::MAX)` when budget is `0` (timeout-only auto-bg).
+-    /// - `Some(ms)` when an explicit budget is configured.
+-    pub(crate) fn effective_foreground_block_budget(
++    /// Preserves finite/default short budget behavior. When budget=0 (disable
++    /// short budget), an omitted timeout receives the effective foreground
++    /// default timeout as its handoff budget so it auto-backgrounds at that
++    /// threshold and continues running under `BACKGROUND_MAX_RUNTIME`, while an
++    /// explicit positive timeout preserves `Some(Duration::MAX)` (only the
++    /// explicit deadline terminates the command).
++    pub(crate) fn resolve_foreground_block_budget(
+         params: &BashParams,
++        is_explicit_timeout: bool,
+     ) -> Option<std::time::Duration> {
+         if !Self::auto_background_on_timeout_enabled(params) {
+             return None;
+         }
+         match params.foreground_block_budget_ms {
+-            // 0 = disable short budget: only model/default timeout auto-bgs.
+-            Some(0) => Some(std::time::Duration::MAX),
++            Some(0) => {
++                if !is_explicit_timeout {
++                    Some(std::time::Duration::from_millis(
++                        Self::effective_default_timeout_ms(params),
++                    ))
++                } else {
++                    Some(std::time::Duration::MAX)
++                }
++            }
+             Some(ms) => Some(std::time::Duration::from_millis(ms)),
+-            // Unset → backend default (env-overridable).
+             None => None,
+         }
+     }
+@@ -2067,19 +2074,28 @@ impl xai_tool_runtime::Tool for BashTool {
+             }))
+         } else {
+             // ─── Foreground execution ───
+-            let timeout = Self::resolve_effective_timeout_for_params(
+-                input.timeout,
+-                false,
+-                config_timeout,
+-                &params,
+-            );
+-            // Backgroundable commands get the terminal's short budget (the
+-            // requested `timeout` stays as the kill backstop, nothing to clamp).
+-            // Non-backgroundable ones have no background path, so a large
+-            // `timeout` would wedge the turn — clamp it to `MAX_FOREGROUND_BLOCK`.
++            let is_explicit_timeout = input.timeout.is_some_and(|ms| ms > 0);
+             let timeout = if Self::auto_background_on_timeout_enabled(&params) {
+-                timeout
++                if input.timeout.is_some_and(|ms| ms > 0) {
++                    Self::resolve_effective_timeout_for_params(
++                        input.timeout,
++                        false,
++                        config_timeout,
++                        &params,
++                    )
++                } else {
++                    // For a backgroundable command with omitted/default timeout,
++                    // keep BACKGROUND_MAX_RUNTIME so auto-backgrounding does not inherit
++                    // the foreground default deadline.
++                    crate::computer::local::terminal::BACKGROUND_MAX_RUNTIME
++                }
+             } else {
++                let timeout = Self::resolve_effective_timeout_for_params(
++                    input.timeout,
++                    false,
++                    config_timeout,
++                    &params,
++                );
+                 clamp_foreground_block(timeout, config_timeout, max_foreground_block())
+             };
+ 
+@@ -2107,7 +2123,10 @@ impl xai_tool_runtime::Tool for BashTool {
+                 // existing grok_build callers that never opted in are
+                 // unaffected.
+                 auto_background_on_timeout: Self::auto_background_on_timeout_enabled(&params),
+-                foreground_block_budget: Self::effective_foreground_block_budget(&params),
++                foreground_block_budget: Self::resolve_foreground_block_budget(
++                    &params,
++                    is_explicit_timeout,
++                ),
+                 kind: crate::computer::types::TaskKind::Bash,
+                 owner_session_id: owner_session_id.clone(),
+                 description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
+@@ -4141,7 +4160,8 @@ mod tests {
+         fn budget_none_when_auto_bg_off() {
+             let params = BashParams::default();
+             assert!(!params.auto_background_on_timeout);
+-            assert!(BashTool::effective_foreground_block_budget(&params).is_none());
++            assert!(BashTool::resolve_foreground_block_budget(&params, false).is_none());
++            assert!(BashTool::resolve_foreground_block_budget(&params, true).is_none());
+             assert!(BashTool::effective_auto_bg_wait_ms(&params).is_none());
+         }
+ 
+@@ -4153,7 +4173,8 @@ mod tests {
+                 ..BashParams::default()
+             };
+             // Must not pin 15s on the request — backend applies env/default.
+-            assert!(BashTool::effective_foreground_block_budget(&params).is_none());
++            assert!(BashTool::resolve_foreground_block_budget(&params, false).is_none());
++            assert!(BashTool::resolve_foreground_block_budget(&params, true).is_none());
+             // Helper still assumes documented 15s default for wait math.
+             assert_eq!(
+                 BashTool::effective_auto_bg_wait_ms(&params),
+@@ -4170,12 +4191,35 @@ mod tests {
+                 ..BashParams::default()
+             };
+             assert_eq!(
+-                BashTool::effective_foreground_block_budget(&params),
++                BashTool::resolve_foreground_block_budget(&params, false),
++                Some(Duration::from_secs(30)),
++            );
++            assert_eq!(
++                BashTool::resolve_foreground_block_budget(&params, true),
+                 Some(Duration::MAX),
+             );
+             // Wait is purely the default timeout when short budget is off.
+             assert_eq!(BashTool::effective_auto_bg_wait_ms(&params), Some(30_000));
+         }
++        #[test]
++        fn budget_zero_resolves_default_timeout_for_omitted_and_max_for_explicit() {
++            let params = BashParams {
++                auto_background_on_timeout: true,
++                foreground_block_budget_ms: Some(0),
++                timeout_secs: Some(30.0),
++                ..BashParams::default()
++            };
++            // Omitted timeout: handoff budget is the effective foreground default timeout (30s)
++            assert_eq!(
++                BashTool::resolve_foreground_block_budget(&params, false),
++                Some(Duration::from_secs(30)),
++            );
++            // Explicit positive timeout: short budget disabled (Duration::MAX) so execution runs to explicit deadline
++            assert_eq!(
++                BashTool::resolve_foreground_block_budget(&params, true),
++                Some(Duration::MAX),
++            );
++        }
+ 
+         #[test]
+         fn custom_budget_and_timeout_min() {
+@@ -4186,7 +4230,11 @@ mod tests {
+                 ..BashParams::default()
+             };
+             assert_eq!(
+-                BashTool::effective_foreground_block_budget(&params),
++                BashTool::resolve_foreground_block_budget(&params, false),
++                Some(Duration::from_millis(5_000)),
++            );
++            assert_eq!(
++                BashTool::resolve_foreground_block_budget(&params, true),
+                 Some(Duration::from_millis(5_000)),
+             );
+             assert_eq!(BashTool::effective_auto_bg_wait_ms(&params), Some(5_000));

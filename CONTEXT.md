@@ -17,7 +17,7 @@ One downloadable or copyable Windows executable. It does not imply that only one
 _Avoid_: Single-process app, single runtime binary
 
 **Runtime Bundle**:
-The versioned set of child binaries needed by the Windows Tray Launcher: the Hands Runtime and `tunnel-client`.
+The versioned set of child binaries needed by the Windows Tray Launcher: `hands.exe`, `tunnel-client.exe`, and pinned `rg.exe`.
 _Avoid_: Installer payload
 
 **Portable App Root**:

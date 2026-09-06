@@ -82,8 +82,23 @@ fn render_search(applied: &SearchReplaceEditsApplied, workspace: &Path) -> Rende
         removed = r;
         body = unified(&path, &old, &new);
     } else {
+        let updated_file = std::fs::read_to_string(&applied.absolute_path)
+            .ok()
+            .map(|s| s.replace("\r\n", "\n"));
+        let file_lines: Option<Vec<&str>> = updated_file
+            .as_deref()
+            .map(|s| s.split_inclusive('\n').collect());
+
         for detail in &applied.edits.details {
-            let (old, new) = snippet(detail);
+            let suffix = file_lines.as_deref().and_then(|lines| {
+                derive_suffix(
+                    lines,
+                    detail.new_line,
+                    &detail.line_prefix,
+                    &detail.new_string,
+                )
+            });
+            let (old, new) = snippet(detail, suffix);
             let (a, r) = line_diff(&old, &new);
             added += a;
             removed += r;
@@ -172,18 +187,113 @@ fn render_patch(
     }
 }
 
-fn snippet(detail: &SearchReplaceEditDetail) -> (String, String) {
+fn derive_suffix<'a>(
+    lines: &[&'a str],
+    new_line: usize,
+    line_prefix: &str,
+    new_string: &str,
+) -> Option<&'a str> {
+    if new_line == 0 {
+        return None;
+    }
+    let start_idx = new_line - 1;
+    if start_idx >= lines.len() {
+        return None;
+    }
+
+    let line_prefix_norm = line_prefix.replace("\r\n", "\n");
+    let new_string_norm = new_string.replace("\r\n", "\n");
+
+    let new_lines: Vec<&str> = if new_string_norm.is_empty() {
+        vec![""]
+    } else {
+        new_string_norm.split_inclusive('\n').collect()
+    };
+
+    let end_idx = start_idx + new_lines.len() - 1;
+    if end_idx >= lines.len() {
+        return None;
+    }
+
+    if !lines[start_idx].starts_with(&line_prefix_norm) {
+        return None;
+    }
+    let after_prefix = &lines[start_idx][line_prefix_norm.len()..];
+
+    if new_lines.len() == 1 {
+        if !after_prefix.starts_with(new_lines[0]) {
+            return None;
+        }
+        return Some(&after_prefix[new_lines[0].len()..]);
+    }
+
+    if after_prefix != new_lines[0] {
+        return None;
+    }
+
+    for (k, expected_line) in new_lines.iter().enumerate().take(new_lines.len() - 1).skip(1) {
+        if lines[start_idx + k] != *expected_line {
+            return None;
+        }
+    }
+
+    let last_new = *new_lines.last().unwrap();
+    if !lines[end_idx].starts_with(last_new) {
+        return None;
+    }
+    Some(&lines[end_idx][last_new.len()..])
+}
+
+fn snippet(detail: &SearchReplaceEditDetail, suffix: Option<&str>) -> (String, String) {
+    let prefix = &detail.line_prefix;
+    if let Some(sfx) = suffix {
+        let (old_sfx, new_sfx) = if sfx.is_empty()
+            && detail.new_string.ends_with('\n')
+            && !detail.old_string.ends_with('\n')
+        {
+            ("\n", "")
+        } else {
+            (sfx, sfx)
+        };
+        let old = format!(
+            "{}{}{}{}{}",
+            detail.context_before, prefix, detail.old_string, old_sfx, detail.context_after
+        );
+        let new = format!(
+            "{}{}{}{}{}",
+            detail.context_before, prefix, detail.new_string, new_sfx, detail.context_after
+        );
+        return (
+            ensure_nl(old.replace("\r\n", "\n")),
+            ensure_nl(new.replace("\r\n", "\n")),
+        );
+    }
+
+    let (old_suffix, new_suffix) = if !detail.context_after.is_empty()
+        && !detail.context_after.starts_with('\n')
+        && !detail.context_after.starts_with("\r\n")
+    {
+        let old_needs_nl = !detail.old_string.ends_with('\n') && !detail.old_string.ends_with("\r\n");
+        let new_needs_nl = !detail.new_string.ends_with('\n') && !detail.new_string.ends_with("\r\n");
+        let old_sep = if old_needs_nl { "\n" } else { "" };
+        let new_sep = if new_needs_nl { "\n" } else { "" };
+        (
+            format!("{}{}", old_sep, detail.context_after),
+            format!("{}{}", new_sep, detail.context_after),
+        )
+    } else {
+        (detail.context_after.clone(), detail.context_after.clone())
+    };
+
     let old = format!(
-        "{}{}{}",
-        detail.context_before, detail.old_string, detail.context_after
+        "{}{}{}{}",
+        detail.context_before, prefix, detail.old_string, old_suffix
     );
     let new = format!(
-        "{}{}{}",
-        detail.context_before, detail.new_string, detail.context_after
+        "{}{}{}{}",
+        detail.context_before, prefix, detail.new_string, new_suffix
     );
-    // Matched substrings often omit the file's trailing newline; don't
-    // show a fake "\\ No newline at end of file" in the ChatGPT card.
-    (ensure_nl(old), ensure_nl(new))
+    (ensure_nl(old.replace("\r\n", "\n")), ensure_nl(new.replace("\r\n", "\n")))
 }
 
 fn ensure_nl(s: String) -> String {
@@ -261,6 +371,18 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use xai_grok_tools::types::output::SearchReplaceEditContextInformation;
+
+    fn test_detail_helper(prefix: &str, old: &str, new: &str) -> SearchReplaceEditDetail {
+        SearchReplaceEditDetail {
+            old_string: old.to_string(),
+            old_line: 2,
+            new_string: new.to_string(),
+            new_line: 2,
+            context_before: "fn main() {\n".into(),
+            context_after: "}\n".into(),
+            line_prefix: prefix.to_string(),
+        }
+    }
 
     fn applied(old: &str, new: &str) -> SearchReplaceEditsApplied {
         SearchReplaceEditsApplied {
@@ -344,5 +466,80 @@ mod tests {
         assert!(d.contains("a/gone.rs"), "{d}");
         assert!(d.contains("/dev/null"), "{d}");
         assert!(d.contains("-bye"), "{d}");
+    }
+
+    #[test]
+    fn snippet_includes_line_prefix_and_normalizes_crlf() {
+        let detail = test_detail_helper("    let x = ", "1;\r\n", "2;\r\n");
+        let (old, new) = snippet(&detail, None);
+        assert_eq!(old, "fn main() {\n    let x = 1;\n}\n");
+        assert_eq!(new, "fn main() {\n    let x = 2;\n}\n");
+
+        let d = unified("src/foo.rs", &old, &new);
+        assert!(d.contains("-    let x = 1;\n"), "{d}");
+        assert!(d.contains("+    let x = 2;\n"), "{d}");
+    }
+
+    #[test]
+    fn snippet_preserves_line_boundary_when_context_after_lacks_leading_newline() {
+        let detail = SearchReplaceEditDetail {
+            old_string: "foo".to_string(),
+            old_line: 2,
+            new_string: "bar".to_string(),
+            new_line: 2,
+            context_before: "header\n".into(),
+            context_after: "footer\n".into(),
+            line_prefix: "prefix_".to_string(),
+        };
+        let (old, new) = snippet(&detail, None);
+        assert_eq!(old, "header\nprefix_foo\nfooter\n");
+        assert_eq!(new, "header\nprefix_bar\nfooter\n");
+
+        let d = unified("src/foo.rs", &old, &new);
+        assert!(d.contains("-prefix_foo\n"), "{d}");
+        assert!(d.contains("+prefix_bar\n"), "{d}");
+        assert!(d.contains(" footer\n"), "{d}");
+    }
+
+    #[test]
+    fn snippet_with_authoritative_suffix_recovers_same_line_context() {
+        let detail = SearchReplaceEditDetail {
+            old_string: "hello".to_string(),
+            old_line: 1,
+            new_string: "hello world".to_string(),
+            new_line: 1,
+            context_before: "".into(),
+            context_after: "".into(),
+            line_prefix: "say ".to_string(),
+        };
+        let file_content = "say hello world now\n";
+        let lines: Vec<&str> = file_content.split_inclusive('\n').collect();
+        let suffix = derive_suffix(&lines, detail.new_line, &detail.line_prefix, &detail.new_string);
+        assert_eq!(suffix, Some(" now\n"));
+
+        let (old, new) = snippet(&detail, suffix);
+        assert_eq!(old, "say hello now\n");
+        assert_eq!(new, "say hello world now\n");
+
+        let d = unified("src/inline.rs", &old, &new);
+        assert!(d.contains("-say hello now\n"), "{d}");
+        assert!(d.contains("+say hello world now\n"), "{d}");
+    }
+
+    #[test]
+    fn derive_suffix_fails_conservatively_on_mismatched_content() {
+        let detail = SearchReplaceEditDetail {
+            old_string: "hello".to_string(),
+            old_line: 1,
+            new_string: "hello world".to_string(),
+            new_line: 1,
+            context_before: "".into(),
+            context_after: "".into(),
+            line_prefix: "say ".to_string(),
+        };
+        let file_content = "different text entirely\n";
+        let lines: Vec<&str> = file_content.split_inclusive('\n').collect();
+        let suffix = derive_suffix(&lines, detail.new_line, &detail.line_prefix, &detail.new_string);
+        assert_eq!(suffix, None);
     }
 }
