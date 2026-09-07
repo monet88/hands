@@ -4,6 +4,8 @@ Unofficial ChatGPT connector. Local coding tools. No LLM on this machine.
 
 macOS/Linux install from a clone with `./install.sh`, then run `hands setup`. Windows uses the versioned Runtime Bundle flow in `WINDOWS.md`; do not assume `install.sh`, `hands enable`, or `hands start` installs Windows lifecycle supervision.
 
+When updating the already-installed Hands runtime on this current Windows dogfood workstation, follow `docs/windows-dogfood-update.md`. That machine-local backup/build/activate/rollback procedure is the source of truth for routine dogfood updates; use `WINDOWS.md` instead for packaging/release portability, clean-machine/Sandbox acceptance, or Windows Tray Launcher work.
+
 ```bash
 export CONTROL_PLANE_API_KEY="sk-..."          # Restricted: Tunnels Read + Use
 export CONTROL_PLANE_TUNNEL_ID="tunnel_..."

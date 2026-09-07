@@ -133,6 +133,8 @@ hands status --json
 
 If the machine uses an existing external/legacy supervisor, it remains responsible for keeping the active tunnel/runtime alive.
 
+For the current developer workstation's routine dogfood update, backup, activation, verification, and rollback procedure, use [`docs/windows-dogfood-update.md`](docs/windows-dogfood-update.md). That document is intentionally machine-specific; this file remains the source of truth for Windows packaging/release portability, clean-machine/Sandbox acceptance, and the accepted Tray Launcher architecture.
+
 ---
 
 ## 4. Credentials and tunnel profile contract
