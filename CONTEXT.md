@@ -2,6 +2,8 @@
 
 Hands is a local bridge that lets ChatGPT operate on a user's machine while keeping model reasoning outside the local runtime. This glossary defines the product language used when separating the Windows desktop shell from the execution runtime.
 
+> **Status:** the Windows Tray Launcher terminology below is an accepted design contract. Launcher implementation is still pending; the current repository supports the Runtime Bundle build/package/verification seam plus existing manual dogfood activation, not the finished tray product.
+
 ## Language
 
 **Hands Runtime**:

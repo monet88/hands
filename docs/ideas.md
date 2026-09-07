@@ -12,7 +12,7 @@ Tài liệu lưu trữ các ý tưởng cải tiến, tính năng và kiến tr�
   * Cần cài đặt toolchain Rust/Python để build hoặc phải duy trì các script khởi chạy rời rạc (`hands-start.ps1`, `hands-start.cmd`, `hands-stop.ps1`).
   * Khó phân phối cho người dùng cuối hoặc dùng dạng portable cắm USB / chạy trên nhiều máy.
   * Thiếu giao diện khay hệ thống (System Tray) để bật/tắt nhanh hoặc cấu hình lại API Key / Tunnel ID mà không phải mở code/file text.
-  * Source hiện tại chưa có Windows supervisor native trong `service.rs`; Windows lifecycle đang được bù bằng external startup scripts trong `WINDOWS.md`.
+  * Source hiện tại chưa có Windows supervisor native trong `service.rs`; các máy dogfood có thể vẫn dùng launcher/startup script cục bộ, nhưng đó là legacy operation. Contract đích là Windows Tray Launcher bên ngoài MCP runtime.
 * **Mục tiêu đã chốt:**
   * Phân phối dưới dạng **1 artifact `.exe` duy nhất** (ví dụ: `Hands.exe`). Sau khi chạy, launcher được phép materialize `hands.exe` và `tunnel-client.exe` thành các child binary riêng.
   * Phase đầu tiên dogfood trên máy hiện tại, nhưng contract phải public-ready để sau này phát hành cho technical/public users mà không đổi kiến trúc nền.
@@ -84,7 +84,7 @@ Chuột phải vào Tray Icon của Hands:
    * Không scan và không `taskkill /IM` theo tên `hands.exe`/`tunnel-client.exe`. Process bên ngoài launcher không bị adopt hoặc kill; nếu chúng chiếm port/profile cần thiết thì launcher báo conflict và fail closed.
    * Restart budget mặc định đã chốt: tối đa 3 restart trong 10 phút; vượt budget chuyển trạng thái Faulted và đợi user `Restart`.
    * Process topology Phase 1 đã chốt: launcher chỉ giữ `tunnel-client.exe` làm long-lived supervised root. `tunnel-client` khởi tạo `hands.exe` MCP child theo **command-based Windows MCP profile**; launcher không giữ thêm một `hands.exe --http :8787` daemon thường trực chỉ để phục vụ config UI.
-   * Source hiện tại cần một Windows-specific config path cho topology này: `service.rs::write_profile()` hiện ghi HTTP-over-UDS `server_urls` dùng cho Unix, còn Windows `install_mcp()` là no-op; `WINDOWS.md` đã chứng minh Windows hoạt động bằng `mcp.commands` trỏ trực tiếp tới `hands.exe`. Launcher design không được reuse nguyên xi Unix profile writer cho Windows.
+   * Source hiện tại cần một Windows-specific config path cho topology này: `service.rs::write_profile()` hiện ghi HTTP-over-UDS `server_urls` dùng cho Unix, còn Windows `install_mcp()` là no-op; existing Windows dogfood evidence dùng `mcp.commands` trỏ trực tiếp tới `hands.exe`. Launcher design không được reuse nguyên xi Unix profile writer cho Windows.
    * Tray/settings WinForms là human UI chính trên Windows. Việc bỏ long-lived `hands.exe --http` không thay đổi MCP dispatch path của `hands.exe` child do tunnel-client khởi tạo.
    * **Ready** chỉ được công nhận khi owned `tunnel-client.exe` vẫn còn sống **và** tunnel health authority trả `ready` tại `http://127.0.0.1:18780/readyz`. Process-alive một mình không đủ để coi runtime usable.
    * Hidden autostart không tự pop Settings khi credentials/config thiếu hoặc invalid. Launcher vẫn lên tray ở trạng thái `Needs setup`; manual launch hoặc user click tray mới mở Settings.

@@ -2,19 +2,17 @@
 
 Unofficial ChatGPT connector. Local coding tools. No LLM on this machine.
 
-```bash
-# from a clone
-./install.sh
+macOS/Linux install from a clone with `./install.sh`, then run `hands setup`. Windows uses the versioned Runtime Bundle flow in `WINDOWS.md`; do not assume `install.sh`, `hands enable`, or `hands start` installs Windows lifecycle supervision.
 
-# after install
+```bash
 export CONTROL_PLANE_API_KEY="sk-..."          # Restricted: Tunnels Read + Use
 export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
-hands setup                                    # TTY checklist; non-interactive if env keys are set
+hands setup                                    # macOS/Linux first-run setup; non-interactive with env keys
 hands status --json
 hands use /path/to/repo
 ```
 
-MCP stdio (what tunnel-client launches): `hands` with no args.
+Transport: `hands` with no args remains the direct MCP stdio entrypoint. The supervised macOS/Linux tunnel path uses local HTTP-over-UDS; the accepted Windows launcher topology uses a command-based profile that lets `tunnel-client` launch the bundle's `hands.exe` child.
 
 Config UI: `hands config` → http://127.0.0.1:8787/
 
@@ -46,7 +44,7 @@ Hands should stay a thin CLI/MCP adapter around upstream capabilities. Prefer th
 - Add a narrow tool-specific adapter only when a demonstrated requirement cannot be satisfied through the existing bridge/upstream surface. Do not introduce a second general execution engine, router, or orchestration layer.
 
 ### 2. External supervision, lean Hands process
-- Long-lived supervision belongs to OS/external mechanisms such as `launchd`, `systemd`, Windows launcher/startup scripts, and `tunnel-client`, not to a watchdog loop inside the Hands process.
+- Long-lived supervision belongs to OS/external mechanisms such as `launchd`, `systemd`, the accepted Windows Tray Launcher, and `tunnel-client`, not to a watchdog loop inside the Hands process. Machine-local Windows startup scripts are legacy dogfood, not the target product contract.
 - Rust may configure or invoke those external integrations, but Hands must not become an in-process restart/health daemon unless an explicit, reproduced requirement cannot be met externally.
 - Keep lifecycle and environment ownership at clear process boundaries; do not duplicate supervision state inside the MCP command path.
 
@@ -68,14 +66,14 @@ Hands should stay a thin CLI/MCP adapter around upstream capabilities. Prefer th
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hands** (398 symbols, 1204 relationships, 20 execution flows).
+This project is indexed by GitNexus as **hands**. Do not hard-code graph counts here; use the current index/status output because node, edge, cluster, and flow counts change as the repository evolves.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 ## Always Do
 
 - **MUST run impact before editing.** Use `impact({target: "symbolName", direction: "upstream"})` or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .`; report callers, processes, and risk. Never substitute grep for graph analysis.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review against this repository's default development branch: `detect_changes({scope: "compare", base_ref: "dev"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "dev" --repo .`.
 - MUST warn on HIGH/CRITICAL `risk` pre-edit; never use `riskSharedAxes` to waive a HIGH/CRITICAL `risk` warning. Compare File/symbol: MCP File omits axes; Graph-RAG expands File.
 - **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
 - **MUST use `query({search_query: "concept"})` for concepts/flows, `context({name: "symbolName"})` for a named symbol, or `impact` for blast radius, on read-only callers, dependencies, imports, or execution flow.** Graph first; text search only for empty/`UNKNOWN`/literals.

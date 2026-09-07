@@ -6,7 +6,9 @@
 
 ## 2. Non-Restoration of Closed #31 Implementation Machinery
 - Closed Issue #31 implementation machinery—specifically custom parameters such as `execution_mode`, `yield_after_ms`, and coordinator polling loops—is **not** restored and must not be reintroduced into tool schemas or dispatch handlers.
-- Dispatch follows upstream command execution semantics: foreground commands execute to completion up to the tool timeout, while background tasks use explicit `is_background: true` execution semantics.
+- Foreground terminal calls may auto-yield to the existing upstream background-task path when the foreground wait budget is reached. The handoff does not restart or double-spawn the process and does not introduce a Hands-owned scheduler.
+- An explicit positive timeout remains the task's total runtime deadline across a foreground-to-background handoff. When that deadline expires, the owned process is terminated and the task becomes terminal rather than continuing under the background maximum lifetime.
+- When timeout is omitted/defaulted, auto-yield must not inherit a short foreground deadline; after handoff the same task continues under the upstream background lifetime. `is_background: true` remains the explicit way to start known-long work in the background immediately.
 
 ## 3. WebCodex Framing Contract
 - MCP tool call results follow the WebCodex framing contract:
@@ -15,6 +17,7 @@
 
 ## 4. Bounded Task Recovery
 - Task recovery (`list_terminal_tasks`) runs directly on top of upstream's terminal backend (`bridge.list_background_tasks()`) without introducing a secondary in-process registry or background daemon supervisor.
+- One terminal backend is retained per observed ChatGPT session for the `McpHost` lifetime so running tasks and completed/timed-out history survive `set_workspace`. Hands does not guess a session-close time and evict recoverable history behind the user's back.
 - Recovered task snapshots expose only bounded, safe fields (`task_id`, `status`, `command`, `cwd`, `exit_code`, `output_file`, `duration_secs`, `completed`, `truncated`, `total_bytes`).
 - Secrets, environment variables, and raw buffers are strictly excluded from listing snapshots.
 - Listing queries return all known session tasks bounded without unrequested filter arguments.

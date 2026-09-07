@@ -357,7 +357,7 @@ fn harness_bin() -> Result<PathBuf, String> {
 
 pub fn tunnel_client_bin() -> Result<PathBuf, String> {
     which("tunnel-client").ok_or_else(|| {
-        "tunnel-client not found. brew install openai/tools/tunnel-client".into()
+        "tunnel-client not found. install it for this platform and ensure it is on PATH".into()
     })
 }
 

@@ -11,9 +11,9 @@ const USAGE: &str = "\
 Hands — unofficial ChatGPT plugin (local tools, no model)
 
   hands setup                      first-run checklist (TTY). no browser
-  hands setup --ui                 same, then open config page
+  hands --ui setup                 same, then open config page
   hands config                     serve UI at http://127.0.0.1:8787/ (no browser)
-  hands config --open              serve UI and open it
+  hands --open config              serve UI and open it
   cd /repo && hands use            pin this folder
   hands status [--json]
   hands enable | disable | start | stop

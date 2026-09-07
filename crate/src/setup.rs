@@ -25,7 +25,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         if client_ok {
             "ok"
         } else {
-            "missing — brew install openai/tools/tunnel-client"
+            "missing — install tunnel-client and ensure it is on PATH"
         },
     );
     check("runtime key", key_ok, if key_ok { "saved" } else { "missing" });
@@ -55,7 +55,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
 
     if !key_ok || !id_ok {
         if tty {
-            return Err("need both runtime key and tunnel id. or: hands config --open".into());
+            return Err("need both runtime key and tunnel id. or: hands --open config".into());
         }
         return Err(
             "non-interactive: set CONTROL_PLANE_API_KEY and CONTROL_PLANE_TUNNEL_ID".into(),
@@ -67,7 +67,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         copy_clip(&id);
         eprintln!();
         eprintln!("tunnel id (copied): {id}");
-        eprintln!("ChatGPT → chatgpt.com/plugins → Developer mode → Tunnel → paste → Scan tools");
+        eprintln!("ChatGPT → Settings/Workspace settings → Apps → Create → Tunnel → paste → Scan Tools");
         eprintln!("Skip confirm: first write → Always allow, or Settings → Apps → Hands → Never ask");
     }
     Ok(())
