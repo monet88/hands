@@ -6,7 +6,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -16,7 +15,6 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::computer::local::LocalTerminalBackend;
-use xai_grok_tools::computer::types::TerminalBackend;
 use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use crate::edit;
 use crate::host;
@@ -28,57 +26,14 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "Hands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Bound on retained session terminal backends. A backend owns its session's
-/// live/completed tasks, so eviction only ever targets *inactive* sessions:
-/// never the session being served, never a session with an in-flight call,
-/// never a session with a live background task. Victims lose cached bridges
-/// and backend together; their next call rebuilds cold (history loss for idle
-/// sessions past the cap is the accepted cost). Temporary over-cap while
-/// sessions are active is fine; permanent unbounded growth is what this
-/// prevents.
-const MAX_SESSION_BACKENDS: usize = 64;
 pub struct McpHost {
     fallback_cwd: PathBuf,
     cached: Mutex<HashMap<(String, PathBuf), ToolBridge>>,
-    backends: Mutex<HashMap<String, (Arc<LocalTerminalBackend>, Instant)>>,
-    inflight: std::sync::Mutex<HashMap<String, usize>>,
+    // One terminal backend per observed ChatGPT session. Hands has no reliable
+    // session-close signal, so keep the backend for host lifetime rather than
+    // guessing inactivity and risking task/history loss.
+    backends: Mutex<HashMap<String, Arc<LocalTerminalBackend>>>,
     call_seq: AtomicU64,
-}
-
-/// RAII in-flight marker: a session holding a live guard is never evicted.
-/// Blocking mutex by design: plain counters, never held across `.await`.
-struct InflightGuard<'a> {
-    counts: &'a std::sync::Mutex<HashMap<String, usize>>,
-    session: String,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = counts.get_mut(&self.session) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                counts.remove(&self.session);
-            }
-        }
-    }
-}
-
-/// Oldest-inactive-first eviction pick, returning at most `need` victims.
-/// Pure for testability. Immune: the session being served and any session with
-/// an in-flight call. Sessions holding cached bridges are NOT immune.
-fn session_eviction_order(
-    sessions: Vec<(String, Instant)>,
-    inflight: &HashMap<String, usize>,
-    current: &str,
-    need: usize,
-) -> Vec<String> {
-    let mut idle: Vec<(String, Instant)> = sessions
-        .into_iter()
-        .filter(|(s, _)| *s != current && inflight.get(s).copied().unwrap_or(0) == 0)
-        .collect();
-    idle.sort_by_key(|(_, t)| *t);
-    idle.into_iter().take(need).map(|(s, _)| s).collect()
 }
 
 impl McpHost {
@@ -87,7 +42,6 @@ impl McpHost {
             fallback_cwd,
             cached: Mutex::new(HashMap::new()),
             backends: Mutex::new(HashMap::new()),
-            inflight: std::sync::Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(1),
         })
     }
@@ -108,20 +62,17 @@ impl McpHost {
         {
             let cache = self.cached.lock().await;
             if let Some(bridge) = cache.get(&key) {
-                let bridge = bridge.clone();
-                drop(cache);
-                self.touch_session(session).await;
-                return Ok(bridge);
+                return Ok(bridge.clone());
             }
         }
         let (backend, is_new) = {
             let mut backends = self.backends.lock().await;
             let exists = backends.contains_key(session);
-            let entry = backends
+            let backend = backends
                 .entry(session.to_string())
-                .or_insert_with(|| (Arc::new(LocalTerminalBackend::new()), Instant::now()));
-            entry.1 = Instant::now();
-            (entry.0.clone(), !exists)
+                .or_insert_with(|| Arc::new(LocalTerminalBackend::new()))
+                .clone();
+            (backend, !exists)
         };
         let bridge = match host::build_bridge_with_backend(cwd, backend).await {
             Ok(b) => b,
@@ -137,83 +88,7 @@ impl McpHost {
             let mut cache = self.cached.lock().await;
             cache.insert(key, bridge.clone());
         }
-        self.evict_sessions_over_cap(session).await;
         Ok(bridge)
-    }
-
-    async fn touch_session(&self, session: &str) {
-        let mut backends = self.backends.lock().await;
-        if let Some(entry) = backends.get_mut(session) {
-            entry.1 = Instant::now();
-        }
-    }
-
-    fn enter_inflight(&self, session: &str) -> InflightGuard<'_> {
-        let mut counts = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        *counts.entry(session.to_string()).or_insert(0) += 1;
-        InflightGuard {
-            counts: &self.inflight,
-            session: session.to_string(),
-        }
-    }
-
-    fn is_inflight(&self, session: &str) -> bool {
-        self.inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(session)
-            .copied()
-            .unwrap_or(0)
-            > 0
-    }
-
-    /// True when the session backend still owns a running background task.
-
-    /// Reclaim idle sessions past the cap, oldest-inactive first. Removes the
-    /// victim's cached bridges and backend together. Immune: the session being
-    /// served, any session with an in-flight call, and any session with a live
-    /// background task. Holding a cached bridge is deliberately NOT immunity —
-    /// idle cached sessions are what the cap reclaims.
-    /// Neither `cached` nor `backends` mutex is held across `list_tasks().await`.
-    async fn evict_sessions_over_cap(&self, current: &str) {
-        let victim_candidates = {
-            let backends = self.backends.lock().await;
-            if backends.len() <= MAX_SESSION_BACKENDS {
-                return;
-            }
-            let inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            let victims = session_eviction_order(
-                backends.iter().map(|(s, (_, t))| (s.clone(), *t)).collect(),
-                &inflight,
-                current,
-                backends.len() - MAX_SESSION_BACKENDS,
-            );
-            victims
-                .into_iter()
-                .filter_map(|v| backends.get(&v).map(|(b, _)| (v, b.clone())))
-                .collect::<Vec<_>>()
-        };
-        for (victim, backend) in victim_candidates {
-            if self.is_inflight(&victim) {
-                continue;
-            }
-            if backend.list_tasks().await.iter().any(|t| !t.completed) {
-                continue;
-            }
-            if self.is_inflight(&victim) {
-                continue;
-            }
-            let mut cache = self.cached.lock().await;
-            let mut backends = self.backends.lock().await;
-            if backends.len() <= MAX_SESSION_BACKENDS {
-                break;
-            }
-            if self.is_inflight(&victim) {
-                continue;
-            }
-            cache.retain(|(s, _), _| s != &victim);
-            backends.remove(&victim);
-        }
     }
 
     async fn drop_session_cache(&self, session: &str) {
@@ -272,14 +147,11 @@ impl McpHost {
     }
 
     async fn switch_workspace(&self, session: Option<&str>, raw: &str) -> Result<PathBuf, String> {
-        // The whole switch runs under the session in-flight marker: between
-        // dropping the cached bridges and returning, an over-cap eviction from
-        // another session must not reclaim this session's backend, or running
-        // tasks and completed history would be lost mid-switch (Issue #62
-        // stories 6-8). Same lifecycle as normal terminal/tool calls.
-        let _inflight = self.enter_inflight(session.unwrap_or(""));
         let path = host::resolve_project(raw)?;
         let cwd = host::pin_for_chat(session, &path)?;
+        // Workspace-bound bridges are disposable; the session-scoped terminal
+        // backend remains owned by this McpHost for the lifetime of the chat so
+        // running tasks and completed history survive the switch (Issue #62).
         self.drop_session_cache(session.unwrap_or("")).await;
         Ok(cwd)
     }
@@ -515,11 +387,6 @@ impl McpHost {
         let cwd = self
             .cwd_for(session.as_deref(), workspace_arg.as_deref())
             .map_err(|e| (-32602, e, Value::Null))?;
-        // Every path below may use the session terminal backend (list/get/kill
-        // tasks, run_terminal_cmd). Hold the in-flight marker across the whole
-        // dispatch so an over-cap scan never evicts this session mid-call.
-        let _inflight = self.enter_inflight(session.as_deref().unwrap_or(""));
-
         if name == "list_terminal_tasks" {
             let bridge = self
                 .bridge_for(session.as_deref().unwrap_or(""), cwd.clone())
@@ -1009,105 +876,6 @@ mod tests {
             }
         }
     }
-    fn aged_sessions(n: usize) -> Vec<(String, Instant)> {
-        // s0 oldest, s{n-1} newest; deterministic without sleeps.
-        let now = Instant::now();
-        (0..n)
-            .map(|i| {
-                (
-                    format!("s{i}"),
-                    now.checked_sub(Duration::from_secs((n - i) as u64))
-                        .unwrap(),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn eviction_order_reclaims_oldest_inactive_first() {
-        let sessions = aged_sessions(70);
-        let victims = session_eviction_order(sessions, &HashMap::new(), "s69", 6);
-        let expected: Vec<String> = (0..6).map(|i| format!("s{i}")).collect();
-        assert_eq!(victims, expected);
-    }
-
-    #[test]
-    fn eviction_order_spares_current_and_inflight_not_cached() {
-        // Holding cached bridges is deliberately NOT immunity: only the served
-        // session and sessions with an in-flight call are spared.
-        let sessions = aged_sessions(10);
-        let mut inflight = HashMap::new();
-        inflight.insert("s0".to_string(), 1);
-        let victims = session_eviction_order(sessions, &inflight, "s9", 3);
-        let expected: Vec<String> = ["s1", "s2", "s3"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(victims, expected);
-    }
-
-    #[tokio::test]
-    async fn evict_over_cap_reclaims_idle_keeps_guarded_and_current() {
-        let host = McpHost::new(std::env::temp_dir());
-        // Fabricate 70 idle backends directly: no bridge builds, same maps.
-        {
-            let mut backends = host.backends.lock().await;
-            let now = Instant::now();
-            for i in 0..70 {
-                backends.insert(
-                    format!("old{i}"),
-                    (
-                        Arc::new(LocalTerminalBackend::new()),
-                        now.checked_sub(Duration::from_secs((70 - i) as u64))
-                            .unwrap(),
-                    ),
-                );
-            }
-        }
-        // Oldest session has an in-flight call; newest is being served.
-        let _guard = host.enter_inflight("old0");
-        host.evict_sessions_over_cap("old69").await;
-        let backends = host.backends.lock().await;
-        assert!(
-            backends.len() <= MAX_SESSION_BACKENDS,
-            "over-cap backends must be reclaimed, len={}",
-            backends.len()
-        );
-        assert!(backends.contains_key("old0"), "in-flight oldest retained");
-        assert!(backends.contains_key("old69"), "served newest retained");
-        assert!(!backends.contains_key("old1"), "oldest unguarded evicted");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn bridge_for_enforces_cap_across_many_sessions() {
-        // End-to-end wiring: 70 real session bridges collapse to the cap, with
-        // both maps bounded and the newest session retained.
-        let cfg = TempDir::new().unwrap();
-        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
-        let dir = TempDir::new().unwrap();
-        let host = McpHost::new(dir.path().to_path_buf());
-        for i in 0..70 {
-            host.bridge_for(&format!("cap{i}"), dir.path().to_path_buf())
-                .await
-                .expect("session bridge build");
-        }
-        assert!(
-            host.backends.lock().await.len() <= MAX_SESSION_BACKENDS,
-            "backends must stay bounded"
-        );
-        assert!(
-            host.cached.lock().await.len() <= MAX_SESSION_BACKENDS,
-            "cached bridges must stay bounded"
-        );
-        assert!(
-            host.backends.lock().await.contains_key("cap69"),
-            "newest retained"
-        );
-        assert!(
-            !host.backends.lock().await.contains_key("cap0"),
-            "oldest reclaimed"
-        );
-
-    }
-
     #[tokio::test]
     #[serial]
     async fn switch_workspace_keeps_session_backend_identity() {
@@ -1125,7 +893,7 @@ mod tests {
         drop(before);
         let ptr_before = {
             let backends = host.backends.lock().await;
-            Arc::as_ptr(&backends["sw"].0)
+            Arc::as_ptr(&backends["sw"])
         };
         let pinned = host
             .switch_workspace(Some("sw"), dir_b.path().to_str().unwrap())
@@ -1139,7 +907,7 @@ mod tests {
         drop(after);
         let ptr_after = {
             let backends = host.backends.lock().await;
-            Arc::as_ptr(&backends["sw"].0)
+            Arc::as_ptr(&backends["sw"])
         };
         assert_eq!(
             ptr_before, ptr_after,
@@ -1147,289 +915,83 @@ mod tests {
         );
 
     }
-
-    fn set_old(
-        backends: &mut HashMap<String, (Arc<LocalTerminalBackend>, Instant)>,
-        s: &str,
-        secs: u64,
-    ) {
-        let old = Instant::now()
-            .checked_sub(Duration::from_secs(secs))
-            .unwrap();
-        backends.get_mut(s).expect("session backend").1 = old;
-    }
-
-    fn fill_idle(
-        backends: &mut HashMap<String, (Arc<LocalTerminalBackend>, Instant)>,
-        n: usize,
-        secs: u64,
-    ) {
-        let old = Instant::now()
-            .checked_sub(Duration::from_secs(secs))
-            .unwrap();
-        for i in 0..n {
-            backends.insert(
-                format!("fill{i}"),
-                (Arc::new(LocalTerminalBackend::new()), old),
-            );
-        }
-    }
-
     #[tokio::test]
     #[serial]
-    async fn switch_window_eviction_hole_and_guard() {
-        // Fix 1: `switch_workspace` holds the session in-flight marker across
-        // `drop_session_cache`, closing the window where an over-cap scan
-        // could reclaim the switching session's backend. Proved in three
-        // phases: the unguarded window is genuinely catchable, the same guard
-        // the fixed switch holds retains the backend, and release reclaims.
+    async fn completed_task_history_survives_many_other_sessions() {
         let cfg = TempDir::new().unwrap();
         let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
-        let dir_a = TempDir::new().unwrap();
-        let host = McpHost::new(dir_a.path().to_path_buf());
-        host.bridge_for("sw", dir_a.path().to_path_buf())
-            .await
-            .expect("build");
-        let ptr = { Arc::as_ptr(&host.backends.lock().await["sw"].0) };
-        {
-            let mut backends = host.backends.lock().await;
-            set_old(&mut backends, "sw", 7200);
-            fill_idle(&mut backends, 70, 3600);
-        }
-        // Phase A: unguarded drop (what the old switch did) loses the backend.
-        host.drop_session_cache("sw").await;
-        host.evict_sessions_over_cap("fill0").await;
-        assert!(
-            !host.backends.lock().await.contains_key("sw"),
-            "unguarded switch window must be catchable by over-cap eviction"
-        );
-        // Phase B: rebuild, then evict with the switch guard held — retained.
-        host.bridge_for("sw", dir_a.path().to_path_buf())
-            .await
-            .expect("rebuild");
-        let ptr_b = { Arc::as_ptr(&host.backends.lock().await["sw"].0) };
-        {
-            let mut backends = host.backends.lock().await;
-            set_old(&mut backends, "sw", 7200);
-            fill_idle(&mut backends, 70, 3600);
-        }
-        host.drop_session_cache("sw").await;
-        let _switch_guard = host.enter_inflight("sw");
-        host.evict_sessions_over_cap("fill0").await;
-        {
-            let backends = host.backends.lock().await;
-            assert!(
-                backends.contains_key("sw"),
-                "guarded switch must retain backend"
-            );
-            assert_eq!(
-                Arc::as_ptr(&backends["sw"].0),
-                ptr_b,
-                "guarded switch keeps identity"
-            );
-        }
-        assert_ne!(ptr_b, ptr, "rebuild is a new backend (sanity)");
-        // Phase C: guard released, session idle — reclamation still works.
-        drop(_switch_guard);
-        {
-            let mut backends = host.backends.lock().await;
-            fill_idle(&mut backends, 70, 3600);
-        }
-        host.evict_sessions_over_cap("fill0").await;
-        assert!(
-            !host.backends.lock().await.contains_key("sw"),
-            "released idle session must be reclaimable"
-        );
-        let _ = dir_a;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "session probe").unwrap();
+        let host = McpHost::new(dir.path().to_path_buf());
 
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn switch_workspace_races_real_eviction_scans() {
-        // Concurrency smoke: switches racing real over-cap scans must never
-        // lose the switching backend mid-switch, panic, or deadlock. The
-        // switching session stays newest here so between-switch idle eviction
-        // cannot legitimately take it; the guard covers the switch itself.
-        let cfg = TempDir::new().unwrap();
-        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
-        let dir_a = TempDir::new().unwrap();
-        let dir_b = TempDir::new().unwrap();
-        let host = McpHost::new(dir_a.path().to_path_buf());
-        host.bridge_for("sw", dir_a.path().to_path_buf())
+        let started = host
+            .tools_call(json!({
+                "name": "run_terminal_cmd",
+                "arguments": {
+                    "command": "echo retained-history",
+                    "description": "retained history probe",
+                    "is_background": true
+                },
+                "_meta": { "openai/session": "history" }
+            }))
             .await
-            .expect("build");
-        let ptr = { Arc::as_ptr(&host.backends.lock().await["sw"].0) };
-        {
-            let mut backends = host.backends.lock().await;
-            fill_idle(&mut backends, 70, 3600);
-        }
-        let dir_a_str = dir_a.path().to_str().unwrap().to_string();
-        let dir_b_str = dir_b.path().to_str().unwrap().to_string();
-        let host2 = Arc::clone(&host);
-        let hammer = tokio::spawn(async move {
-            for _ in 0..3 {
-                host2.evict_sessions_over_cap("fill0").await;
+            .expect("start background task");
+        let task_id = started["structuredContent"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let mut completed = false;
+        let started_at = std::time::Instant::now();
+        while started_at.elapsed() < Duration::from_secs(10) {
+            let listed = host
+                .tools_call(json!({
+                    "name": "list_terminal_tasks",
+                    "arguments": {},
+                    "_meta": { "openai/session": "history" }
+                }))
+                .await
+                .expect("list task history");
+            if listed["structuredContent"]["tasks"]
+                .as_array()
+                .and_then(|tasks| tasks.iter().find(|task| task["task_id"] == task_id))
+                .is_some_and(|task| task["completed"] == true)
+            {
+                completed = true;
+                break;
             }
-        });
-        for i in 0..6 {
-            let target = if i % 2 == 0 { &dir_b_str } else { &dir_a_str };
-            let pinned = host
-                .switch_workspace(Some("sw"), target)
-                .await
-                .expect("switch");
-            // Every completed switch leaves a usable session: bridge + tasks.
-            let _b = host
-                .bridge_for("sw", pinned)
-                .await
-                .expect("post-switch bridge");
-            let backends = host.backends.lock().await;
-            assert_eq!(
-                Arc::as_ptr(&backends["sw"].0),
-                ptr,
-                "identity across racing scans"
-            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        hammer.await.expect("evict hammer joins");
+        assert!(completed, "probe task must complete before retention check");
+
+        // Exceed the former 64-session cap that used to evict completed task
+        // history from otherwise idle sessions.
+        for i in 0..70 {
+            let session = format!("other-{i}");
+            host.tools_call(json!({
+                "name": "read_file",
+                "arguments": { "target_file": "probe.txt" },
+                "_meta": { "openai/session": session }
+            }))
+            .await
+            .expect("open another session");
+        }
+
+        let tasks = host
+            .tools_call(json!({
+                "name": "list_terminal_tasks",
+                "arguments": {},
+                "_meta": { "openai/session": "history" }
+            }))
+            .await
+            .expect("list retained history");
         assert!(
-            host.backends.lock().await.contains_key("sw"),
-            "sw survives the race"
+            tasks["structuredContent"]["tasks"]
+                .as_array()
+                .expect("tasks array")
+                .iter()
+                .any(|task| task["task_id"] == task_id),
+            "completed task history must remain owned by its ChatGPT session"
         );
-
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn over_cap_eviction_spares_live_task_then_reclaims() {
-        // Fix 2: a session with a running background task is not inactive —
-        // evicting it would drop the last backend senders and kill the task.
-        // Once the task is killed/completed and the session is otherwise idle,
-        // it becomes evictable and the cap converges.
-        let cfg = TempDir::new().unwrap();
-        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
-        let dir = TempDir::new().unwrap();
-        let host = McpHost::new(dir.path().to_path_buf());
-        let bridge = host
-            .bridge_for("live", dir.path().to_path_buf())
-            .await
-            .expect("build");
-        #[cfg(windows)]
-        let cmd = "powershell -Command \"Start-Sleep -Seconds 60\"";
-        #[cfg(not(windows))]
-        let cmd = "sleep 60";
-        let started = bridge
-            .call(
-                "run_terminal_cmd",
-                json!({ "command": cmd, "description": "evict-guard probe", "is_background": true }),
-                "evict-live-t1",
-            )
-            .await;
-        assert!(started.is_ok(), "background task must start");
-        let task_id = {
-            let backends = host.backends.lock().await;
-            let tasks = backends["live"].0.list_tasks().await;
-            tasks
-                .iter()
-                .find(|t| !t.completed)
-                .map(|t| t.task_id.clone())
-                .expect("task running")
-        };
-        // "live" is the oldest candidate, so without immunity it would go first.
-        {
-            let mut backends = host.backends.lock().await;
-            set_old(&mut backends, "live", 7200);
-            fill_idle(&mut backends, 70, 3600);
-        }
-        host.evict_sessions_over_cap("fill0").await;
-        {
-            let backends = host.backends.lock().await;
-            assert!(
-                backends.contains_key("live"),
-                "live-task session must survive"
-            );
-            assert_eq!(backends.len(), 65, "cap converges on idle fills only");
-        }
-        // Kill the task: completed-only history is evictable again.
-        {
-            let backends = host.backends.lock().await;
-            backends["live"].0.kill_task(&task_id).await;
-            let tasks = backends["live"].0.list_tasks().await;
-            assert!(
-                tasks
-                    .iter()
-                    .find(|t| t.task_id == task_id)
-                    .is_some_and(|t| t.completed),
-                "killed task must read back completed"
-            );
-        }
-        host.evict_sessions_over_cap("fill0").await;
-        {
-            // Same lock order as production (cached, then backends).
-            let cache = host.cached.lock().await;
-            let backends = host.backends.lock().await;
-            assert!(
-                !backends.contains_key("live"),
-                "quiet session reclaimed after task end"
-            );
-            assert!(backends.len() <= MAX_SESSION_BACKENDS, "cap converges");
-            assert!(
-                !cache.keys().any(|(s, _)| s == "live"),
-                "victim bridges removed too"
-            );
-        }
-
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn eviction_does_not_hold_cached_lock_across_task_listing() {
-        let cfg = TempDir::new().unwrap();
-        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
-        let dir = TempDir::new().unwrap();
-        let host = McpHost::new(dir.path().to_path_buf());
-        let bridge = host
-            .bridge_for("live", dir.path().to_path_buf())
-            .await
-            .expect("build");
-        #[cfg(windows)]
-        let cmd = "powershell -Command \"Start-Sleep -Seconds 60\"";
-        #[cfg(not(windows))]
-        let cmd = "sleep 60";
-        let started = bridge
-            .call(
-                "run_terminal_cmd",
-                json!({ "command": cmd, "description": "evict-guard probe", "is_background": true }),
-                "evict-live-t2",
-            )
-            .await;
-        assert!(started.is_ok(), "background task must start");
-        let task_id = {
-            let backends = host.backends.lock().await;
-            let tasks = backends["live"].0.list_tasks().await;
-            tasks
-                .iter()
-                .find(|t| !t.completed)
-                .map(|t| t.task_id.clone())
-                .expect("task running")
-        };
-        {
-            let mut backends = host.backends.lock().await;
-            set_old(&mut backends, "live", 7200);
-            fill_idle(&mut backends, 70, 3600);
-        }
-        let host_clone = Arc::clone(&host);
-        let evict_handle = tokio::spawn(async move {
-            host_clone.evict_sessions_over_cap("fill0").await;
-        });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            let mut cache = host.cached.lock().await;
-            cache.insert(("probe".to_string(), dir.path().to_path_buf()), bridge.clone());
-        }
-        evict_handle.await.expect("eviction completes");
-        {
-            let backends = host.backends.lock().await;
-            backends["live"].0.kill_task(&task_id).await;
-        }
     }
 }
