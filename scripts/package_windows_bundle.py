@@ -69,19 +69,34 @@ def parse_pe_imports_and_arch(path: Path) -> tuple[int, list[str]]:
         )
     size_of_opt_hdr = struct.unpack_from("<H", data, pe_offset + 20)[0]
     opt_offset = pe_offset + 24
-    if size_of_opt_hdr < 112 + 16:
-        return machine, []
+    if size_of_opt_hdr < 112:
+        raise RuntimeError(
+            f"{path.name} has invalid PE32+ optional header size: expected at least 112, got {size_of_opt_hdr}"
+        )
+    if opt_offset + size_of_opt_hdr > len(data):
+        raise RuntimeError(f"{path.name} is truncated (optional header extends past EOF)")
     magic = struct.unpack_from("<H", data, opt_offset)[0]
     if magic != 0x020B:
         raise RuntimeError(f"{path.name} is not a PE32+ (64-bit) executable: magic 0x{magic:04x}")
-    import_rva, import_size = struct.unpack_from("<II", data, opt_offset + 120)
+    num_rva_and_sizes = struct.unpack_from("<I", data, opt_offset + 108)[0]
+    if size_of_opt_hdr < 112 + num_rva_and_sizes * 8:
+        raise RuntimeError(
+            f"{path.name} has malformed optional header: size {size_of_opt_hdr} cannot fit {num_rva_and_sizes} data directories"
+        )
+    import_rva, import_size = 0, 0
+    if num_rva_and_sizes >= 2:
+        import_rva, import_size = struct.unpack_from("<II", data, opt_offset + 120)
+
     sections_offset = opt_offset + size_of_opt_hdr
+    if sections_offset + num_sections * 40 > len(data):
+        raise RuntimeError(f"{path.name} is truncated (section table extends past EOF)")
+
     sections = []
     for i in range(num_sections):
         s_off = sections_offset + i * 40
-        if s_off + 40 > len(data):
-            break
         v_size, v_addr, raw_size, raw_ptr = struct.unpack_from("<IIII", data, s_off + 8)
+        if raw_size > 0 and raw_ptr + raw_size > len(data):
+            raise RuntimeError(f"{path.name} is truncated (section raw data extends past EOF)")
         sections.append((v_addr, max(v_size, raw_size), raw_ptr))
 
     def rva_to_offset(rva: int) -> int | None:
@@ -93,20 +108,42 @@ def parse_pe_imports_and_arch(path: Path) -> tuple[int, list[str]]:
     imported_dlls = []
     if import_rva and import_size:
         imp_off = rva_to_offset(import_rva)
-        if imp_off is not None:
-            while imp_off + 20 <= len(data):
-                desc = struct.unpack_from("<IIIII", data, imp_off)
-                if desc == (0, 0, 0, 0, 0):
-                    break
-                name_rva = desc[3]
-                if name_rva:
-                    name_off = rva_to_offset(name_rva)
-                    if name_off is not None and name_off < len(data):
-                        end = data.find(b"\0", name_off)
-                        if end != -1:
-                            dll_name = data[name_off:end].decode("ascii", "replace")
-                            imported_dlls.append(dll_name)
-                imp_off += 20
+        if imp_off is None:
+            raise RuntimeError(
+                f"{path.name} has malformed import directory: RVA 0x{import_rva:08x} not in any section"
+            )
+        found_null_descriptor = False
+        while imp_off + 20 <= len(data):
+            desc = struct.unpack_from("<IIIII", data, imp_off)
+            if desc == (0, 0, 0, 0, 0):
+                found_null_descriptor = True
+                break
+            name_rva = desc[3]
+            if not name_rva:
+                raise RuntimeError(
+                    f"{path.name} has malformed import directory descriptor: missing name RVA"
+                )
+            name_off = rva_to_offset(name_rva)
+            if name_off is None:
+                raise RuntimeError(
+                    f"{path.name} has malformed import directory: DLL name RVA 0x{name_rva:08x} not in any section"
+                )
+            if name_off >= len(data):
+                raise RuntimeError(
+                    f"{path.name} is truncated (import DLL name offset extends past EOF)"
+                )
+            end = data.find(b"\0", name_off)
+            if end == -1:
+                raise RuntimeError(
+                    f"{path.name} has malformed import directory: unterminated DLL name string"
+                )
+            dll_name = data[name_off:end].decode("ascii", "replace")
+            imported_dlls.append(dll_name)
+            imp_off += 20
+        if not found_null_descriptor:
+            raise RuntimeError(
+                f"{path.name} has truncated import directory table (missing null terminator descriptor)"
+            )
     return machine, imported_dlls
 
 

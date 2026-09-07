@@ -583,6 +583,61 @@ stage_bundle_for_testing(out_dir, hands_bin=hands_bin, tunnel_client_bin=tc_bin,
         "rejection must explain the clean-Windows static CRT requirement: {stderr}"
     );
 }
+#[tokio::test]
+#[serial]
+async fn test_package_windows_bundle_rejects_malformed_truncated_pe() {
+    let staging_dir = TempDir::new().expect("staging tempdir");
+    let fake_hands = staging_dir.path().join("fake_truncated_hands.exe");
+    let mut data = vec![0u8; 96];
+    data[0] = b'M';
+    data[1] = b'Z';
+    data[0x3C] = 64;
+    data[64] = b'P';
+    data[65] = b'E';
+    data[66] = 0;
+    data[67] = 0;
+    // machine x86_64 = 0x8664 at offset 68
+    data[68] = 0x64;
+    data[69] = 0x86;
+    // size of optional header = 0 at offset 84
+    std::fs::write(&fake_hands, data).expect("write 96-byte truncated PE");
+
+    let repo_root = hands_repo_root();
+    let python_script = r#"
+import sys, pathlib
+sys.path.insert(0, '.')
+from scripts.package_windows_bundle import verify_pe_x86_64
+hands_bin = pathlib.Path(sys.argv[1])
+try:
+    verify_pe_x86_64(hands_bin, "hands.exe")
+    print("ACCEPTED", file=sys.stderr)
+    sys.exit(1)
+except RuntimeError as e:
+    print(f"REJECTED: {e}", file=sys.stderr)
+    sys.exit(0)
+"#;
+    let status = std::process::Command::new(resolve_python_cmd())
+        .arg("-B")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(python_script)
+        .arg(&fake_hands)
+        .current_dir(&repo_root)
+        .output()
+        .expect("run malformed PE test");
+
+    assert!(
+        status.status.success(),
+        "verify_pe_x86_64 must reject 96-byte malformed PE: stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("REJECTED") && (stderr.contains("optional header") || stderr.contains("invalid")),
+        "rejection must report invalid/truncated PE header: {stderr}"
+    );
+}
+
 
 #[tokio::test]
 #[serial]
@@ -734,7 +789,18 @@ try:
 except RuntimeError as e:
     assert "diverged" in str(e), f"Unexpected error on trailing whitespace tamper: {e}"
 
-# 9. Clean up git readonly files so TempDir drops without Windows permission error
+# 9. Already-applied tampered Cargo.lock fail-closed
+clone7 = temp_dir / "tampered_lock_clone"
+subprocess.check_call(["git", "clone", "--depth", "1", "file:///" + str(grok_source).replace("\\", "/"), str(clone7)], stderr=subprocess.DEVNULL)
+verify_and_patch(clone7, patches_dir, pinned_sha)
+(clone7 / "Cargo.lock").write_text("tampered-lock\n", encoding="utf-8")
+try:
+    verify_and_patch(clone7, patches_dir, pinned_sha)
+    raise AssertionError("Already-applied tampered Cargo.lock did not fail closed")
+except RuntimeError as e:
+    assert "Cargo.lock does not match" in str(e) or "unexpected" in str(e), f"Unexpected error on tampered lock: {e}"
+
+# 10. Clean up git readonly files so TempDir drops without Windows permission error
 import stat, shutil
 def remove_readonly(func, path, excinfo):
     try:

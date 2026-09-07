@@ -62,6 +62,49 @@ def validate_cargo_toml_state(grok_build_path: Path) -> None:
             "Cargo.toml does not match the exact deterministic injection transformation from pinned HEAD"
         )
 
+HANDS_CARGO_LOCK_PACKAGE = """[[package]]
+name = "hands"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "dunce",
+ "serde_json",
+ "serial_test",
+ "sha2 0.10.9",
+ "similar",
+ "tempfile",
+ "tokio",
+ "xai-grok-tools",
+ "xai-tool-types",
+]
+
+"""
+
+
+def validate_cargo_lock_state(grok_build_path: Path) -> None:
+    res = run_git(["show", "HEAD:Cargo.lock"], cwd=grok_build_path)
+    if res.returncode != 0:
+        raise RuntimeError("failed to read HEAD:Cargo.lock")
+    head_lock = res.stdout.replace("\r\n", "\n")
+
+    cargo_lock_file = grok_build_path / "Cargo.lock"
+    if not cargo_lock_file.is_file():
+        raise RuntimeError(f"Cargo.lock missing in {grok_build_path}")
+    actual = cargo_lock_file.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+    if actual == head_lock:
+        return
+
+    needle = '[[package]]\nname = "hash32"'
+    if needle in head_lock:
+        expected = head_lock.replace(needle, HANDS_CARGO_LOCK_PACKAGE + needle, 1)
+        if actual == expected:
+            return
+
+    raise RuntimeError(
+        "Cargo.lock does not match the exact deterministic injection transformation from pinned HEAD"
+    )
+
 def validate_grok_build_status(
     grok_build_path: Path,
     expected_patch_targets: set[str],
@@ -90,6 +133,7 @@ def validate_grok_build_status(
                 raise RuntimeError(
                     f"unexpected modified/untracked Cargo.lock in grok-build checkout: {raw_line.strip()}"
                 )
+            validate_cargo_lock_state(grok_build_path)
             continue
 
         if path_str == "crates/codegen/hands" or path_str.startswith("crates/codegen/hands/"):
