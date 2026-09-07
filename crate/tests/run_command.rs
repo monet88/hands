@@ -535,13 +535,15 @@ async fn test_run_command_bounded_output() {
     assert_eq!(structured["exit_code"], 0);
 
     let stdout = structured["stdout"].as_str().expect("stdout string");
-    assert!(stdout.len() > 40_000, "raw stdout should exceed 40KB");
+    assert!(stdout.len() <= hands::run_command::MAX_OUTPUT_BYTES, "structured stdout must be bounded under MAX_OUTPUT_BYTES");
+    assert_eq!(structured["stdout_truncated"], true);
+    let stdout_total = structured["stdout_total_bytes"].as_u64().expect("stdout_total_bytes");
+    assert!(stdout_total > 40_000, "total bytes must record actual raw size");
 
     let content_text = resp["result"]["content"][0]["text"].as_str().expect("content text");
     assert!(content_text.contains("[Output truncated: showing first"));
-    assert!(content_text.len() < stdout.len(), "content text must be bounded");
+    assert!(content_text.len() <= hands::run_command::MAX_FALLBACK_CONTENT_BYTES + 300, "content text must be concise and bounded");
 }
-
 #[tokio::test]
 #[serial]
 async fn test_run_command_combined_output_bounded_shared_budget() {
@@ -577,8 +579,11 @@ async fn test_run_command_combined_output_bounded_shared_budget() {
 
     let stdout = structured["stdout"].as_str().expect("stdout string");
     let stderr = structured["stderr"].as_str().expect("stderr string");
-    assert_eq!(stdout.len(), 30_000, "raw stdout should be 30KB");
-    assert_eq!(stderr.len(), 30_000, "raw stderr should be 30KB");
+    assert!(stdout.len() + stderr.len() <= hands::run_command::MAX_OUTPUT_BYTES + 100, "combined structured stdout+stderr must be bounded under shared budget");
+    assert_eq!(structured["stdout_total_bytes"], 30_000);
+    assert_eq!(structured["stderr_total_bytes"], 30_000);
+    assert_eq!(structured["stdout_truncated"], true);
+    assert_eq!(structured["stderr_truncated"], true);
 
     let content_text = resp["result"]["content"][0]["text"].as_str().expect("content text");
     assert!(
@@ -586,12 +591,11 @@ async fn test_run_command_combined_output_bounded_shared_budget() {
         "combined content text must be truncated under shared budget"
     );
     assert!(
-        content_text.len() <= hands::run_command::MAX_OUTPUT_BYTES + 300,
-        "content text length ({}) must not exceed shared budget",
+        content_text.len() <= hands::run_command::MAX_FALLBACK_CONTENT_BYTES + 300,
+        "content text length ({}) must not exceed concise budget",
         content_text.len()
     );
 }
-
 #[tokio::test]
 #[serial]
 async fn test_run_command_timeout_with_detached_descendant() {
@@ -602,9 +606,16 @@ async fn test_run_command_timeout_with_detached_descendant() {
         "python"
     };
 
-    // Child spawns descendant that sleeps 2s holding pipes, while parent sleeps 10s.
-    // When 100ms timeout fires, child is killed and reader tasks are aborted, returning bounded.
-    let script = "import subprocess, time; subprocess.Popen(['python', '-c', 'import time; time.sleep(2)']); time.sleep(10)";
+    // Windows Job Object owns the whole spawned tree: a descendant recorded
+    // before the timeout must be gone. Non-Windows keeps the prior
+    // direct-child contract (Issue #62 leaves Unix behavior unchanged).
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    let pid_file = marker_dir.path().join("child.pid");
+    let pid_file_str = pid_file.display().to_string().replace('\\', "/");
+    let script = format!(
+        "import subprocess, time, sys; p = subprocess.Popen(['python', '-c', 'import os, time; open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(10)']); time.sleep(10)",
+        pid_file_str
+    );
     let start = std::time::Instant::now();
     let resp = harness
         .rpc(
@@ -614,7 +625,7 @@ async fn test_run_command_timeout_with_detached_descendant() {
                 "arguments": {
                     "command": python_cmd,
                     "args": ["-c", script],
-                    "timeout_ms": 100
+                    "timeout_ms": 300
                 }
             }),
         )
@@ -628,12 +639,112 @@ async fn test_run_command_timeout_with_detached_descendant() {
     assert_eq!(structured["timed_out"], true);
     assert_eq!(structured["exit_code"], -1);
     assert!(
-        elapsed < std::time::Duration::from_millis(1500),
+        elapsed < std::time::Duration::from_millis(2000),
         "call must return bounded within deadline, elapsed was {:?}",
         elapsed
     );
+
+    // Tree-ownership proof is Windows-only (see above); on other platforms the
+    // bounded timed_out return is the whole assertion.
+    #[cfg(windows)]
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) && !pid_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(pid_file.exists(), "descendant PID file must exist before timeout check");
+        let pid_str = std::fs::read_to_string(&pid_file).expect("read pid file");
+        let pid: u32 = pid_str.trim().parse().expect("parse pid");
+        let check = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid)])
+            .output()
+            .expect("check process");
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "descendant PID {} must not be alive after run_command timeout",
+            pid
+        );
+    }
 }
 
+#[tokio::test]
+#[serial]
+async fn test_run_command_success_preserves_descendant() {
+    let harness = TestHarness::new();
+    let python_cmd = if std::process::Command::new("python3").arg("--version").output().is_ok() {
+        "python3"
+    } else {
+        "python"
+    };
+
+    let marker_dir = tempfile::TempDir::new().unwrap();
+    let pid_file = marker_dir.path().join("child_success.pid");
+    let pid_file_str = pid_file.display().to_string().replace('\\', "/");
+    let script = format!(
+        "import subprocess, time, sys; p = subprocess.Popen(['{python_cmd}', '-c', 'import os, time; open(\"{pid_file_str}\", \"w\").write(str(os.getpid())); time.sleep(15)']); sys.stdout.write('SUCCESS_DONE\\n'); sys.exit(0)"
+    );
+    let resp = harness
+        .rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "run_command",
+                "arguments": {
+                    "command": python_cmd,
+                    "args": ["-c", script],
+                    "timeout_ms": 10000
+                }
+            }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false);
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["execution_state"], "completed");
+    assert_eq!(structured["command_started"], true);
+    assert_eq!(structured["command_completed"], true);
+    assert_eq!(structured["exit_code"], 0);
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) && !pid_file.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(pid_file.exists(), "descendant PID file must exist");
+    let pid_str = std::fs::read_to_string(&pid_file).expect("read pid");
+    let pid: u32 = pid_str.trim().parse().expect("parse pid");
+
+    struct ProcessKiller(u32);
+    impl Drop for ProcessKiller {
+        fn drop(&mut self) {
+            #[cfg(windows)]
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &format!("Stop-Process -Id {} -Force -ErrorAction SilentlyContinue", self.0)])
+                .output();
+            #[cfg(not(windows))]
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .output();
+        }
+    }
+    let _killer = ProcessKiller(pid);
+
+    #[cfg(windows)]
+    {
+        let check = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Id", pid)])
+            .output()
+            .expect("check descendant process");
+        let out = String::from_utf8_lossy(&check.stdout).trim().to_string();
+        assert_eq!(out, pid.to_string(), "descendant PID {pid} must still be running after successful completion");
+    }
+    #[cfg(not(windows))]
+    {
+        let check = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("check descendant process");
+        assert!(check.status.success(), "descendant PID {pid} must still be running after successful completion");
+    }
+}
 #[tokio::test]
 #[serial]
 async fn test_run_command_truncation_flags() {
@@ -708,16 +819,19 @@ async fn test_run_command_output_exceeding_max_raw_bytes_drains_without_broken_p
 
     let stdout = structured["stdout"].as_str().expect("stdout string");
     assert!(
-        stdout.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES,
-        "captured raw stdout must not exceed MAX_RAW_OUTPUT_BYTES ({} bytes, got {})",
-        hands::run_command::MAX_RAW_OUTPUT_BYTES,
+        stdout.len() <= hands::run_command::MAX_OUTPUT_BYTES,
+        "inline structured stdout must be bounded under MAX_OUTPUT_BYTES ({} bytes, got {})",
+        hands::run_command::MAX_OUTPUT_BYTES,
         stdout.len()
     );
+    let stdout_total = structured["stdout_total_bytes"].as_u64().expect("stdout_total_bytes");
+    let expected_total_bytes = 144 * 65536; // exactly 9,437,184 bytes produced by the child
     assert_eq!(
-        stdout.len(),
-        hands::run_command::MAX_RAW_OUTPUT_BYTES,
-        "captured raw stdout should fill up to MAX_RAW_OUTPUT_BYTES"
+        stdout_total, expected_total_bytes as u64,
+        "stdout_total_bytes must reflect exact total bytes produced ({}), got {}",
+        expected_total_bytes, stdout_total
     );
+    assert_eq!(structured["stderr_total_bytes"], 0);
 }
 
 #[tokio::test]
@@ -754,8 +868,8 @@ async fn test_run_command_repeated_timeouts_cleanup_and_bounded() {
         assert_eq!(structured["exit_code"], -1);
         let stdout = structured["stdout"].as_str().unwrap();
         let stderr = structured["stderr"].as_str().unwrap();
-        assert!(stdout.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES);
-        assert!(stderr.len() <= hands::run_command::MAX_RAW_OUTPUT_BYTES);
+        assert!(stdout.len() <= hands::run_command::MAX_OUTPUT_BYTES);
+        assert!(stderr.len() <= hands::run_command::MAX_OUTPUT_BYTES);
     }
 }
 

@@ -6,3 +6,8 @@ Unofficial ChatGPT plugin (MCP host). Not affiliated with OpenAI or xAI.
 Tool runtime comes from Grok Build (xai-org/grok-build), Apache License 2.0.
 See https://github.com/xai-org/grok-build and that repository's LICENSE
 and THIRD-PARTY-NOTICES.
+
+Ripgrep (rg.exe)
+Copyright 2015 Andrew Gallant
+Dual licensed under the MIT License and Unlicense.
+Source: https://github.com/BurntSushi/ripgrep

@@ -196,11 +196,129 @@ async fn test_mcp_error_handling() {
 #[test]
 fn test_git_ancestry_provenance() {
     assert_eq!(host::UPSTREAM_BASE_COMMIT, "c059e0d");
-    let status = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", "c059e0d", "HEAD"])
-        .status();
-    if let Ok(s) = status {
-        assert!(s.success(), "HEAD must descend from upstream commit c059e0d");
+    assert_eq!(
+        host::GROK_BUILD_PINNED_SHA,
+        "72a61251fcffb464bcc687aeb5a998e5a98ec0c9"
+    );
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let prov_file = std::path::Path::new(manifest_dir).join(".hands-source-rev");
+
+    if prov_file.exists() {
+        // Injected Hands: MUST prove BOTH Hands source ancestry and outer grok-build pinned SHA
+        let manifest = std::path::PathBuf::from(manifest_dir);
+        let cur = dunce::canonicalize(&manifest).unwrap_or(manifest);
+
+        // 1. Hands source repo discovery and ancestry check
+        let mut hands_repo = None;
+        let mut p = cur.as_path();
+        while let Some(parent) = p.parent() {
+            let sibling = parent.join("hands");
+            if sibling.join("scripts").join("inject.py").is_file() && sibling.join(".git").exists()
+            {
+                hands_repo = Some(sibling);
+                break;
+            }
+            if parent.join("scripts").join("inject.py").is_file() && parent.join(".git").exists() {
+                hands_repo = Some(parent.to_path_buf());
+                break;
+            }
+            p = parent;
+        }
+        let hands_repo = hands_repo.unwrap_or_else(|| {
+            panic!(
+                "failed to locate Hands source repository for injected crate at {}",
+                cur.display()
+            )
+        });
+        assert!(
+            hands_repo.join(".git").exists(),
+            "Hands source repository must contain .git at {}",
+            hands_repo.display()
+        );
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                hands_repo.to_str().unwrap(),
+                "merge-base",
+                "--is-ancestor",
+                host::UPSTREAM_BASE_COMMIT,
+                "HEAD",
+            ])
+            .status()
+            .expect("failed to execute git merge-base on Hands source repository");
+        assert!(
+            status.success(),
+            "Hands source repository at {} HEAD must descend from upstream Hands commit {}",
+            hands_repo.display(),
+            host::UPSTREAM_BASE_COMMIT
+        );
+
+        // 2. Outer grok-build repo discovery and pinned SHA check
+        let mut grok_build_repo = None;
+        let mut p = cur.as_path();
+        while let Some(parent) = p.parent() {
+            if parent.join("Cargo.toml").is_file()
+                && parent.join("crates").join("codegen").join("xai-grok-tools").is_dir()
+                && parent.join(".git").exists()
+            {
+                grok_build_repo = Some(parent.to_path_buf());
+                break;
+            }
+            p = parent;
+        }
+        let grok_build_repo = grok_build_repo.unwrap_or_else(|| {
+            panic!(
+                "failed to locate outer grok-build repository for injected hands at {}",
+                cur.display()
+            )
+        });
+        let output = std::process::Command::new("git")
+            .args(["-C", grok_build_repo.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .expect("failed to execute git rev-parse HEAD on outer grok-build repository");
+        assert!(
+            output.status.success(),
+            "git rev-parse HEAD failed on outer grok-build repository at {}",
+            grok_build_repo.display()
+        );
+        let head_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            head_sha,
+            host::GROK_BUILD_PINNED_SHA,
+            "outer grok-build HEAD at {} must match pinned grok-build SHA {}",
+            grok_build_repo.display(),
+            host::GROK_BUILD_PINNED_SHA
+        );
+    } else {
+        // Standalone Hands: MUST prove Hands ancestry
+        let manifest = std::path::PathBuf::from(manifest_dir);
+        let hands_repo = dunce::canonicalize(&manifest)
+            .unwrap_or(manifest)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| panic!("failed to resolve standalone Hands repository root"));
+        assert!(
+            hands_repo.join(".git").exists(),
+            "standalone Hands repository must contain .git at {}",
+            hands_repo.display()
+        );
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                hands_repo.to_str().unwrap(),
+                "merge-base",
+                "--is-ancestor",
+                host::UPSTREAM_BASE_COMMIT,
+                "HEAD",
+            ])
+            .status()
+            .expect("failed to execute git merge-base on standalone Hands repository");
+        assert!(
+            status.success(),
+            "standalone Hands HEAD must descend from upstream Hands commit {}",
+            host::UPSTREAM_BASE_COMMIT
+        );
     }
 }
 

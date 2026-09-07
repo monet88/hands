@@ -14,8 +14,8 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xai_grok_tools::bridge::ToolBridge;
+use xai_grok_tools::computer::local::LocalTerminalBackend;
 use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
-
 use crate::edit;
 use crate::host;
 use crate::plugin;
@@ -29,6 +29,10 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct McpHost {
     fallback_cwd: PathBuf,
     cached: Mutex<HashMap<(String, PathBuf), ToolBridge>>,
+    // One terminal backend per observed ChatGPT session. Hands has no reliable
+    // session-close signal, so keep the backend for host lifetime rather than
+    // guessing inactivity and risking task/history loss.
+    backends: Mutex<HashMap<String, Arc<LocalTerminalBackend>>>,
     call_seq: AtomicU64,
 }
 
@@ -37,6 +41,7 @@ impl McpHost {
         Arc::new(Self {
             fallback_cwd,
             cached: Mutex::new(HashMap::new()),
+            backends: Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(1),
         })
     }
@@ -52,15 +57,37 @@ impl McpHost {
     async fn bridge(&self) -> Result<ToolBridge, String> {
         self.bridge_for("", self.workspace()).await
     }
-
     async fn bridge_for(&self, session: &str, cwd: PathBuf) -> Result<ToolBridge, String> {
         let key = (session.to_string(), cwd.clone());
-        let mut cache = self.cached.lock().await;
-        if let Some(bridge) = cache.get(&key) {
-            return Ok(bridge.clone());
+        {
+            let cache = self.cached.lock().await;
+            if let Some(bridge) = cache.get(&key) {
+                return Ok(bridge.clone());
+            }
         }
-        let bridge = host::build_bridge(cwd).await?;
-        cache.insert(key, bridge.clone());
+        let (backend, is_new) = {
+            let mut backends = self.backends.lock().await;
+            let exists = backends.contains_key(session);
+            let backend = backends
+                .entry(session.to_string())
+                .or_insert_with(|| Arc::new(LocalTerminalBackend::new()))
+                .clone();
+            (backend, !exists)
+        };
+        let bridge = match host::build_bridge_with_backend(cwd, backend).await {
+            Ok(b) => b,
+            Err(e) => {
+                if is_new {
+                    let mut backends = self.backends.lock().await;
+                    backends.remove(session);
+                }
+                return Err(e);
+            }
+        };
+        {
+            let mut cache = self.cached.lock().await;
+            cache.insert(key, bridge.clone());
+        }
         Ok(bridge)
     }
 
@@ -119,13 +146,12 @@ impl McpHost {
         })
     }
 
-    async fn switch_workspace(
-        &self,
-        session: Option<&str>,
-        raw: &str,
-    ) -> Result<PathBuf, String> {
+    async fn switch_workspace(&self, session: Option<&str>, raw: &str) -> Result<PathBuf, String> {
         let path = host::resolve_project(raw)?;
         let cwd = host::pin_for_chat(session, &path)?;
+        // Workspace-bound bridges are disposable; the session-scoped terminal
+        // backend remains owned by this McpHost for the lifetime of the chat so
+        // running tasks and completed history survive the switch (Issue #62).
         self.drop_session_cache(session.unwrap_or("")).await;
         Ok(cwd)
     }
@@ -361,7 +387,6 @@ impl McpHost {
         let cwd = self
             .cwd_for(session.as_deref(), workspace_arg.as_deref())
             .map_err(|e| (-32602, e, Value::Null))?;
-
         if name == "list_terminal_tasks" {
             let bridge = self
                 .bridge_for(session.as_deref().unwrap_or(""), cwd.clone())
@@ -815,4 +840,158 @@ async fn write_http<W: AsyncWrite + Unpin>(
     writer.write_all(body).await.map_err(|e| e.to_string())?;
     writer.flush().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        var: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(var: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(var);
+            unsafe {
+                std::env::set_var(var, val);
+            }
+            Self { var, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe {
+                    std::env::set_var(self.var, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.var);
+                },
+            }
+        }
+    }
+    #[tokio::test]
+    #[serial]
+    async fn switch_workspace_keeps_session_backend_identity() {
+        // Issue #62 stories 6-8: set_workspace must not replace the session's
+        // terminal backend. Identity proven by Arc pointer equality.
+        let cfg = TempDir::new().unwrap();
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let host = McpHost::new(dir_a.path().to_path_buf());
+        let before = host
+            .bridge_for("sw", dir_a.path().to_path_buf())
+            .await
+            .expect("initial bridge");
+        drop(before);
+        let ptr_before = {
+            let backends = host.backends.lock().await;
+            Arc::as_ptr(&backends["sw"])
+        };
+        let pinned = host
+            .switch_workspace(Some("sw"), dir_b.path().to_str().unwrap())
+            .await
+            .expect("switch workspace");
+        assert_eq!(pinned, dunce::canonicalize(dir_b.path()).unwrap());
+        let after = host
+            .bridge_for("sw", pinned.clone())
+            .await
+            .expect("post-switch bridge");
+        drop(after);
+        let ptr_after = {
+            let backends = host.backends.lock().await;
+            Arc::as_ptr(&backends["sw"])
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "backend identity must survive set_workspace"
+        );
+
+    }
+    #[tokio::test]
+    #[serial]
+    async fn completed_task_history_survives_many_other_sessions() {
+        let cfg = TempDir::new().unwrap();
+        let _env = EnvGuard::set("HANDS_CONFIG_DIR", cfg.path());
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "session probe").unwrap();
+        let host = McpHost::new(dir.path().to_path_buf());
+
+        let started = host
+            .tools_call(json!({
+                "name": "run_terminal_cmd",
+                "arguments": {
+                    "command": "echo retained-history",
+                    "description": "retained history probe",
+                    "is_background": true
+                },
+                "_meta": { "openai/session": "history" }
+            }))
+            .await
+            .expect("start background task");
+        let task_id = started["structuredContent"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let mut completed = false;
+        let started_at = std::time::Instant::now();
+        while started_at.elapsed() < Duration::from_secs(10) {
+            let listed = host
+                .tools_call(json!({
+                    "name": "list_terminal_tasks",
+                    "arguments": {},
+                    "_meta": { "openai/session": "history" }
+                }))
+                .await
+                .expect("list task history");
+            if listed["structuredContent"]["tasks"]
+                .as_array()
+                .and_then(|tasks| tasks.iter().find(|task| task["task_id"] == task_id))
+                .is_some_and(|task| task["completed"] == true)
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(completed, "probe task must complete before retention check");
+
+        // Exceed the former 64-session cap that used to evict completed task
+        // history from otherwise idle sessions.
+        for i in 0..70 {
+            let session = format!("other-{i}");
+            host.tools_call(json!({
+                "name": "read_file",
+                "arguments": { "target_file": "probe.txt" },
+                "_meta": { "openai/session": session }
+            }))
+            .await
+            .expect("open another session");
+        }
+
+        let tasks = host
+            .tools_call(json!({
+                "name": "list_terminal_tasks",
+                "arguments": {},
+                "_meta": { "openai/session": "history" }
+            }))
+            .await
+            .expect("list retained history");
+        assert!(
+            tasks["structuredContent"]["tasks"]
+                .as_array()
+                .expect("tasks array")
+                .iter()
+                .any(|task| task["task_id"] == task_id),
+            "completed task history must remain owned by its ChatGPT session"
+        );
+    }
 }

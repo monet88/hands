@@ -18,6 +18,19 @@ def main() -> int:
         return 2
     src_repo = Path(sys.argv[1]).resolve()
     grok_build = Path(sys.argv[2]).resolve()
+
+    # Prepare and patch grok-build before injecting Hands crate (mandatory)
+    patcher = src_repo / "scripts" / "patch_grok_build.py"
+    if not patcher.is_file():
+        print(f"error: mandatory patcher missing at {patcher}", file=sys.stderr)
+        return 1
+    res = subprocess.run(
+        [sys.executable, str(patcher), str(grok_build)],
+        check=False,
+    )
+    if res.returncode != 0:
+        print("error: failed to prepare/patch grok-build", file=sys.stderr)
+        return res.returncode
     crate_src = src_repo / "crate"
     dest = grok_build / "crates" / "codegen" / "hands"
     if not (crate_src / "Cargo.toml").is_file():

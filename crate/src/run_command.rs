@@ -14,6 +14,76 @@ use tokio::process::Command;
 
 use crate::plugin;
 
+#[cfg(windows)]
+mod win_suspend {
+    type HANDLE = *mut std::ffi::c_void;
+    type BOOL = i32;
+
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct THREADENTRY32 {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ThreadID: u32,
+        th32OwnerProcessID: u32,
+        tpBasePri: i32,
+        tpDeltaPri: i32,
+        dwFlags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn OpenThread(dwDesiredAccess: u32, bInheritHandle: BOOL, dwThreadId: u32) -> HANDLE;
+        fn ResumeThread(hThread: HANDLE) -> u32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
+        fn Thread32First(hSnapshot: HANDLE, lpte: *mut THREADENTRY32) -> BOOL;
+        fn Thread32Next(hSnapshot: HANDLE, lpte: *mut THREADENTRY32) -> BOOL;
+    }
+
+    /// Resume the suspended initial thread of `pid` (created via
+    /// CREATE_SUSPENDED) so the process starts executing.
+    pub fn resume_process(pid: u32) -> bool {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            cntUsage: 0,
+            th32ThreadID: 0,
+            th32OwnerProcessID: 0,
+            tpBasePri: 0,
+            tpDeltaPri: 0,
+            dwFlags: 0,
+        };
+        let mut resumed = false;
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if !thread.is_null() && thread != INVALID_HANDLE_VALUE {
+                    let ret = unsafe { ResumeThread(thread) };
+                    unsafe { CloseHandle(thread) };
+                    if ret != u32::MAX {
+                        resumed = true;
+                        break;
+                    }
+                }
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
+        }
+        unsafe { CloseHandle(snapshot) };
+        resumed
+    }
+}
+#[cfg(windows)]
+use xai_grok_tools::util::ProcessGroup;
+
 pub const TOOL_NAME: &str = "run_command";
 
 pub const TOOL_DESCRIPTION: &str = "\
@@ -28,6 +98,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024; // 1 MB
 pub const MAX_OUTPUT_BYTES: usize = 40_000; // 40 KB
+pub const MAX_FALLBACK_CONTENT_BYTES: usize = 2048; // 2 KB
 pub const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024; // 8 MB
 
 pub fn tool_descriptor() -> Value {
@@ -183,10 +254,16 @@ fn validate_input(params: &Value, default_workdir: &Path) -> Result<ValidatedInp
     })
 }
 
+#[derive(Default)]
+struct PipeCapture {
+    raw: Vec<u8>,
+    truncated: bool,
+    total_bytes: usize,
+}
 async fn read_bounded<R: AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: usize,
-    capture: Arc<Mutex<(Vec<u8>, bool)>>,
+    capture: Arc<Mutex<PipeCapture>>,
 ) {
     let mut chunk = [0u8; 65536];
     loop {
@@ -194,15 +271,16 @@ async fn read_bounded<R: AsyncRead + Unpin>(
             Ok(0) => break,
             Ok(n) => {
                 let mut guard = capture.lock().unwrap();
-                let remaining = max_bytes.saturating_sub(guard.0.len());
+                guard.total_bytes += n;
+                let remaining = max_bytes.saturating_sub(guard.raw.len());
                 if remaining > 0 {
                     let to_take = n.min(remaining);
-                    guard.0.extend_from_slice(&chunk[..to_take]);
+                    guard.raw.extend_from_slice(&chunk[..to_take]);
                     if n > remaining {
-                        guard.1 = true;
+                        guard.truncated = true;
                     }
                 } else {
-                    guard.1 = true;
+                    guard.truncated = true;
                 }
             }
             Err(_) => break,
@@ -248,6 +326,43 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
         cmd.env(k, v);
     }
 
+    #[cfg(windows)]
+    {
+        // CREATE_SUSPENDED (0x00000004) | CREATE_NEW_PROCESS_GROUP (0x00000200) | CREATE_NO_WINDOW (0x08000000)
+        // Spawning suspended closes the spawn-to-assign race: the process cannot run any code
+        // or spawn descendants before being assigned to the Job Object.
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    // Windows-only owned process tree (Job Object with kill-on-close): the
+    // Issue #62 descendant remediation. Non-Windows keeps the prior
+    // direct-child behavior — the child is never enrolled in a group.
+    #[cfg(windows)]
+    let mut process_group = match ProcessGroup::new() {
+        Ok(g) => g,
+        Err(e) => {
+            let err_msg = format!(
+                "Failed to create process group for '{}': {e}",
+                validated.command
+            );
+            return json!({
+                "content": [{ "type": "text", "text": err_msg }],
+                "structuredContent": {
+                    "execution_state": "not_started",
+                    "command_started": false,
+                    "command_completed": false,
+                    "exit_code": Value::Null,
+                    "error": err_msg,
+                    "cwd": cwd.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
+                },
+                "isError": true
+            });
+        }
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -267,6 +382,56 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             });
         }
     };
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        if let Err(e) = process_group.attach(&child) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let err_msg = format!("Failed to attach child process to process group: {e}");
+            return json!({
+                "content": [{ "type": "text", "text": err_msg }],
+                "structuredContent": {
+                    "execution_state": "outcome_unknown",
+                    "command_started": true,
+                    "command_completed": false,
+                    "exit_code": Value::Null,
+                    "error": err_msg,
+                    "cwd": cwd.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
+                },
+                "isError": true
+            });
+        }
+
+        // Child is enrolled in the Job Object while suspended. Now resume the initial thread.
+        let resumed = match pid {
+            Some(p) => win_suspend::resume_process(p),
+            None => false,
+        };
+        if !resumed {
+            let _ = process_group.kill();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let err_msg = format!(
+                "Failed to resume suspended child process '{}': initial thread could not be resumed",
+                validated.command
+            );
+            return json!({
+                "content": [{ "type": "text", "text": err_msg }],
+                "structuredContent": {
+                    "execution_state": "outcome_unknown",
+                    "command_started": true,
+                    "command_completed": false,
+                    "exit_code": Value::Null,
+                    "error": err_msg,
+                    "cwd": cwd.display().to_string(),
+                    "default_workspace": active_workspace.display().to_string()
+                },
+                "isError": true
+            });
+        }
+    }
 
     if let Some(input_text) = validated.stdin {
         if let Some(mut stdin_pipe) = child.stdin.take() {
@@ -280,7 +445,7 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let stdout_capture = Arc::new(Mutex::new((Vec::new(), false)));
+    let stdout_capture = Arc::new(Mutex::new(PipeCapture::default()));
     let stdout_capture_clone = Arc::clone(&stdout_capture);
     let stdout_handle = tokio::spawn(async move {
         if let Some(r) = stdout_pipe {
@@ -288,7 +453,7 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
         }
     });
 
-    let stderr_capture = Arc::new(Mutex::new((Vec::new(), false)));
+    let stderr_capture = Arc::new(Mutex::new(PipeCapture::default()));
     let stderr_capture_clone = Arc::clone(&stderr_capture);
     let stderr_handle = tokio::spawn(async move {
         if let Some(r) = stderr_pipe {
@@ -298,8 +463,21 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
 
     let wait_res = tokio::time::timeout(validated.timeout, child.wait()).await;
 
+    let mut cleanup_error: Option<String> = None;
     let (exit_code, timed_out, execution_state, command_completed) = match wait_res {
-        Ok(Ok(status)) => (status.code().unwrap_or(-1), false, "completed", true),
+        Ok(Ok(status)) => {
+            #[cfg(windows)]
+            {
+                if let Err(e) = process_group.preserve_descendants() {
+                    cleanup_error = Some(format!("Failed to preserve process group descendants: {e}"));
+                }
+            }
+            if cleanup_error.is_some() {
+                (status.code().unwrap_or(-1), false, "outcome_unknown", false)
+            } else {
+                (status.code().unwrap_or(-1), false, "completed", true)
+            }
+        }
         Ok(Err(e)) => {
             stdout_handle.abort();
             stderr_handle.abort();
@@ -319,16 +497,46 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
             });
         }
         Err(_) => {
-            let kill_res = child.kill().await;
+            let _kill_res = child.kill().await;
+            #[cfg(windows)]
+            let tree_kill_res = process_group.kill();
             let wait_after_kill = child.wait().await;
-            if kill_res.is_ok() && wait_after_kill.is_ok() {
+            #[cfg(windows)]
+            let settled = if tree_kill_res.is_ok() && wait_after_kill.is_ok() {
+                let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+                let mut all_dead = false;
+                loop {
+                    match process_group.has_live_members() {
+                        Some(false) => {
+                            all_dead = true;
+                            break;
+                        }
+                        Some(true) => {
+                            if tokio::time::Instant::now() >= settle_deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+                all_dead
+            } else {
+                false
+            };
+            // Non-Windows keeps the prior direct-child contract: kill, reap,
+            // report. No group is ever enrolled (see spawn above).
+            #[cfg(not(windows))]
+            let settled = _kill_res.is_ok() && wait_after_kill.is_ok();
+            if settled {
                 (-1, true, "timed_out", false)
             } else {
                 (-1, true, "outcome_unknown", false)
             }
         }
     };
-
     if timed_out {
         stdout_handle.abort();
         stderr_handle.abort();
@@ -338,61 +546,91 @@ pub async fn execute(params: &Value, active_workspace: &Path) -> Value {
         let _ = tokio::time::timeout(join_timeout, stderr_handle).await;
     }
 
-    let (stdout_raw, stdout_truncated) = {
+    let (stdout_raw, stdout_truncated, stdout_total_bytes) = {
         let guard = stdout_capture.lock().unwrap();
-        (guard.0.clone(), guard.1)
+        (guard.raw.clone(), guard.truncated, guard.total_bytes)
     };
-    let (stderr_raw, stderr_truncated) = {
+    let (stderr_raw, stderr_truncated, stderr_total_bytes) = {
         let guard = stderr_capture.lock().unwrap();
-        (guard.0.clone(), guard.1)
+        (guard.raw.clone(), guard.truncated, guard.total_bytes)
     };
+    let stdout_lossy = String::from_utf8_lossy(&stdout_raw);
+    let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
 
-    let stdout_str = String::from_utf8_lossy(&stdout_raw).into_owned();
-    let stderr_str = String::from_utf8_lossy(&stderr_raw).into_owned();
+    let (stdout_str, stderr_str, stdout_is_truncated, stderr_is_truncated) = if stdout_lossy.len() + stderr_lossy.len() > MAX_OUTPUT_BYTES {
+        let budget_each = MAX_OUTPUT_BYTES / 2;
+        let mut did_trunc_out = false;
+        let truncated_stdout = if stdout_lossy.len() > budget_each {
+            did_trunc_out = true;
+            crate::mcp::truncate_output_text(&stdout_lossy, budget_each, "")
+        } else {
+            stdout_lossy.into_owned()
+        };
+        let remaining_budget = MAX_OUTPUT_BYTES.saturating_sub(truncated_stdout.len());
+        let mut did_trunc_err = false;
+        let truncated_stderr = if stderr_lossy.len() > remaining_budget {
+            did_trunc_err = true;
+            crate::mcp::truncate_output_text(&stderr_lossy, remaining_budget, "")
+        } else {
+            stderr_lossy.into_owned()
+        };
+        let out_trunc = stdout_truncated || did_trunc_out;
+        let err_trunc = stderr_truncated || did_trunc_err;
+        (truncated_stdout, truncated_stderr, out_trunc, err_trunc)
+    } else {
+        (stdout_lossy.into_owned(), stderr_lossy.into_owned(), stdout_truncated, stderr_truncated)
+    };
 
     let mut summary_lines = Vec::new();
+    if let Some(err) = &cleanup_error {
+        summary_lines.push(err.clone());
+    }
     if timed_out {
         summary_lines.push(format!("Command timed out after {}ms", validated.timeout.as_millis()));
     }
+    if stdout_is_truncated {
+        summary_lines.push(format!("[stdout truncated: {stdout_total_bytes} bytes produced]"));
+    }
+    if stderr_is_truncated {
+        summary_lines.push(format!("[stderr truncated: {stderr_total_bytes} bytes produced]"));
+    }
     if !stdout_str.is_empty() {
-        let text = if stdout_str.len() > MAX_OUTPUT_BYTES {
-            crate::mcp::truncate_output_text(&stdout_str, MAX_OUTPUT_BYTES, "")
-        } else {
-            stdout_str.clone()
-        };
-        summary_lines.push(text);
+        summary_lines.push(stdout_str.clone());
     }
     if !stderr_str.is_empty() {
-        let text = if stderr_str.len() > MAX_OUTPUT_BYTES {
-            crate::mcp::truncate_output_text(&stderr_str, MAX_OUTPUT_BYTES, "")
-        } else {
-            stderr_str.clone()
-        };
-        summary_lines.push(format!("stderr: {text}"));
+        summary_lines.push(format!("stderr: {stderr_str}"));
     }
     summary_lines.push(format!("exit: {exit_code}"));
 
     let combined = summary_lines.join("\n");
-    let content_text = if combined.len() > MAX_OUTPUT_BYTES {
-        crate::mcp::truncate_output_text(&combined, MAX_OUTPUT_BYTES, "")
+    let content_text = if combined.len() > MAX_FALLBACK_CONTENT_BYTES {
+        crate::mcp::truncate_output_text(&combined, MAX_FALLBACK_CONTENT_BYTES, "")
     } else {
         combined
     };
+    let mut structured = json!({
+        "execution_state": execution_state,
+        "command_started": true,
+        "command_completed": command_completed,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "stdout_truncated": stdout_is_truncated,
+        "stderr_truncated": stderr_is_truncated,
+        "stdout_total_bytes": stdout_total_bytes,
+        "stderr_total_bytes": stderr_total_bytes,
+        "cwd": cwd.display().to_string(),
+        "default_workspace": active_workspace.display().to_string()
+    });
+    if let Some(err) = &cleanup_error {
+        if let Some(obj) = structured.as_object_mut() {
+            obj.insert("error".to_string(), Value::String(err.clone()));
+        }
+    }
     json!({
         "content": [{ "type": "text", "text": content_text }],
-        "structuredContent": {
-            "execution_state": execution_state,
-            "command_started": true,
-            "command_completed": command_completed,
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-            "cwd": cwd.display().to_string(),
-            "default_workspace": active_workspace.display().to_string()
-        },
-        "isError": false
+        "structuredContent": structured,
+        "isError": cleanup_error.is_some() || execution_state == "outcome_unknown"
     })
 }

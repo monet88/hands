@@ -109,6 +109,7 @@ fn parse_args() -> Result<(PathBuf, Cmd), String> {
 #[tokio::main]
 async fn main() {
     host::migrate_from_legacy();
+    host::ensure_bundled_rg();
     let (fallback, cmd) = match parse_args() {
         Ok(v) => v,
         Err(e) => {

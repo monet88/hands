@@ -12,18 +12,51 @@ Tài liệu ghi lại toàn bộ các bước cấu hình, build và vận hành
 ---
 
 ## 2. Biên dịch & Cài đặt (Build & Deploy)
-1. **Inject crate upstream vào grok-build:**
+1. **Chuẩn bị và inject crate vào grok-build (pinned SHA `72a61251fcffb464bcc687aeb5a998e5a98ec0c9`):**
    ```powershell
+   # scripts/inject.py tự động gọi scripts/patch_grok_build.py để verify base SHA và apply patch set deterministic:
    python scripts/inject.py . "$env:LOCALAPPDATA\hands\cache\grok-build"
    ```
-2. **Biên dịch Release Binary:**
+2. **Biên dịch Release Binary với static MSVC CRT:**
    ```powershell
-   cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   $prevRustflags = $env:RUSTFLAGS
+   $env:RUSTFLAGS = "-C target-feature=+crt-static"
+   try {
+       cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   } finally {
+       if ($null -ne $prevRustflags) { $env:RUSTFLAGS = $prevRustflags } else { Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue }
+   }
+   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
    ```
-3. **Deploy & Backup:**
-   * File cũ được backup tại: `%LOCALAPPDATA%\Programs\hands\bin\hands.exe.bak`
-   * Binary mới được deploy tại: `%LOCALAPPDATA%\Programs\hands\bin\hands.exe`
-4. **Kiểm tra chức năng:**
+   Runtime Bundle ba file không mang `VCRUNTIME140.dll`; `package_windows_bundle.py` sẽ fail-closed nếu `hands.exe` vẫn link MSVC CRT động.
+3. **Stage và verify Portable Runtime Bundle:**
+   ```powershell
+   # Tải và xác thực ripgrep 15.1.0 chính thức từ GitHub releases:
+   $rgZip = "$env:TEMP\ripgrep-15.1.0-x86_64-pc-windows-msvc.zip"
+   Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip" -OutFile $rgZip
+   Expand-Archive -Path $rgZip -DestinationPath "$env:TEMP\ripgrep" -Force
+   $rgBin = "$env:TEMP\ripgrep\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe"
+   $actualHash = (Get-FileHash -Algorithm SHA256 $rgBin).Hash.ToLower()
+   if ($actualHash -ne "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408") {
+       throw "rg.exe SHA-256 mismatch: expected decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408, got $actualHash"
+   }
+
+   $runtimeVersion = "0.1.0-$(git rev-parse --short HEAD)"
+   $bundle = Join-Path $env:LOCALAPPDATA "Programs\hands\runtime\$runtimeVersion"
+   python scripts/package_windows_bundle.py `
+     --out-dir $bundle `
+     --hands-bin "$env:LOCALAPPDATA\hands\cache\grok-build\target\release\hands.exe" `
+     --rg-bin $rgBin `
+     --tunnel-client-bin "$env:LOCALAPPDATA\Programs\hands\bin\tunnel-client.exe" `
+     --version $runtimeVersion
+   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+   python scripts/package_windows_bundle.py --out-dir $bundle --verify-only
+   ```
+   `rg.exe` phải đúng pin SHA-256 mà package script khai báo; không dùng Scoop/winget/global PATH làm runtime dependency.
+4. **Giữ Runtime Bundle nguyên khối:**
+   * Không copy riêng `$bundle\hands.exe` ra khỏi bundle: `rg.exe` phải nằm sibling với runtime để `grep`/`glob` hoạt động trên máy sạch.
+   * #62 chỉ harden + verify Runtime Bundle; việc launcher/activation chọn `runtime\<version>\` nào để chạy thuộc launcher work tiếp theo. Không dùng bước build này để thay/restart runtime host đang phục vụ.
+5. **Kiểm tra chức năng:**
    ```powershell
    hands list
    ```
@@ -96,22 +129,48 @@ Khi Upstream có commit mới hoặc muốn re-build:
    ```powershell
    git pull origin main
    ```
-2. **Inject mã nguồn vào cache build:**
+2. **Inject mã nguồn vào cache build (tự động verify base SHA & apply patch set):**
    ```powershell
    python scripts/inject.py . "$env:LOCALAPPDATA\hands\cache\grok-build"
    ```
-3. **Biên dịch Release Binary:**
+3. **Biên dịch Release Binary với static MSVC CRT:**
    ```powershell
-   cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   $prevRustflags = $env:RUSTFLAGS
+   $env:RUSTFLAGS = "-C target-feature=+crt-static"
+   try {
+       cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   } finally {
+       if ($null -ne $prevRustflags) { $env:RUSTFLAGS = $prevRustflags } else { Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue }
+   }
+   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
    ```
-4. **Deploy Binary mới:**
+4. **Stage + verify Runtime Bundle mới:**
    ```powershell
-   # Backup file hiện tại
-   Copy-Item "$env:LOCALAPPDATA\Programs\hands\bin\hands.exe" "$env:LOCALAPPDATA\Programs\hands\bin\hands.exe.bak" -Force
-   # Chép binary mới
-   Copy-Item "$env:LOCALAPPDATA\hands\cache\grok-build\target\release\hands.exe" "$env:LOCALAPPDATA\Programs\hands\bin\hands.exe" -Force
+   # Tải và xác thực ripgrep 15.1.0 chính thức từ GitHub releases:
+   $rgZip = "$env:TEMP\ripgrep-15.1.0-x86_64-pc-windows-msvc.zip"
+   Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip" -OutFile $rgZip
+   Expand-Archive -Path $rgZip -DestinationPath "$env:TEMP\ripgrep" -Force
+   $rgBin = "$env:TEMP\ripgrep\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe"
+   $actualHash = (Get-FileHash -Algorithm SHA256 $rgBin).Hash.ToLower()
+   if ($actualHash -ne "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408") {
+       throw "rg.exe SHA-256 mismatch: expected decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408, got $actualHash"
+   }
+
+   $runtimeVersion = "0.1.0-$(git rev-parse --short HEAD)"
+   $bundle = Join-Path $env:LOCALAPPDATA "Programs\hands\runtime\$runtimeVersion"
+   python scripts/package_windows_bundle.py `
+     --out-dir $bundle `
+     --hands-bin "$env:LOCALAPPDATA\hands\cache\grok-build\target\release\hands.exe" `
+     --rg-bin $rgBin `
+     --tunnel-client-bin "$env:LOCALAPPDATA\Programs\hands\bin\tunnel-client.exe" `
+     --version $runtimeVersion
+   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+   python scripts/package_windows_bundle.py --out-dir $bundle --verify-only
    ```
-5. **Giữ nguyên các thành phần cấu hình:**
+5. **Giữ bundle mới nguyên khối để activation/launcher chọn:**
+   * Không deploy riêng `hands.exe`; giữ `hands.exe`, `rg.exe`, `tunnel-client.exe`, `manifest.json`, và `SHA256SUMS.txt` cùng trong `$bundle`.
+   * Activation/rollback của versioned runtime được thực hiện bởi launcher workflow sau #62; build/update ở đây không tự thay hoặc restart active host runtime.
+6. **Giữ nguyên các thành phần cấu hình:**
    * File cấu hình tunnel: `%APPDATA%\tunnel-client\hands.yaml`
    * Launcher: `%LOCALAPPDATA%\Programs\hands\bin\start-hands.bat`
    * Autostart: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\hands-autostart.vbs`
