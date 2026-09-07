@@ -135,19 +135,33 @@ Khi Upstream có commit mới hoặc muốn re-build:
    ```
 3. **Biên dịch Release Binary với static MSVC CRT:**
    ```powershell
+   $prevRustflags = $env:RUSTFLAGS
    $env:RUSTFLAGS = "-C target-feature=+crt-static"
-   cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   try {
+       cargo build --release -p hands --manifest-path "$env:LOCALAPPDATA\hands\cache\grok-build\Cargo.toml"
+   } finally {
+       if ($null -ne $prevRustflags) { $env:RUSTFLAGS = $prevRustflags } else { Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue }
+   }
    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-   Remove-Item Env:RUSTFLAGS
    ```
 4. **Stage + verify Runtime Bundle mới:**
    ```powershell
+   # Tải và xác thực ripgrep 15.1.0 chính thức từ GitHub releases:
+   $rgZip = "$env:TEMP\ripgrep-15.1.0-x86_64-pc-windows-msvc.zip"
+   Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip" -OutFile $rgZip
+   Expand-Archive -Path $rgZip -DestinationPath "$env:TEMP\ripgrep" -Force
+   $rgBin = "$env:TEMP\ripgrep\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe"
+   $actualHash = (Get-FileHash -Algorithm SHA256 $rgBin).Hash.ToLower()
+   if ($actualHash -ne "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408") {
+       throw "rg.exe SHA-256 mismatch: expected decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408, got $actualHash"
+   }
+
    $runtimeVersion = "0.1.0-$(git rev-parse --short HEAD)"
    $bundle = Join-Path $env:LOCALAPPDATA "Programs\hands\runtime\$runtimeVersion"
    python scripts/package_windows_bundle.py `
      --out-dir $bundle `
      --hands-bin "$env:LOCALAPPDATA\hands\cache\grok-build\target\release\hands.exe" `
-     --rg-bin "C:\path\to\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe" `
+     --rg-bin $rgBin `
      --tunnel-client-bin "$env:LOCALAPPDATA\Programs\hands\bin\tunnel-client.exe" `
      --version $runtimeVersion
    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

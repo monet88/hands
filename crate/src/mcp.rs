@@ -194,13 +194,13 @@ impl McpHost {
                 .collect::<Vec<_>>()
         };
         for (victim, backend) in victim_candidates {
-            if victim == current || self.is_inflight(&victim) {
+            if self.is_inflight(&victim) {
                 continue;
             }
             if backend.list_tasks().await.iter().any(|t| !t.completed) {
                 continue;
             }
-            if victim == current || self.is_inflight(&victim) {
+            if self.is_inflight(&victim) {
                 continue;
             }
             let mut cache = self.cached.lock().await;
@@ -208,7 +208,7 @@ impl McpHost {
             if backends.len() <= MAX_SESSION_BACKENDS {
                 break;
             }
-            if victim == current || self.is_inflight(&victim) {
+            if self.is_inflight(&victim) {
                 continue;
             }
             cache.retain(|(s, _), _| s != &victim);

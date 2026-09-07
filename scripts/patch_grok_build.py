@@ -170,13 +170,15 @@ def verify_target_diffs(
         target = get_patch_target(patch_text)
         res = run_git(
             [
-                "-c",
-                "diff.noprefix=false",
-                "-c",
-                "diff.mnemonicprefix=false",
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                "--diff-algorithm=default",
+                "--indent-heuristic",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--",
                 target,
             ],

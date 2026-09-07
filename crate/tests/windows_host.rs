@@ -40,13 +40,14 @@ fn hands_repo_root() -> std::path::PathBuf {
 }
 
 fn resolve_python_cmd() -> &'static str {
-    if std::process::Command::new("python3").arg("--version").output().is_ok() {
-        "python3"
-    } else if std::process::Command::new("python").arg("--version").output().is_ok() {
-        "python"
-    } else {
-        "py"
+    for cmd in &["python3", "python", "py"] {
+        if let Ok(output) = std::process::Command::new(cmd).arg("--version").output() {
+            if output.status.success() {
+                return cmd;
+            }
+        }
     }
+    panic!("failed to locate a usable Python 3 executable (tried python3, python, py)");
 }
 
 fn write_dummy_pe(path: &std::path::Path, dlls: &[&str]) {
@@ -582,6 +583,45 @@ stage_bundle_for_testing(out_dir, hands_bin=hands_bin, tunnel_client_bin=tc_bin,
         stderr.contains("dynamic MSVC CRT") && stderr.contains("crt-static"),
         "rejection must explain the clean-Windows static CRT requirement: {stderr}"
     );
+
+    // Negative regression: delay-imported MSVC CRT must also fail closed
+    let fake_delay_hands = staging_dir.path().join("fake_delay_dynamic_hands.exe");
+    let write_delay_code = format!(
+        "import sys, pathlib; sys.path.insert(0, '.'); from scripts.package_windows_bundle import make_dummy_pe; pathlib.Path(sys.argv[1]).write_bytes(make_dummy_pe(delay_dlls=['VCRUNTIME140.dll']))"
+    );
+    let status_write_delay = std::process::Command::new(resolve_python_cmd())
+        .arg("-B")
+        .arg("-c")
+        .arg(write_delay_code)
+        .arg(&fake_delay_hands)
+        .current_dir(&repo_root)
+        .status()
+        .expect("write delay dummy pe");
+    assert!(status_write_delay.success(), "write delay dummy pe failed");
+
+    let bundle_delay_out = staging_dir.path().join("bundle_delay_crt");
+    let status_delay = std::process::Command::new(resolve_python_cmd())
+        .arg("-B")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(python_script)
+        .arg(&bundle_delay_out)
+        .arg(&fake_delay_hands)
+        .arg(&fake_tc)
+        .arg(&fake_rg)
+        .arg(&expected_hash)
+        .current_dir(&repo_root)
+        .output()
+        .expect("run delay dynamic CRT package rejection");
+    assert!(
+        !status_delay.status.success(),
+        "packaging MUST reject hands.exe that delay-imports dynamic MSVC CRT"
+    );
+    let stderr_delay = String::from_utf8_lossy(&status_delay.stderr);
+    assert!(
+        stderr_delay.contains("dynamic MSVC CRT") && stderr_delay.contains("crt-static"),
+        "rejection must explain the clean-Windows static CRT requirement for delay imports: {stderr_delay}"
+    );
 }
 #[tokio::test]
 #[serial]
@@ -609,7 +649,7 @@ sys.path.insert(0, '.')
 from scripts.package_windows_bundle import verify_pe_x86_64
 hands_bin = pathlib.Path(sys.argv[1])
 try:
-    verify_pe_x86_64(hands_bin, "hands.exe")
+    verify_pe_x86_64(hands_bin)
     print("ACCEPTED", file=sys.stderr)
     sys.exit(1)
 except RuntimeError as e:
@@ -635,6 +675,90 @@ except RuntimeError as e:
     assert!(
         stderr.contains("REJECTED") && (stderr.contains("optional header") || stderr.contains("invalid")),
         "rejection must report invalid/truncated PE header: {stderr}"
+    );
+
+    // Seam 2 regression: verify-only must reject wrong architecture tunnel-client.exe
+    let fake_tc_i386 = staging_dir.path().join("fake_tc_i386.exe");
+    let write_i386_code = format!(
+        "import sys, pathlib; sys.path.insert(0, '.'); from scripts.package_windows_bundle import make_dummy_pe; pathlib.Path(sys.argv[1]).write_bytes(make_dummy_pe(machine=0x014c))"
+    );
+    let status_write_i386 = std::process::Command::new(resolve_python_cmd())
+        .arg("-B")
+        .arg("-c")
+        .arg(write_i386_code)
+        .arg(&fake_tc_i386)
+        .current_dir(&repo_root)
+        .status()
+        .expect("write i386 dummy pe");
+    assert!(status_write_i386.success(), "write i386 dummy pe failed");
+
+    let bundle_verify_bad_tc = staging_dir.path().join("bundle_bad_tc");
+    std::fs::create_dir_all(&bundle_verify_bad_tc).expect("create bundle_bad_tc dir");
+    let valid_hands = staging_dir.path().join("valid_hands.exe");
+    write_dummy_pe(&valid_hands, &[]);
+    std::fs::copy(&valid_hands, bundle_verify_bad_tc.join("hands.exe")).expect("copy hands");
+    std::fs::copy(&fake_tc_i386, bundle_verify_bad_tc.join("tunnel-client.exe")).expect("copy tc i386");
+    let fake_rg = staging_dir.path().join("fake_rg.exe");
+    let rg_bytes = b"test pinned rg bytes for verify only test";
+    std::fs::write(&fake_rg, rg_bytes).expect("write rg");
+    std::fs::copy(&fake_rg, bundle_verify_bad_tc.join("rg.exe")).expect("copy rg");
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(rg_bytes);
+    let rg_hash = format!("{:x}", hasher.finalize());
+
+    let tc_bytes = std::fs::read(&fake_tc_i386).expect("read tc i386");
+    let mut tc_hasher = Sha256::new();
+    tc_hasher.update(&tc_bytes);
+    let tc_hash = format!("{:x}", tc_hasher.finalize());
+
+    let hands_bytes = std::fs::read(&valid_hands).expect("read hands");
+    let mut hands_hasher = Sha256::new();
+    hands_hasher.update(&hands_bytes);
+    let hands_hash = format!("{:x}", hands_hasher.finalize());
+
+    let manifest_json = serde_json::json!({
+        "schema_version": "1.0.0",
+        "bundle_version": "0.1.0-test",
+        "target_os": "windows",
+        "target_arch": "x86_64",
+        "files": [
+            { "name": "rg.exe", "size": rg_bytes.len(), "sha256": rg_hash },
+            { "name": "hands.exe", "size": hands_bytes.len(), "sha256": hands_hash, "crt_linkage": "static" },
+            { "name": "tunnel-client.exe", "size": tc_bytes.len(), "sha256": tc_hash }
+        ]
+    });
+    std::fs::write(bundle_verify_bad_tc.join("manifest.json"), serde_json::to_string_pretty(&manifest_json).unwrap()).expect("write manifest");
+    let sha_sums = format!("{rg_hash} *rg.exe\n{hands_hash} *hands.exe\n{tc_hash} *tunnel-client.exe\n");
+    std::fs::write(bundle_verify_bad_tc.join("SHA256SUMS.txt"), sha_sums).expect("write sha sums");
+
+    let verify_script = r#"
+import sys, pathlib
+sys.path.insert(0, '.')
+from scripts.package_windows_bundle import verify_bundle_for_testing
+out_dir = pathlib.Path(sys.argv[1])
+expected_hash = sys.argv[2]
+verify_bundle_for_testing(out_dir, expected_rg_hash=expected_hash)
+"#;
+    let status_verify = std::process::Command::new(resolve_python_cmd())
+        .arg("-B")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(verify_script)
+        .arg(&bundle_verify_bad_tc)
+        .arg(&rg_hash)
+        .current_dir(&repo_root)
+        .output()
+        .expect("run verify-only with wrong arch tunnel");
+    assert!(
+        !status_verify.status.success(),
+        "verify-only MUST reject wrong machine architecture tunnel-client.exe"
+    );
+    let stderr_verify = String::from_utf8_lossy(&status_verify.stderr);
+    assert!(
+        stderr_verify.contains("wrong machine architecture") || stderr_verify.contains("0x014c"),
+        "verify-only rejection must report architecture mismatch: {stderr_verify}"
     );
 }
 
@@ -799,6 +923,16 @@ try:
     raise AssertionError("Already-applied tampered Cargo.lock did not fail closed")
 except RuntimeError as e:
     assert "Cargo.lock does not match" in str(e) or "unexpected" in str(e), f"Unexpected error on tampered lock: {e}"
+
+# 10. Hostile Git diff config (diff.context, diff.algorithm, diff.textconv) must not break verification
+clone8 = temp_dir / "hostile_config_clone"
+subprocess.check_call(["git", "clone", "--depth", "1", "file:///" + str(grok_source).replace("\\", "/"), str(clone8)], stderr=subprocess.DEVNULL)
+subprocess.check_call(["git", "-C", str(clone8), "config", "diff.context", "1"], stderr=subprocess.DEVNULL)
+subprocess.check_call(["git", "-C", str(clone8), "config", "diff.algorithm", "histogram"], stderr=subprocess.DEVNULL)
+subprocess.check_call(["git", "-C", str(clone8), "config", "diff.textconv", "true"], stderr=subprocess.DEVNULL)
+verify_and_patch(clone8, patches_dir, pinned_sha)
+# Target diff verification under hostile user config must still succeed cleanly
+verify_target_diffs(clone8, patch_files)
 
 # 10. Clean up git readonly files so TempDir drops without Windows permission error
 import stat, shutil

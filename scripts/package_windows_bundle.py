@@ -86,7 +86,9 @@ def parse_pe_imports_and_arch(path: Path) -> tuple[int, list[str]]:
     import_rva, import_size = 0, 0
     if num_rva_and_sizes >= 2:
         import_rva, import_size = struct.unpack_from("<II", data, opt_offset + 120)
-
+    delay_rva, delay_size = 0, 0
+    if num_rva_and_sizes >= 14:
+        delay_rva, delay_size = struct.unpack_from("<II", data, opt_offset + 216)
     sections_offset = opt_offset + size_of_opt_hdr
     if sections_offset + num_sections * 40 > len(data):
         raise RuntimeError(f"{path.name} is truncated (section table extends past EOF)")
@@ -144,13 +146,51 @@ def parse_pe_imports_and_arch(path: Path) -> tuple[int, list[str]]:
             raise RuntimeError(
                 f"{path.name} has truncated import directory table (missing null terminator descriptor)"
             )
+
+    if delay_rva and delay_size:
+        delay_off = rva_to_offset(delay_rva)
+        if delay_off is None:
+            raise RuntimeError(
+                f"{path.name} has malformed delay import directory: RVA 0x{delay_rva:08x} not in any section"
+            )
+        found_null_delay_descriptor = False
+        while delay_off + 32 <= len(data):
+            desc = struct.unpack_from("<IIIIIIII", data, delay_off)
+            if desc == (0, 0, 0, 0, 0, 0, 0, 0):
+                found_null_delay_descriptor = True
+                break
+            name_rva = desc[1]
+            if not name_rva:
+                raise RuntimeError(
+                    f"{path.name} has malformed delay import directory descriptor: missing name RVA"
+                )
+            name_off = rva_to_offset(name_rva)
+            if name_off is None:
+                raise RuntimeError(
+                    f"{path.name} has malformed delay import directory: DLL name RVA 0x{name_rva:08x} not in any section"
+                )
+            if name_off >= len(data):
+                raise RuntimeError(
+                    f"{path.name} is truncated (delay import DLL name offset extends past EOF)"
+                )
+            end = data.find(b"\0", name_off)
+            if end == -1:
+                raise RuntimeError(
+                    f"{path.name} has malformed delay import directory: unterminated DLL name string"
+                )
+            dll_name = data[name_off:end].decode("ascii", "replace")
+            imported_dlls.append(dll_name)
+            delay_off += 32
+        if not found_null_delay_descriptor:
+            raise RuntimeError(
+                f"{path.name} has truncated delay import directory table (missing null terminator descriptor)"
+            )
     return machine, imported_dlls
 
 
-def verify_pe_x86_64(path: Path, binary_name: str) -> None:
+def verify_pe_x86_64(path: Path) -> None:
     """Verify that a binary has valid PE headers and targets x86_64."""
     parse_pe_imports_and_arch(path)
-
 
 def verify_hands_static_crt(path: Path) -> None:
     """Reject a Hands PE that still imports an app-external MSVC runtime DLL."""
@@ -166,13 +206,13 @@ def verify_hands_static_crt(path: Path) -> None:
         )
 
 
-def make_dummy_pe(dlls: list[str] = ()) -> bytes:
-    """Construct a minimal valid x86_64 PE binary for testing."""
+def make_dummy_pe(dlls: list[str] = (), delay_dlls: list[str] = (), machine: int = 0x8664) -> bytes:
+    """Construct a minimal valid PE binary for testing."""
     dos = bytearray(64)
     dos[:2] = b"MZ"
     struct.pack_into("<I", dos, 0x3C, 64)
     pe_sig = b"PE\0\0"
-    file_hdr = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 240, 0x22)
+    file_hdr = struct.pack("<HHIIIHH", machine, 1, 0, 0, 0, 240, 0x22)
     opt_hdr = bytearray(240)
     struct.pack_into("<H", opt_hdr, 0, 0x020B)
     struct.pack_into("<II", opt_hdr, 32, 0x1000, 0x200)
@@ -189,8 +229,24 @@ def make_dummy_pe(dlls: list[str] = ()) -> bytes:
             names_data.extend(d_bytes)
             desc_data.extend(struct.pack("<IIIII", 0, 0, 0, name_rva, 0))
         desc_data.extend(b"\0" * 20)
-        sec_data = desc_data + names_data
-        struct.pack_into("<II", opt_hdr, 120, 0x1000, len(sec_data))
+        normal_import_data = desc_data + names_data
+        struct.pack_into("<II", opt_hdr, 120, 0x1000, len(normal_import_data))
+        sec_data.extend(normal_import_data)
+    if delay_dlls:
+        delay_start_rva = 0x1000 + len(sec_data)
+        desc_size = (len(delay_dlls) + 1) * 32
+        names_data = bytearray()
+        desc_data = bytearray()
+        for d in delay_dlls:
+            d_bytes = d.encode("ascii") + b"\0"
+            name_rva = delay_start_rva + desc_size + len(names_data)
+            names_data.extend(d_bytes)
+            # grAttrs=1 (RVA mode), rvaDLLName=name_rva
+            desc_data.extend(struct.pack("<IIIIIIII", 1, name_rva, 0, 0, 0, 0, 0, 0))
+        desc_data.extend(b"\0" * 32)
+        delay_data = desc_data + names_data
+        struct.pack_into("<II", opt_hdr, 216, delay_start_rva, len(delay_data))
+        sec_data.extend(delay_data)
     raw_size = ((len(sec_data) + 511) // 512) * 512
     if raw_size == 0:
         raw_size = 512
@@ -268,6 +324,8 @@ def _verify_bundle_core(out_dir: Path, expected_rg_hash: str) -> dict:
                 raise RuntimeError(
                     "hands.exe manifest must declare crt_linkage=static for the portable Windows bundle"
                 )
+        elif item["name"] == "tunnel-client.exe":
+            verify_pe_x86_64(file_path)
 
     return manifest
 
@@ -358,7 +416,7 @@ def _stage_bundle_core(
             "tunnel-client.exe is mandatory for the complete Windows Runtime Bundle composition."
         )
 
-    verify_pe_x86_64(dest_tc, "tunnel-client.exe")
+    verify_pe_x86_64(dest_tc)
 
     manifest_files.append({
         "name": "tunnel-client.exe",

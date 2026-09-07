@@ -679,6 +679,7 @@ fn spawn_stdio_hands(
     let mut stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
+    let guard = ProcessGuard(child);
 
     let init_req = json!({
         "jsonrpc": "2.0",
@@ -697,7 +698,7 @@ fn spawn_stdio_hands(
     let resp: Value = serde_json::from_str(&resp_line).expect("parse init json");
     assert_eq!(resp["id"], 1);
 
-    (ProcessGuard(child), stdin, reader, config_dir, workspace)
+    (guard, stdin, reader, config_dir, workspace)
 }
 
 fn stdio_call_with_meta(
