@@ -10,8 +10,6 @@ use xai_grok_tools::types::output::{
     ToolOutput, line_diff,
 };
 
-use crate::plugin;
-
 const CONTEXT: usize = 3;
 const MAX_FILE: usize = 1024 * 1024;
 const MAX_DIFF_CHARS: usize = 24_000;
@@ -31,7 +29,9 @@ pub fn mcp_result(output: &ToolOutput, prompt_text: &str, workspace: &Path) -> V
             "content": [{ "type": "text", "text": r.summary }],
             "structuredContent": r.meta,
             "isError": false,
-            "_meta": plugin::diff_result_meta()
+            // No widget `_meta`: the model reads the full diff from
+            // `structuredContent`, but we don't hydrate a diff iframe in
+            // ChatGPT (it made the UI heavy and the operator does not read it).
         }),
         _ => json!({
             "content": [{ "type": "text", "text": prompt_text }],
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(mcp["isError"], false);
         assert_eq!(mcp["structuredContent"]["added"], 1);
         assert_eq!(mcp["structuredContent"]["removed"], 1);
-        assert_eq!(mcp["_meta"]["openai/outputTemplate"], crate::plugin::DIFF_URI);
+        assert!(mcp.get("_meta").is_none(), "no widget meta for edits");
         assert!(
             mcp["content"][0]["text"]
                 .as_str()

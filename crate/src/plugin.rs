@@ -1,18 +1,10 @@
-//! ChatGPT plugin chrome: titles, annotations, invocation text, skills, widgets.
+//! ChatGPT plugin chrome: titles, annotations, invocation text, skills.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const SKILL_MD: &str = include_str!("../skills/hands-code/SKILL.md");
 const SKILL_URI: &str = "skill://hands/hands-code/SKILL.md";
-pub const DIFF_URI: &str = "ui://widget/diff-v1.html";
-const DIFF_HTML: &str = include_str!("widgets/diff.html");
-const DIFF_MIME_CHATGPT: &str = "text/html+skybridge";
-const DIFF_MIME_APPS: &str = "text/html;profile=mcp-app";
-
-fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "search_replace" | "write" | "apply_patch")
-}
 
 pub struct Face {
     pub title: &'static str,
@@ -186,18 +178,14 @@ fn with_workspace_field(mut schema: Value) -> Value {
 
 pub fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
     let f = face(name);
-    let mut meta = json!({
+    // No widget meta for edit tools: keep `invoking`/`invoked` status text but
+    // do not advertise a diff template to ChatGPT. The model still receives the
+    // full diff via `structuredContent`; the operator does not want an iframe
+    // hydrated in the chat (heavy UI).
+    let meta = json!({
         "openai/toolInvocation/invoking": f.invoking,
         "openai/toolInvocation/invoked": f.invoked,
     });
-    if is_edit_tool(name) {
-        meta["ui"] = json!({ "resourceUri": DIFF_URI });
-        meta["openai/outputTemplate"] = json!(DIFF_URI);
-        meta["openai/resultCanProduceWidget"] = json!(true);
-        meta["openai/widgetAccessible"] = json!(false);
-        meta["openai/widgetDescription"] =
-            json!("Inline unified diff of the file just written on this machine.");
-    }
     let schema = if name == "set_workspace" {
         input_schema
     } else {
@@ -219,48 +207,12 @@ pub fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Va
     })
 }
 
-fn widget_resource_meta() -> Value {
-    json!({
-        "ui": {
-            "prefersBorder": true,
-            "csp": {
-                "connectDomains": [],
-                "resourceDomains": [],
-            }
-        },
-        "openai/widgetPrefersBorder": true,
-        "openai/widgetDescription": "Unified diff of the edit that just landed.",
-        "openai/widgetCSP": {
-            "connect_domains": [],
-            "resource_domains": [],
-        }
-    })
-}
-
-/// `_meta` on a successful edit `tools/call` so ChatGPT hydrates the iframe.
-pub fn diff_result_meta() -> Value {
-    json!({
-        "ui": { "resourceUri": DIFF_URI },
-        "openai/outputTemplate": DIFF_URI,
-        "openai.com/widget": {
-            "type": "resource",
-            "resource": {
-                "uri": DIFF_URI,
-                "mimeType": DIFF_MIME_CHATGPT,
-                "text": DIFF_HTML,
-                "_meta": widget_resource_meta()
-            }
-        }
-    })
-}
-
 pub fn initialize_capabilities() -> Value {
     json!({
         "tools": { "listChanged": false },
         "resources": { "listChanged": false },
         "extensions": {
-            "io.modelcontextprotocol/skills": {},
-            "io.modelcontextprotocol/ui": {}
+            "io.modelcontextprotocol/skills": {}
         }
     })
 }
@@ -306,17 +258,6 @@ pub fn skills_get(params: &Value) -> Result<Value, (i64, String, Value)> {
     Ok(json!({ "skill": skill_entry() }))
 }
 
-fn diff_resource(mime: &str) -> Value {
-    json!({
-        "uri": DIFF_URI,
-        "name": "edit-diff",
-        "title": "Edit diff",
-        "mimeType": mime,
-        "description": "Inline unified diff after search_replace, write, or apply_patch",
-        "_meta": widget_resource_meta()
-    })
-}
-
 pub fn resources_list() -> Value {
     json!({
         "resources": [
@@ -325,8 +266,7 @@ pub fn resources_list() -> Value {
                 "name": "hands-code",
                 "mimeType": "text/markdown",
                 "description": "Hands local coding workflow"
-            },
-            diff_resource(DIFF_MIME_CHATGPT)
+            }
         ]
     })
 }
@@ -342,24 +282,6 @@ pub fn resources_read(params: &Value) -> Result<Value, (i64, String, Value)> {
             }]
         }));
     }
-    if uri == DIFF_URI {
-        return Ok(json!({
-            "contents": [
-                {
-                    "uri": DIFF_URI,
-                    "mimeType": DIFF_MIME_CHATGPT,
-                    "text": DIFF_HTML,
-                    "_meta": widget_resource_meta()
-                },
-                {
-                    "uri": DIFF_URI,
-                    "mimeType": DIFF_MIME_APPS,
-                    "text": DIFF_HTML,
-                    "_meta": widget_resource_meta()
-                }
-            ]
-        }));
-    }
     Err((-32602, format!("unknown resource uri: {uri}"), Value::Null))
 }
 
@@ -368,10 +290,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_tools_advertise_widget() {
+    fn edit_tools_have_no_widget_meta() {
         let d = tool_descriptor("search_replace", "edit", json!({ "type": "object" }));
-        assert_eq!(d["_meta"]["openai/outputTemplate"], DIFF_URI);
-        assert_eq!(d["_meta"]["ui"]["resourceUri"], DIFF_URI);
+        assert!(d["_meta"].get("openai/outputTemplate").is_none());
+        assert!(d["_meta"].get("ui").is_none());
         assert!(d["inputSchema"]["properties"].get("workspace").is_some());
         assert!(d["inputSchema"]["properties"]["workspace"]["description"]
             .as_str()
@@ -388,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_resource_is_readable() {
+    fn resources_list_only_exposes_skill() {
         let list = resources_list();
         let uris: Vec<&str> = list["resources"]
             .as_array()
@@ -396,10 +318,9 @@ mod tests {
             .iter()
             .filter_map(|r| r["uri"].as_str())
             .collect();
-        assert!(uris.contains(&DIFF_URI));
-        let got = resources_read(&json!({ "uri": DIFF_URI })).unwrap();
-        let html = got["contents"][0]["text"].as_str().unwrap();
-        assert!(html.contains("ui/notifications/tool-result"));
-        assert_eq!(got["contents"][0]["mimeType"], DIFF_MIME_CHATGPT);
+        assert_eq!(uris, vec![SKILL_URI]);
+        let got = resources_read(&json!({ "uri": SKILL_URI })).unwrap();
+        assert!(got["contents"][0]["text"].as_str().unwrap().contains("Hands"));
+        assert!(resources_read(&json!({ "uri": "ui://widget/diff-v1.html" })).is_err());
     }
 }
