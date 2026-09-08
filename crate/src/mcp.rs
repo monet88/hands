@@ -159,7 +159,14 @@ impl McpHost {
     pub async fn serve_stdio(self: Arc<Self>) -> Result<(), String> {
         let stdin = BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();
-        let mut stdout = tokio::io::stdout();
+        // Responses are written through a shared mutex so concurrent RPC
+        // handlers never interleave a JSON-RPC line. The primary transport
+        // (ChatGPT tunnel-client) correlates replies by `id`, so out-of-order
+        // completion is safe; this keeps one slow `tools/call` (e.g. a long
+        // foreground bash near the 2-minute command deadline) from blocking
+        // `ping`/`initialize` and every other request on the same channel.
+        let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+        let mut tasks = tokio::task::JoinSet::new();
         while let Some(line) = lines
             .next_line()
             .await
@@ -173,14 +180,31 @@ impl McpHost {
                 Ok(v) => v,
                 Err(e) => {
                     let err = rpc_error(Value::Null, -32700, format!("parse error: {e}"));
-                    write_line(&mut stdout, &err).await?;
+                    let out = Arc::clone(&stdout);
+                    tasks.spawn(async move {
+                        let mut guard = out.lock().await;
+                        let _ = write_line(&mut *guard, &err).await;
+                    });
                     continue;
                 }
             };
-            if let Some(resp) = self.handle_rpc(msg).await {
-                write_line(&mut stdout, &resp).await?;
-            }
+            let host = Arc::clone(&self);
+            let out = Arc::clone(&stdout);
+            tasks.spawn(async move {
+                if let Some(resp) = host.handle_rpc(msg).await {
+                    let mut guard = out.lock().await;
+                    let _ = write_line(&mut *guard, &resp).await;
+                }
+            });
         }
+        // Stdin closed: the client is done sending requests. Drain in-flight
+        // handlers so a partially-completed RPC (e.g. a bridge/tool still
+        // building) is not aborted mid-call — aborting one can crash the
+        // process via native process-group code. Handlers are bounded by their
+        // own tool timeout (default 120s), so this cannot hang indefinitely,
+        // and the sequential loop's prompt-exit is preserved for the common
+        // case where all handlers have already completed.
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 
