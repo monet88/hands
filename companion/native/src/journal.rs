@@ -231,6 +231,21 @@ pub fn compute_payload_digest(
     hex::encode(hasher.finalize())
 }
 
+pub fn is_supported_tool_policy(policy: &str) -> bool {
+    matches!(
+        policy.to_lowercase().trim(),
+        "standard" | "all" | "read_only" | "none" | "no_tools"
+    )
+}
+
+pub fn is_supported_approval_policy(policy: &str) -> bool {
+    matches!(
+        policy.to_lowercase().trim(),
+        "prompt" | "ask" | "write" | "auto" | "yolo"
+    )
+}
+
+
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
@@ -753,7 +768,6 @@ impl Journal {
             _ => PairingError::StorageError(e.to_string()),
         })
     }
-
 pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, PairingError> {
     let raw_path = Path::new(canonical_path_str);
     if !raw_path.exists() || !raw_path.is_dir() {
@@ -930,7 +944,9 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         };
 
         // Enforce supported policy values: fail closed on unsupported tool/approval policy
-        if policy_rec.tool_policy.trim().is_empty() || policy_rec.approval_policy.trim().is_empty() {
+        if !is_supported_tool_policy(&policy_rec.tool_policy)
+            || !is_supported_approval_policy(&policy_rec.approval_policy)
+        {
             return Err(PairingError::PolicyUnsupported);
         }
 

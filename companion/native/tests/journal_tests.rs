@@ -848,3 +848,121 @@ fn test_replay_preserves_execution_even_if_registered_policy_changes_later() {
     let new_res = journal.reserve_or_claim_launch(&new_params);
     assert_eq!(new_res.unwrap_err(), PairingError::PolicyMismatch);
 }
+
+#[test]
+fn test_unsupported_registered_policy_fails_closed_without_allocating_claim_or_tombstone() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+    let pairing_id = "pair_unsupported_pol";
+    let bootstrap_token = "bt_unsupp";
+    let profile_id = "prof_unsupp";
+    let target_canonical = "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string();
+    let targets = vec![TargetRecord {
+        target_id: "hands".to_string(),
+        canonical_path: target_canonical,
+        name: "hands".to_string(),
+    }];
+
+    // Seed a registered policy with unsupported tool_policy = "unrestricted"
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "unrestricted".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            "chrome",
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_unsupported_1".to_string(),
+        origin_conversation_id: "c_unsupported".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/c_unsupported".to_string(),
+        transcript_evidence_hash: "hash_t".to_string(),
+        account_evidence_hash: "hash_a".to_string(),
+        target_id: "hands".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "do unrestricted task".to_string(),
+    };
+
+    // 1. A NEW request with unsupported policy MUST fail before claim or tombstone allocation
+    let claim_res = journal.reserve_or_claim_launch(&params);
+    assert_eq!(claim_res.unwrap_err(), PairingError::PolicyUnsupported);
+
+    // 2. Prove ZERO launch_request, ZERO tombstone, and ZERO attempt in SQLite
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let lr_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM launch_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lr_count, 0, "Must be zero launch_requests in database");
+
+        let rt_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM replay_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rt_count, 0, "Must be zero replay_tombstones in database");
+    }
+
+    // 3. Preserve replay semantics: an already-accepted identical key replays its original execution
+    // Simulate an existing accepted launch request in DB
+    let original_exec_id = "exec_pre_accepted_99";
+    let original_ret_token = "ret_token_99";
+    let payload_digest = hands_return_bridge::journal::compute_payload_digest(
+        &params.origin_conversation_id,
+        &params.origin_conversation_url,
+        &params.transcript_evidence_hash,
+        &params.account_evidence_hash,
+        &params.target_id,
+        &params.policy_revision,
+        &params.prompt_text,
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO launch_requests (
+                pairing_id, launch_request_id, execution_id, return_token,
+                origin_conversation_id, origin_conversation_url,
+                transcript_evidence_hash, account_evidence_hash,
+                target_id, canonical_target_path,
+                policy_revision, effective_tool_policy, effective_approval_policy,
+                prompt_text, payload_digest, state, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1000, 1000
+            )
+            "#,
+            rusqlite::params![
+                pairing_id,
+                params.launch_request_id,
+                original_exec_id,
+                original_ret_token,
+                params.origin_conversation_id,
+                params.origin_conversation_url,
+                params.transcript_evidence_hash,
+                params.account_evidence_hash,
+                params.target_id,
+                targets[0].canonical_path,
+                params.policy_revision,
+                "standard",
+                "prompt",
+                params.prompt_text,
+                payload_digest,
+                "claimed",
+            ],
+        ).unwrap();
+    }
+
+    let replay_claim = journal.reserve_or_claim_launch(&params).unwrap();
+    assert!(replay_claim.is_replayed, "Accepted request must replay");
+    assert_eq!(replay_claim.execution_id, original_exec_id);
+    assert_eq!(replay_claim.return_token, original_ret_token);
+}

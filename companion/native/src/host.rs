@@ -4,7 +4,9 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::journal::{Journal, PolicyRecord, TargetRecord};
+use crate::journal::{
+    is_supported_approval_policy, is_supported_tool_policy, Journal, PolicyRecord, TargetRecord,
+};
 use crate::protocol::{
     ProtocolError, TRUST_NOTICE, handle_native_message, read_native_message, write_native_message,
 };
@@ -204,11 +206,17 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     if opts.policy_revision.trim().is_empty() {
         return Err(HostError::Storage("Missing required --policy-revision".to_string()));
     }
-    if opts.tool_policy.trim().is_empty() {
-        return Err(HostError::Storage("Missing required --tool-policy".to_string()));
+    if opts.tool_policy.trim().is_empty() || !is_supported_tool_policy(&opts.tool_policy) {
+        return Err(HostError::Storage(format!(
+            "Unsupported --tool-policy '{}'; must be one of: standard, all, read_only, none, no_tools",
+            opts.tool_policy
+        )));
     }
-    if opts.approval_policy.trim().is_empty() {
-        return Err(HostError::Storage("Missing required --approval-policy".to_string()));
+    if opts.approval_policy.trim().is_empty() || !is_supported_approval_policy(&opts.approval_policy) {
+        return Err(HostError::Storage(format!(
+            "Unsupported --approval-policy '{}'; must be one of: prompt, ask, write, auto, yolo",
+            opts.approval_policy
+        )));
     }
 
     let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;

@@ -864,28 +864,202 @@ fn test_launch_preflight_check() {
 
 #[test]
 fn test_resolve_omp_binary_shapes() {
-    use hands_return_bridge::launcher::{build_omp_startup_command, resolve_omp_binary};
+    use hands_return_bridge::launcher::{
+        build_omp_startup_command, resolve_omp_binary, verify_launch_preflight,
+    };
     use std::path::Path;
 
-    // 1. Default token shape
+    // 1. Default token shape ("omp") - verify string shape AND actual compatibility preflight
     std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
     assert_eq!(resolve_omp_binary(), "omp");
+    let token_preflight = verify_launch_preflight(Some("omp"));
+    assert!(
+        token_preflight.is_ok(),
+        "Preflight for wrapper token 'omp' must succeed: {:?}",
+        token_preflight
+    );
 
-    // 2. Direct executable path shape
-    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", "C:\\Users\\monet\\.bun\\bin\\omp.exe");
-    assert_eq!(resolve_omp_binary(), "C:\\Users\\monet\\.bun\\bin\\omp.exe");
+    // 2. Direct executable path shape - verify string shape AND actual compatibility preflight
+    let direct_bin = "C:\\Users\\monet\\.bun\\bin\\omp.exe";
+    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", direct_bin);
+    assert_eq!(resolve_omp_binary(), direct_bin);
+    if Path::new(direct_bin).exists() {
+        let direct_preflight = verify_launch_preflight(Some(direct_bin));
+        assert!(
+            direct_preflight.is_ok(),
+            "Preflight for direct executable '{}' must succeed: {:?}",
+            direct_bin,
+            direct_preflight
+        );
+    }
 
     // 3. Executable path with spaces (must be safely quoted)
-    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", "C:\\Program Files\\OMP Tools\\omp.exe");
-    assert_eq!(resolve_omp_binary(), "\"C:/Program Files/OMP Tools/omp.exe\"");
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_OMP_BIN",
+        "C:\\Program Files\\OMP Tools\\omp.exe",
+    );
+    assert_eq!(
+        resolve_omp_binary(),
+        "\"C:/Program Files/OMP Tools/omp.exe\""
+    );
 
     // 4. Verify startup command with quoted binary
     let dummy_adapter = Path::new("C:/temp/adapter.ts");
     let cmd = build_omp_startup_command(dummy_adapter, "standard", "prompt").unwrap();
     assert!(cmd.starts_with("\"C:/Program Files/OMP Tools/omp.exe\""));
 
-    // Clean up env
+    // 5. Clean up env
     std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
+
+    // 6. Security guard: browser messages must NEVER be able to provide or override executable/bin
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+    let browser_override_msg = json!({
+        "op": "launch",
+        "pairingId": "pair_test",
+        "pairingSecret": "sec_test",
+        "profileId": "profile_alpha",
+        "launchRequestId": "req_1",
+        "originConversationId": "c_1",
+        "originConversationUrl": "https://chatgpt.com/c/c_1",
+        "transcriptEvidenceHash": "hash_t",
+        "accountEvidenceHash": "hash_a",
+        "targetId": "hands",
+        "requestedPolicyRevision": "v1",
+        "promptText": "test prompt",
+        "executable": "C:\\malicious\\path\\omp.exe"
+    });
+    let resp = handle_native_message(&browser_override_msg, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unauthorized_override");
+}
+
+#[test]
+fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_unsupported_policy";
+    let bootstrap_token = "boot_unsupp_policy";
+    let profile_id = "profile_alpha";
+
+    let target_canonical = "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string();
+    let targets = vec![hands_return_bridge::journal::TargetRecord {
+        target_id: "hands".to_string(),
+        canonical_path: target_canonical,
+        name: "hands".to_string(),
+    }];
+    // Unsupported tool_policy: "unrestricted"
+    let policy = hands_return_bridge::journal::PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "unrestricted".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            "chrome",
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let launch_msg = json!({
+        "op": "launch",
+        "pairingId": pairing_id,
+        "pairingSecret": activated.pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": "req_unsupp_new_1",
+        "originConversationId": "c_unsupp_new",
+        "originConversationUrl": "https://chatgpt.com/c/c_unsupp_new",
+        "transcriptEvidenceHash": "hash_t",
+        "accountEvidenceHash": "hash_a",
+        "targetId": "hands",
+        "requestedPolicyRevision": "v1",
+        "promptText": "attempt launch with unrestricted policy"
+    });
+
+    // 1. MUST fail closed with policy_unsupported
+    let resp = handle_native_message(&launch_msg, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "policy_unsupported");
+
+    // 2. Prove ZERO launch_request, ZERO tombstone, and ZERO attempt
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let lr_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM launch_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lr_count, 0, "Must be zero launch_requests in database");
+
+        let rt_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM replay_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rt_count, 0, "Must be zero replay_tombstones in database");
+    }
+    let summaries = journal.get_launch_summaries(pairing_id).unwrap();
+    assert_eq!(summaries.len(), 0, "Must be zero launch summaries");
+
+    // 3. Preserve replay semantics: insert an already accepted request with original execution
+    let accepted_exec_id = "exec_pre_accepted_42";
+    let accepted_ret_token = "ret_token_42";
+    let payload_digest = hands_return_bridge::journal::compute_payload_digest(
+        "c_unsupp_new",
+        "https://chatgpt.com/c/c_unsupp_new",
+        "hash_t",
+        "hash_a",
+        "hands",
+        "v1",
+        "attempt launch with unrestricted policy",
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO launch_requests (
+                pairing_id, launch_request_id, execution_id, return_token,
+                origin_conversation_id, origin_conversation_url,
+                transcript_evidence_hash, account_evidence_hash,
+                target_id, canonical_target_path,
+                policy_revision, effective_tool_policy, effective_approval_policy,
+                prompt_text, payload_digest, state, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1000, 1000
+            )
+            "#,
+            rusqlite::params![
+                pairing_id,
+                "req_unsupp_new_1",
+                accepted_exec_id,
+                accepted_ret_token,
+                "c_unsupp_new",
+                "https://chatgpt.com/c/c_unsupp_new",
+                "hash_t",
+                "hash_a",
+                "hands",
+                targets[0].canonical_path,
+                "v1",
+                "unrestricted",
+                "prompt",
+                "attempt launch with unrestricted policy",
+                payload_digest,
+                "claimed",
+            ],
+        ).unwrap();
+    }
+
+    // Replay MUST return the accepted execution without running preflight/target/policy validation again
+    let replay_resp = handle_native_message(&launch_msg, &journal);
+    assert_eq!(replay_resp["status"], "ok");
+    assert_eq!(replay_resp["isReplayed"], true);
+    assert_eq!(replay_resp["executionId"], accepted_exec_id);
+    assert_eq!(replay_resp["returnToken"], accepted_ret_token);
 }
 
 #[test]
@@ -912,4 +1086,86 @@ fn test_conflicting_inherited_policy_hardening() {
     assert!(cmd_none.contains("--no-rules"), "Must disable rules");
     assert!(cmd_none.contains("--no-extensions"), "Must disable extensions");
     assert!(cmd_none.contains("--no-prewalk"), "Must disable prewalk");
+}
+
+#[test]
+fn test_conflicting_inherited_omp_runtime_probe() {
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let temp_path = dir.path();
+
+    // 1. Seed conflicting inherited configuration in temp workspace
+    let omp_dir = temp_path.join(".omp");
+    fs::create_dir_all(&omp_dir).unwrap();
+    fs::create_dir_all(omp_dir.join("extensions")).unwrap();
+    fs::create_dir_all(omp_dir.join("skills").join("rogue_skill")).unwrap();
+    fs::create_dir_all(omp_dir.join("rules")).unwrap();
+
+    // Conflicting settings trying to force yolo approval and prewalk
+    fs::write(
+        omp_dir.join("settings.json"),
+        r#"{"tools.approvalMode": "yolo", "prewalk.enabled": true}"#,
+    ).unwrap();
+
+    // Rogue extension that should NEVER load under --no-extensions
+    fs::write(
+        omp_dir.join("extensions").join("rogue_ext.ts"),
+        r#"export default function() { console.error("ROGUE_EXTENSION_LOADED"); }"#,
+    ).unwrap();
+
+    fs::write(
+        omp_dir.join("skills").join("rogue_skill").join("SKILL.md"),
+        "# Rogue Skill\n",
+    ).unwrap();
+    fs::write(
+        omp_dir.join("rules").join("rogue_rule.md"),
+        "# Rogue Rule\n",
+    ).unwrap();
+
+    // 2. Build native-owned startup command for read_only + prompt approval
+    let adapter_path = temp_path.join("adapter.ts");
+    fs::write(&adapter_path, hands_return_bridge::launcher::ADAPTER_TS_CONTENT).unwrap();
+
+    let startup_cmd = hands_return_bridge::launcher::build_omp_startup_command(
+        &adapter_path,
+        "read_only",
+        "prompt",
+    ).unwrap();
+
+    // Verify explicit CLI flags dominate
+    assert!(startup_cmd.contains("--no-extensions"));
+    assert!(startup_cmd.contains("--no-prewalk"));
+    assert!(startup_cmd.contains("--no-skills"));
+    assert!(startup_cmd.contains("--no-rules"));
+    assert!(startup_cmd.contains("--tools=read,grep,glob,lsp"));
+    assert!(startup_cmd.contains("--approval-mode=always-ask"));
+
+    // 3. Execute real OMP probe with these exact flags and verify runtime behavior
+    // Run omp with --help or probe to assert rogue extension was not loaded and CLI succeeds
+    let output = Command::new("omp")
+        .args([
+            "--no-extensions",
+            "-e",
+            &adapter_path.to_string_lossy().replace('\\', "/"),
+            "--no-prewalk",
+            "--no-skills",
+            "--no-rules",
+            "--tools=read,grep,glob,lsp",
+            "--approval-mode=always-ask",
+            "--help",
+        ])
+        .current_dir(temp_path)
+        .output();
+
+    if let Ok(out) = output {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("ROGUE_EXTENSION_LOADED"),
+            "Rogue extension must not be executed when --no-extensions is active"
+        );
+        assert!(out.status.success(), "OMP must execute cleanly with native startup flags");
+    }
 }

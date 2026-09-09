@@ -253,6 +253,7 @@ async function main() {
     });
 
     let alphaResult;
+    const launchBoundaryTime = Date.now() - 2000;
     try {
       const version = await waitForBrowserVersion(cdpPortAlpha);
       const loadedExtId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
@@ -296,35 +297,97 @@ async function main() {
         console.warn("      Failed to read terminal:", termErr.message);
       }
 
-      // 2. Exact literal prompt verification in real OMP session transcript
-      const sessionDir = path.join(os.homedir(), ".omp", "agent", "sessions", "--F--CodeBase-hands-issue-66-return-bridge-pairing--");
-      let promptVerified = false;
-      if (fs.existsSync(sessionDir)) {
-        const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
-        files.sort((a, b) => fs.statSync(path.join(sessionDir, b)).mtimeMs - fs.statSync(path.join(sessionDir, a)).mtimeMs);
-        for (const file of files.slice(0, 3)) {
-          const content = fs.readFileSync(path.join(sessionDir, file), "utf8");
-          const lines = content.trim().split("\n");
-          for (const line of lines) {
-            try {
-              const obj = JSON.parse(line);
-              if (obj.type === "message" && obj.message?.role === "user" && !obj.message?.steering) {
-                const text = obj.message.content?.[0]?.text;
-                if (text === expectedPrompt) {
-                  promptVerified = true;
-                  console.log(`      [PASS] Verified exact literal prompt delivered into OMP session unchanged:`);
-                  console.log(`             --flag, @some_file, "quotes", semicolon, pipe, Unicode, and newline preserved verbatim.`);
-                  break;
+      // 2. Exact literal prompt verification in dynamically resolved, current-run attributable OMP session transcript
+      function resolveOmpWorkspaceSessionDir(targetWorkspace) {
+        const sessionsBase = path.join(os.homedir(), ".omp", "agent", "sessions");
+        if (!fs.existsSync(sessionsBase)) return null;
+        const normalizedTarget = path.resolve(targetWorkspace).toLowerCase();
+
+        // 1. Scan existing session directories for matching cwd in session header
+        for (const entry of fs.readdirSync(sessionsBase)) {
+          const fullPath = path.join(sessionsBase, entry);
+          try {
+            if (!fs.statSync(fullPath).isDirectory()) continue;
+            const files = fs.readdirSync(fullPath).filter(f => f.endsWith(".jsonl"));
+            for (const file of files) {
+              try {
+                const headLines = fs.readFileSync(path.join(fullPath, file), "utf8").split("\n").slice(0, 3);
+                for (const line of headLines) {
+                  if (!line) continue;
+                  const parsed = JSON.parse(line);
+                  if (parsed.type === "session" && parsed.cwd && path.resolve(parsed.cwd).toLowerCase() === normalizedTarget) {
+                    return fullPath;
+                  }
                 }
-              }
-            } catch {}
-          }
+              } catch {}
+            }
+          } catch {}
+        }
+        // 2. Fallback to slug-derived directory path
+        const slug = "--" + targetWorkspace.replace(/[^a-zA-Z0-9]/g, "-") + "--";
+        const derived = path.join(sessionsBase, slug);
+        if (fs.existsSync(derived)) return derived;
+        return null;
+      }
+
+      const sessionDir = resolveOmpWorkspaceSessionDir(REPO_ROOT);
+      if (!sessionDir || !fs.existsSync(sessionDir)) {
+        throw new Error(`Could not dynamically resolve OMP session directory for workspace: ${REPO_ROOT}`);
+      }
+      console.log(`      Dynamically resolved OMP workspace session directory: ${sessionDir}`);
+
+      // Filter files created or modified after this launch boundary to guarantee current-run attribution
+      const pollStart = Date.now();
+      let promptVerified = false;
+      let matchedFile = null;
+
+      while (Date.now() - pollStart < 15000 && !promptVerified) {
+        const candidateFiles = fs.readdirSync(sessionDir)
+          .filter(f => f.endsWith(".jsonl"))
+          .filter(f => {
+            try {
+              const stats = fs.statSync(path.join(sessionDir, f));
+              return stats.mtimeMs >= launchBoundaryTime;
+            } catch {
+              return false;
+            }
+          });
+
+        candidateFiles.sort((a, b) => fs.statSync(path.join(sessionDir, b)).mtimeMs - fs.statSync(path.join(sessionDir, a)).mtimeMs);
+
+        for (const file of candidateFiles) {
+          const filePath = path.join(sessionDir, file);
+          try {
+            const content = fs.readFileSync(filePath, "utf8");
+            const lines = content.trim().split("\n");
+            for (const line of lines) {
+              try {
+                const obj = JSON.parse(line);
+                if (obj.type === "message" && obj.message?.role === "user" && !obj.message?.steering) {
+                  const text = obj.message.content?.[0]?.text;
+                  if (text === expectedPrompt) {
+                    promptVerified = true;
+                    matchedFile = file;
+                    break;
+                  }
+                }
+              } catch {}
+            }
+          } catch {}
           if (promptVerified) break;
         }
+
+        if (!promptVerified) {
+          await sleep(500);
+        }
       }
+
       if (!promptVerified) {
-        throw new Error(`Literal prompt was not found verbatim in OMP session transcript: expected ${JSON.stringify(expectedPrompt)}`);
+        throw new Error(`Literal prompt was not found verbatim in any current-run OMP session file after launch boundary: expected ${JSON.stringify(expectedPrompt)}`);
       }
+
+      console.log(`      [PASS] Verified exact literal prompt delivered into current-run OMP session: ${matchedFile}`);
+      console.log(`             Leading --flag, @some_file, "quotes", semicolon, pipe, Unicode, and newline preserved verbatim.`);
 
       console.log(`      Cleaning up test-owned Orca terminal: ${termHandle}`);
       try {

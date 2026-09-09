@@ -159,13 +159,15 @@ window.startTest = async function(config = {}) {
 
       await ensureMockChatGptDom();
 
+      const runNonce = Date.now().toString(36);
+      const testPrompt = `--flag @some_file "quotes" ; echo pipe | unicode: Đại Ca ${runNonce}\nsecond_line_preserved`;
       const launchPayload = {
         action: "launch",
         launchRequestId: launchReqId,
         tabId: chatTab.id,
         targetId: validTargetId,
         requestedPolicyRevision: "v1",
-        promptText: 'Test literal task prompt: --flag @some_file "quotes" ; echo pipe | unicode: Đại Ca \n line2'
+        promptText: testPrompt
       };
 
       const internalLaunchResp = await chrome.runtime.sendMessage(launchPayload);

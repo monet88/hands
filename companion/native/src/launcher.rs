@@ -285,10 +285,16 @@ pub fn wait_orca_terminal_idle(terminal_handle: &str, timeout_ms: u64) -> Result
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
+        let out_msg = String::from_utf8_lossy(&output.stdout);
+        let detail = if !err_msg.trim().is_empty() {
+            err_msg.trim()
+        } else {
+            out_msg.trim()
+        };
         return Err(LauncherError::OrcaExecutionUncertain(format!(
             "Orca terminal wait returned exit code {:?}: {}",
             output.status.code(),
-            err_msg.trim()
+            detail
         )));
     }
 
@@ -306,14 +312,14 @@ pub fn wait_orca_terminal_idle(terminal_handle: &str, timeout_ms: u64) -> Result
 
 /// Sends exact bounded task prompt as literal text data to terminal via Command argv
 pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) -> Result<(), LauncherError> {
+    let text_arg = format!("--text={}", literal_prompt);
     let output = Command::new("orca")
         .args([
             "terminal",
             "send",
             "--terminal",
             terminal_handle,
-            "--text",
-            literal_prompt,
+            &text_arg,
             "--enter",
             "--json",
         ])
@@ -322,10 +328,16 @@ pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) ->
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
+        let out_msg = String::from_utf8_lossy(&output.stdout);
+        let detail = if !err_msg.trim().is_empty() {
+            err_msg.trim()
+        } else {
+            out_msg.trim()
+        };
         return Err(LauncherError::OrcaExecutionUncertain(format!(
             "Orca terminal send returned exit code {:?}: {}",
             output.status.code(),
-            err_msg.trim()
+            detail
         )));
     }
 
