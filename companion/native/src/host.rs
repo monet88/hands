@@ -258,9 +258,10 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         .map_err(|e| HostError::Storage(e.to_string()))?;
 
     // Persist expected extension ID in journal configuration
-    journal
-        .set_expected_extension_id(&opts.extension_id)
-        .map_err(|e| HostError::Storage(e.to_string()))?;
+    if let Err(e) = journal.set_expected_extension_id(&opts.extension_id) {
+        let _ = journal.delete_pairing(&pairing_id);
+        return Err(HostError::Storage(e.to_string()));
+    }
 
     // Generate manifest
     let current_exe = match std::env::current_exe() {

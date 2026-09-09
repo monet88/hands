@@ -75,6 +75,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try {
       const profileId = await getOrCreateProfileId();
 
+      // Gate: Secret-bearing actions must fail-closed if storage isolation is not established
+      if (["setup", "status", "connect", "revoke"].includes(request.action)) {
+        const isTrustedStorage = await ensureStorageAccessLevel();
+        if (!isTrustedStorage) {
+          sendResponse({
+            status: "error",
+            code: "storage_isolation_unavailable",
+            message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
+          });
+          return;
+        }
+      }
+
       switch (request.action) {
         case "getState": {
           const isTrustedStorage = await ensureStorageAccessLevel();
@@ -114,16 +127,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "setup": {
-          const isTrustedStorage = await ensureStorageAccessLevel();
-          if (!isTrustedStorage) {
-            sendResponse({
-              status: "error",
-              code: "storage_isolation_unavailable",
-              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
-            });
-            return;
-          }
-
           const token = request.bootstrapToken?.trim();
           if (!token) {
             sendResponse({ status: "error", code: "missing_token", message: "Bootstrap token is required" });
@@ -159,16 +162,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "status": {
-          const isTrustedStorage = await ensureStorageAccessLevel();
-          if (!isTrustedStorage) {
-            sendResponse({
-              status: "error",
-              code: "storage_isolation_unavailable",
-              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
-            });
-            return;
-          }
-
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "ok", isPaired: false, profileId });
@@ -203,16 +196,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "connect": {
-          const isTrustedStorage = await ensureStorageAccessLevel();
-          if (!isTrustedStorage) {
-            sendResponse({
-              status: "error",
-              code: "storage_isolation_unavailable",
-              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
-            });
-            return;
-          }
-
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
@@ -231,16 +214,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "revoke": {
-          const isTrustedStorage = await ensureStorageAccessLevel();
-          if (!isTrustedStorage) {
-            sendResponse({
-              status: "error",
-              code: "storage_isolation_unavailable",
-              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
-            });
-            return;
-          }
-
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "ok", message: "Already unpaired" });

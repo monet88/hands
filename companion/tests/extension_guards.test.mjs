@@ -1,173 +1,257 @@
-// Focused unit and regression tests for extension guards:
-// 1. Confused-deputy protection against content script messages
-// 2. Fail-closed storage access level isolation
-
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
 import assert from "node:assert/strict";
 
-const EXTENSION_ID = "mkkajdpmlmliildflmnnmfndboldnnfa";
+const BACKGROUND_JS_PATH = path.resolve("companion/extension/background.js");
+const backgroundCode = fs.readFileSync(BACKGROUND_JS_PATH, "utf8");
 
-// Recreate the pure guard logic from companion/extension/background.js
-function isTrustedExtensionSender(sender, currentExtId = EXTENSION_ID) {
-  if (!sender || sender.id !== currentExtId) {
-    return false;
-  }
-  const extensionOriginPrefix = `chrome-extension://${currentExtId}/`;
-  if (typeof sender.url !== "string" || !sender.url.startsWith(extensionOriginPrefix)) {
-    return false;
-  }
-  return true;
-}
+function createTestHarness({
+  extensionId = "mkkajdpmlmliildflmnnmfndboldnnfa",
+  failSetAccessLevel = false,
+  missingSetAccessLevel = false,
+  nativeResponse = { status: "ok", pairingId: "pair_123", pairingSecret: "rb_sec_456" },
+  initialStorage = {}
+} = {}) {
+  const storageStore = { ...initialStorage };
+  let capturedListener = null;
+  const nativeMessagesSent = [];
 
-console.log("Running extension guard regression tests...");
-
-// Test 1: Reject content script on chatgpt.com (confused deputy protection)
-{
-  const contentScriptSender = {
-    id: EXTENSION_ID,
-    url: "https://chatgpt.com/c/test-chat-session"
-  };
-  assert.equal(
-    isTrustedExtensionSender(contentScriptSender),
-    false,
-    "Content script on chatgpt.com sharing extension ID must be rejected"
-  );
-}
-
-// Test 2: Reject arbitrary web page sender
-{
-  const webSender = {
-    id: EXTENSION_ID,
-    url: "https://malicious.example.com/exploit.html"
-  };
-  assert.equal(
-    isTrustedExtensionSender(webSender),
-    false,
-    "Arbitrary web page sharing extension ID must be rejected"
-  );
-}
-
-// Test 3: Reject external extension sender with differing ID
-{
-  const foreignExtSender = {
-    id: "different_extension_id_abcdefghijkl",
-    url: "chrome-extension://different_extension_id_abcdefghijkl/options.html"
-  };
-  assert.equal(
-    isTrustedExtensionSender(foreignExtSender),
-    false,
-    "Foreign extension sender must be rejected"
-  );
-}
-
-// Test 4: Accept trusted extension documents
-{
-  const optionsSender = {
-    id: EXTENSION_ID,
-    url: `chrome-extension://${EXTENSION_ID}/options.html`
-  };
-  assert.equal(
-    isTrustedExtensionSender(optionsSender),
-    true,
-    "Options page document must be accepted"
-  );
-
-  const popupSender = {
-    id: EXTENSION_ID,
-    url: `chrome-extension://${EXTENSION_ID}/popup.html`
-  };
-  assert.equal(
-    isTrustedExtensionSender(popupSender),
-    true,
-    "Popup document must be accepted"
-  );
-
-  const testRunnerSender = {
-    id: EXTENSION_ID,
-    url: `chrome-extension://${EXTENSION_ID}/test_runner.html`
-  };
-  assert.equal(
-    isTrustedExtensionSender(testRunnerSender),
-    true,
-    "Test runner document must be accepted"
-  );
-}
-
-// Test 5: Fail-closed storage access level verification
-{
-  // Simulate environment where setAccessLevel fails
-  let accessLevelSet = false;
-  let mockStorage = {
-    local: {
-      async setAccessLevel({ accessLevel }) {
-        throw new Error("setAccessLevel is not supported or permission denied");
+  const mockChrome = {
+    runtime: {
+      id: extensionId,
+      onInstalled: {
+        addListener() {}
       },
-      async get(keys) {
-        return { pairingSecret: "rb_sec_leak_attempt" };
+      onMessage: {
+        addListener(fn) {
+          capturedListener = fn;
+        }
       },
-      async set(items) {
-        // no-op
+      sendNativeMessage(host, msg, cb) {
+        nativeMessagesSent.push({ host, msg });
+        cb(nativeResponse);
+      }
+    },
+    storage: {
+      local: {
+        async get(keys) {
+          if (!keys) return { ...storageStore };
+          if (Array.isArray(keys)) {
+            const res = {};
+            for (const k of keys) {
+              if (k in storageStore) res[k] = storageStore[k];
+            }
+            return res;
+          }
+          return { [keys]: storageStore[keys] };
+        },
+        async set(items) {
+          Object.assign(storageStore, items);
+        },
+        async remove(keys) {
+          const arr = Array.isArray(keys) ? keys : [keys];
+          for (const k of arr) {
+            delete storageStore[k];
+          }
+        }
       }
     }
   };
 
-  let storageAccessLevelEstablished = false;
-  async function ensureStorageAccessLevel() {
-    if (storageAccessLevelEstablished) return true;
-    if (mockStorage.local.setAccessLevel) {
-      try {
-        await mockStorage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
-        storageAccessLevelEstablished = true;
-        return true;
-      } catch (err) {
-        storageAccessLevelEstablished = false;
-        return false;
+  if (!missingSetAccessLevel) {
+    mockChrome.storage.local.setAccessLevel = async () => {
+      if (failSetAccessLevel) {
+        throw new Error("Simulated storage setAccessLevel failure");
       }
-    }
-    return false;
-  }
-
-  // Verify ensureStorageAccessLevel returns false when setAccessLevel fails
-  const established = await ensureStorageAccessLevel();
-  assert.equal(established, false, "ensureStorageAccessLevel must return false on failure");
-
-  // Verify fail-closed behavior: secret-bearing action must reject immediately without touching storage
-  async function handleSetupAction() {
-    const isTrustedStorage = await ensureStorageAccessLevel();
-    if (!isTrustedStorage) {
-      return {
-        status: "error",
-        code: "storage_isolation_unavailable",
-        message: "Storage isolation (TRUSTED_CONTEXTS) could not be established."
-      };
-    }
-    // Should never reach here
-    return { status: "ok" };
-  }
-
-  const result = await handleSetupAction();
-  assert.equal(result.status, "error");
-  assert.equal(result.code, "storage_isolation_unavailable");
-
-  // Verify getState does NOT claim TRUSTED_CONTEXTS when isolation is unavailable
-  async function handleGetState() {
-    const isTrustedStorage = await ensureStorageAccessLevel();
-    if (!isTrustedStorage) {
-      return {
-        status: "ok",
-        isPaired: false,
-        pairingId: null,
-        storageAccessLevel: "UNTRUSTED"
-      };
-    }
-    return {
-      status: "ok",
-      storageAccessLevel: "TRUSTED_CONTEXTS"
     };
   }
 
-  const state = await handleGetState();
-  assert.equal(state.storageAccessLevel, "UNTRUSTED");
-  assert.equal(state.isPaired, false);
+  const context = vm.createContext({
+    chrome: mockChrome,
+    crypto: globalThis.crypto,
+    console: {
+      log() {},
+      warn() {},
+      error() {}
+    },
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    Promise: globalThis.Promise
+  });
+
+  // Execute the REAL background.js in VM
+  vm.runInContext(backgroundCode, context);
+
+  assert.ok(capturedListener, "background.js must register an onMessage listener");
+
+  async function sendMessage(request, sender) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      capturedListener(request, sender, (response) => {
+        resolved = true;
+        resolve(response);
+      });
+      // Synchronous rejection branch
+      queueMicrotask(() => {
+        if (!resolved) {
+          // If sendResponse was not called asynchronously
+        }
+      });
+    });
+  }
+
+  return {
+    extensionId,
+    sendMessage,
+    storageStore,
+    nativeMessagesSent
+  };
 }
 
-console.log("All extension guard regression tests passed cleanly!");
+async function runTests() {
+  console.log("Running real background.js harness tests...");
+
+  // ---------------------------------------------------------------------------
+  // Test 1: Untrusted web-page sender rejection (Confused-deputy protection)
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness();
+    const untrustedSenders = [
+      // Content script on chatgpt.com sharing the extension ID
+      { id: harness.extensionId, url: "https://chatgpt.com/c/session1" },
+      // Arbitrary web page sender sharing the extension ID
+      { id: harness.extensionId, url: "https://malicious.example.com/exploit.html" },
+      // External extension sender
+      { id: "foreign_extension_id_abcdef", url: "chrome-extension://foreign_extension_id_abcdef/options.html" },
+      // Missing or non-string URL
+      { id: harness.extensionId, url: null },
+      { id: harness.extensionId, url: undefined },
+      // Empty or missing sender
+      null,
+      undefined
+    ];
+
+    for (const sender of untrustedSenders) {
+      const res = await harness.sendMessage({ action: "getState" }, sender);
+      assert.equal(res?.status, "error");
+      assert.equal(res?.code, "unauthorized_sender");
+    }
+
+    assert.equal(
+      harness.nativeMessagesSent.length,
+      0,
+      "No native messaging must occur for untrusted senders"
+    );
+    console.log("  [PASS] Untrusted web-page senders rejected (confused-deputy protection)");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 2: Trusted extension-document acceptance
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness();
+    const optionsSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/options.html`
+    };
+    const testRunnerSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/test_runner.html`
+    };
+
+    const state1 = await harness.sendMessage({ action: "getState" }, optionsSender);
+    assert.equal(state1.status, "ok");
+    assert.equal(state1.storageAccessLevel, "TRUSTED_CONTEXTS");
+    assert.ok(state1.profileId.startsWith("prof_"));
+
+    const state2 = await harness.sendMessage({ action: "getState" }, testRunnerSender);
+    assert.equal(state2.status, "ok");
+    assert.equal(state2.storageAccessLevel, "TRUSTED_CONTEXTS");
+
+    console.log("  [PASS] Trusted extension documents accepted");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 3: Storage-isolation failure blocks secret-bearing actions fail closed
+  //         before credential storage or native messaging
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness({
+      failSetAccessLevel: true,
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_existing",
+        pairingSecret: "rb_sec_existing"
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/options.html`
+    };
+
+    // A. Setup must reject without native messaging or saving credentials
+    const setupRes = await harness.sendMessage(
+      { action: "setup", bootstrapToken: "rb_boot_secret_token" },
+      trustedSender
+    );
+    assert.equal(setupRes.status, "error");
+    assert.equal(setupRes.code, "storage_isolation_unavailable");
+    assert.equal(harness.nativeMessagesSent.length, 0, "Native messaging must NOT be invoked when storage isolation fails");
+
+    // B. Status must reject without native messaging
+    const statusRes = await harness.sendMessage({ action: "status" }, trustedSender);
+    assert.equal(statusRes.status, "error");
+    assert.equal(statusRes.code, "storage_isolation_unavailable");
+    assert.equal(harness.nativeMessagesSent.length, 0);
+
+    // C. Connect must reject without native messaging
+    const connectRes = await harness.sendMessage({ action: "connect" }, trustedSender);
+    assert.equal(connectRes.status, "error");
+    assert.equal(connectRes.code, "storage_isolation_unavailable");
+    assert.equal(harness.nativeMessagesSent.length, 0);
+
+    // D. Revoke must reject without native messaging
+    const revokeRes = await harness.sendMessage({ action: "revoke" }, trustedSender);
+    assert.equal(revokeRes.status, "error");
+    assert.equal(revokeRes.code, "storage_isolation_unavailable");
+    assert.equal(harness.nativeMessagesSent.length, 0);
+
+    console.log("  [PASS] Storage-isolation failure blocks setup/status/connect/revoke before credential storage/native messaging");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 4: getState reports untrusted and unpaired when isolation fails
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness({
+      failSetAccessLevel: true,
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_existing",
+        pairingSecret: "rb_sec_existing"
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/options.html`
+    };
+
+    const state = await harness.sendMessage({ action: "getState" }, trustedSender);
+    assert.equal(state.status, "ok");
+    assert.equal(state.storageAccessLevel, "UNTRUSTED");
+    assert.equal(state.isPaired, false, "Must report unpaired when storage isolation is untrusted");
+    assert.equal(state.pairingId, null);
+
+    console.log("  [PASS] getState reports untrusted/unpaired when storage isolation fails");
+  }
+
+  console.log("ALL real background.js harness tests PASSED CLEANLY!");
+}
+
+runTests().catch((err) => {
+  console.error("Test failed:", err);
+  process.exit(1);
+});

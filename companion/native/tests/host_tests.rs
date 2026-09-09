@@ -271,3 +271,39 @@ fn test_setup_skip_registry_semantics() {
     let result = execute_setup(&opts);
     assert!(result.is_ok(), "--skip-registry must allow isolated setup without platform registry side effects");
 }
+
+#[test]
+#[cfg(not(windows))]
+fn test_non_windows_setup_fails_closed_without_skip_registry() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("should_not_exist");
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_path = target_dir.path().to_str().unwrap().to_string();
+
+    let opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "test_profile_1".to_string(),
+        target_path,
+        target_id: Some("test_target".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_id_123".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    };
+
+    let result = execute_setup(&opts);
+    assert!(result.is_err(), "execute_setup without --skip-registry must fail on non-Windows");
+    match result.unwrap_err() {
+        HostError::Registry(msg) => {
+            assert!(msg.contains("automatic registration is only supported on Windows"));
+        }
+        other => panic!("Expected HostError::Registry, got {:?}", other),
+    }
+
+    // Assert zero durable side effects before error return
+    assert!(!state_dir.exists(), "state_dir must not be created when registration check fails");
+}
