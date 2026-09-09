@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hands Return Bridge</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      width: 340px;
+      margin: 0;
+      padding: 16px;
+      color: #222;
+      background: #fafafa;
+    }
+    h2 {
+      font-size: 16px;
+      margin-top: 0;
+      margin-bottom: 8px;
+      color: #111;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 12px;
+      margin-bottom: 12px;
+    }
+    .badge-paired {
+      background: #d4edda;
+      color: #155724;
+    }
+    .badge-unpaired {
+      background: #fff3cd;
+      color: #856404;
+    }
+    .notice-box {
+      font-size: 11px;
+      background: #fdf2e9;
+      border-left: 3px solid #e67e22;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+      line-height: 1.4;
+      color: #7d3c00;
+    }
+    .field-row {
+      font-size: 12px;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .field-label {
+      color: #666;
+    }
+    .field-value {
+      font-weight: 500;
+      font-family: monospace;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      margin-top: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+      background: #0066cc;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn:hover {
+      background: #0052a3;
+    }
+    .btn-secondary {
+      background: #e0e0e0;
+      color: #333;
+    }
+    .btn-secondary:hover {
+      background: #d0d0d0;
+    }
+  </style>
+</head>
+<body>
+  <h2>Hands Return Bridge</h2>
+  <div id="statusBadge" class="badge badge-unpaired">Checking status...</div>
+
+  <div class="notice-box">
+    <strong>Security Notice:</strong> A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.
+  </div>
+
+  <div id="pairedContent" style="display: none;">
+    <div class="field-row">
+      <span class="field-label">Profile ID:</span>
+      <span id="profileIdVal" class="field-value">-</span>
+    </div>
+    <div class="field-row">
+      <span class="field-label">Pairing ID:</span>
+      <span id="pairingIdVal" class="field-value">-</span>
+    </div>
+    <div class="field-row">
+      <span class="field-label">Policy Revision:</span>
+      <span id="policyRevVal" class="field-value">-</span>
+    </div>
+    <div class="field-row">
+      <span class="field-label">Registered Targets:</span>
+      <span id="targetsVal" class="field-value">-</span>
+    </div>
+    <button id="btnOptions" class="btn btn-secondary">Settings & Pairing</button>
+  </div>
+
+  <div id="unpairedContent" style="display: none;">
+    <p style="font-size: 13px; color: #555;">This browser profile is not paired with a local Hands companion host.</p>
+    <div class="field-row">
+      <span class="field-label">Profile ID:</span>
+      <span id="unpairedProfileId" class="field-value">-</span>
+    </div>
+    <button id="btnPair" class="btn">Pair This Profile</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

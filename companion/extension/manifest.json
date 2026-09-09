@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Hands Return Bridge",
+  "version": "0.1.0",
+  "description": "Companion extension for Hands Return Bridge",
+  "permissions": [
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Hands Return Bridge"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "test_runner.html",
+        "test_runner.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
