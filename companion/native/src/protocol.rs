@@ -91,11 +91,13 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
     const FORBIDDEN_FIELDS: &[&str] = &[
         "targets",
         "target",
+        "canonicalPath",
         "policy",
         "policyRevision",
         "toolPolicy",
         "approvalPolicy",
         "executable",
+        "cwd",
         "adapter",
         "argv",
         "environment",
@@ -125,15 +127,38 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
         }
     };
 
-    match op {
+    // Strict per-op field allowlists: reject unknown, unapproved, or filesystem/command fields
+    let allowed_fields: &[&str] = match op {
+        "setup" => &["op", "bootstrapToken", "profileId"],
+        "connect" | "status" | "revoke" => &["op", "pairingId", "pairingSecret", "profileId"],
         "launch" => {
-            // Task execution remains unavailable until the owned-launch slice lands (#67)
-            json!({
+            // Task execution remains unavailable under #66
+            return json!({
                 "status": "error",
                 "code": "task_execution_unavailable",
                 "message": "Task execution is unavailable until owned-launch slice lands (#67)"
-            })
+            });
         }
+        _ => {
+            return json!({
+                "status": "error",
+                "code": "unsupported_operation",
+                "message": format!("Unsupported operation: {}", op)
+            });
+        }
+    };
+
+    for key in obj.keys() {
+        if !allowed_fields.contains(&key.as_str()) {
+            return json!({
+                "status": "error",
+                "code": "unexpected_field",
+                "message": format!("Unexpected or unapproved field '{}' for op '{}'", key, op)
+            });
+        }
+    }
+
+    match op {
         "setup" => {
             let bootstrap_token = match obj.get("bootstrapToken").and_then(|v| v.as_str()) {
                 Some(t) if !t.trim().is_empty() => t.trim(),

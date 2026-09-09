@@ -179,3 +179,136 @@ fn test_closed_operation_set_and_security_guards() {
     assert_eq!(retired_resp["status"], "error");
     assert_eq!(retired_resp["code"], "pairing_retired");
 }
+
+#[test]
+fn test_unapproved_fields_rejected_on_valid_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_field_test";
+    let bootstrap_token = "boot_field_token_123";
+    let browser = "chrome";
+    let profile_id = "profile_field";
+    let targets = vec![TargetRecord {
+        target_id: "target_canonical".to_string(),
+        canonical_path: "F:\\CodeBase\\hands".to_string(),
+        name: "hands".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            browser,
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .expect("Bootstrap failed");
+
+    // 1. setup with filesystem/command/arbitrary field must be rejected
+    let bad_setup = json!({
+        "op": "setup",
+        "bootstrapToken": bootstrap_token,
+        "profileId": profile_id,
+        "command": "whoami"
+    });
+    let resp = handle_native_message(&bad_setup, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    let bad_setup_path = json!({
+        "op": "setup",
+        "bootstrapToken": bootstrap_token,
+        "profileId": profile_id,
+        "path": "C:\\Windows\\System32"
+    });
+    let resp = handle_native_message(&bad_setup_path, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    // Perform valid setup to get credentials
+    let setup_msg = json!({
+        "op": "setup",
+        "bootstrapToken": bootstrap_token,
+        "profileId": profile_id
+    });
+    let setup_resp = handle_native_message(&setup_msg, &journal);
+    assert_eq!(setup_resp["status"], "ok");
+    let pairing_secret = setup_resp["pairingSecret"].as_str().unwrap();
+
+    // 2. connect with targetId / shell / command / prompt / unknown fields must be rejected
+    let bad_connect_target_id = json!({
+        "op": "connect",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "targetId": "malicious_target"
+    });
+    let resp = handle_native_message(&bad_connect_target_id, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    let bad_connect_shell = json!({
+        "op": "connect",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "shell": "cmd.exe"
+    });
+    let resp = handle_native_message(&bad_connect_shell, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    let bad_connect_prompt = json!({
+        "op": "connect",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "prompt": "execute malicious command"
+    });
+    let resp = handle_native_message(&bad_connect_prompt, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    let bad_connect_arbitrary = json!({
+        "op": "connect",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "unknownFieldXYZ": 123
+    });
+    let resp = handle_native_message(&bad_connect_arbitrary, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    // 3. status with unexpected field must be rejected
+    let bad_status = json!({
+        "op": "status",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "extra": "value"
+    });
+    let resp = handle_native_message(&bad_status, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+
+    // 4. revoke with unexpected field must be rejected
+    let bad_revoke = json!({
+        "op": "revoke",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "force": true
+    });
+    let resp = handle_native_message(&bad_revoke, &journal);
+    assert_eq!(resp["status"], "error");
+    assert_eq!(resp["code"], "unexpected_field");
+}

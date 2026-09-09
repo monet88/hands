@@ -191,6 +191,29 @@ fn test_run_native_host_exact_origin_authority() {
     // Case 3: Scheme prefix only without matching ID must be rejected
     let err_scheme = run_native_host(Some(&state_dir), Some("chrome-extension://other/"));
     assert!(err_scheme.is_err(), "Non-matching scheme prefix origin must be rejected");
+
+    // Case 4: Forged/tampered manifest with attacker origin cannot authorize when journal authority has different ID
+    let manifest_path = state_dir.join("com.hands.return_bridge.json");
+    let forged_manifest = serde_json::json!({
+        "name": "com.hands.return_bridge",
+        "description": "Forged manifest",
+        "path": "hands-return-bridge.exe",
+        "type": "stdio",
+        "allowed_origins": ["chrome-extension://forged_attacker_ext_id/"]
+    });
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&forged_manifest).unwrap()).unwrap();
+
+    let err_forged = run_native_host(Some(&state_dir), Some("chrome-extension://forged_attacker_ext_id/"));
+    assert!(err_forged.is_err(), "Forged manifest must not authorize origin when journal authority does not match");
+
+    // Case 5: Forged manifest when journal has no expected_extension_id configured must fail closed (no fallback)
+    {
+        let db_path = state_dir.join("journal.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM host_config WHERE key = 'expected_extension_id'", []).unwrap();
+    }
+    let err_no_journal = run_native_host(Some(&state_dir), Some("chrome-extension://forged_attacker_ext_id/"));
+    assert!(err_no_journal.is_err(), "Manifest must not be used as fallback when journal authority is absent");
 }
 
 #[test]
@@ -306,4 +329,93 @@ fn test_non_windows_setup_fails_closed_without_skip_registry() {
 
     // Assert zero durable side effects before error return
     assert!(!state_dir.exists(), "state_dir must not be created when registration check fails");
+}
+
+#[test]
+fn test_setup_a_remains_authoritative_after_competing_setup_b_fails() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_path = target_dir.path().to_str().unwrap().to_string();
+
+    let ext_a = "authoritative_extension_id_aaa".to_string();
+    let ext_b = "competing_malicious_id_bbb".to_string();
+
+    // 1. Setup A succeeds and configures authoritative extension ID
+    let opts_a = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_a".to_string(),
+        target_path: target_path.clone(),
+        target_id: Some("target_a".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: ext_a.clone(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    let res_a = execute_setup(&opts_a);
+    assert!(res_a.is_ok(), "Setup A must succeed");
+
+    // Verify authoritative ID is recorded in journal
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    assert_eq!(journal.get_expected_extension_id().unwrap().as_deref(), Some(ext_a.as_str()));
+
+    // 2. Competing Setup B attempts to configure a different extension ID in the same state directory
+    let opts_b = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_b".to_string(),
+        target_path: target_path.clone(),
+        target_id: Some("target_b".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: ext_b.clone(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    let res_b = execute_setup(&opts_b);
+    assert!(res_b.is_err(), "Setup B with different extension ID must fail closed");
+    match res_b.unwrap_err() {
+        HostError::Storage(msg) => {
+            assert!(msg.contains("cannot overwrite"));
+        }
+        other => panic!("Expected HostError::Storage, got {:?}", other),
+    }
+
+    // 3. Setup A remains authoritative
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some(ext_a.as_str()),
+        "Authoritative extension ID from Setup A must not be clobbered"
+    );
+
+    // Origin validation continues to authorize ONLY extension A
+    let origin_a = format!("chrome-extension://{}/", ext_a);
+    let origin_b = format!("chrome-extension://{}/", ext_b);
+
+    // Origin B must be rejected
+    let err_b = run_native_host(Some(&state_dir), Some(&origin_b));
+    assert!(err_b.is_err(), "Origin B must be rejected");
+
+    // 4. Identical reuse by a compatible setup succeeds
+    let opts_a_reuse = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_a2".to_string(),
+        target_path,
+        target_id: Some("target_a2".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: ext_a.clone(),
+        state_dir: Some(state_dir),
+        skip_registry: true,
+    };
+    let res_reuse = execute_setup(&opts_a_reuse);
+    assert!(res_reuse.is_ok(), "Setup reusing identical extension ID must succeed");
 }

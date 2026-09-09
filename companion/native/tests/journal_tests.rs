@@ -283,3 +283,86 @@ fn test_bootstrap_persistence_atomic_rollback_on_failure() {
     let targets_res = journal.get_targets(pairing_id).unwrap();
     assert!(targets_res.is_empty(), "Rolled back targets must be empty");
 }
+
+#[test]
+fn test_empty_stored_profile_id_fails_closed_on_auth_and_revoke() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_corrupt_profile";
+    let bootstrap_token = "boot_corrupt_token_123";
+    let browser = "chrome";
+    let profile_id = "profile_alpha";
+    let targets = vec![TargetRecord {
+        target_id: "target_corrupt".to_string(),
+        canonical_path: "/workspace/corrupt".to_string(),
+        name: "corrupt".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            browser,
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .expect("Create bootstrap failed");
+
+    let act = journal
+        .activate_bootstrap(bootstrap_token, profile_id)
+        .expect("Activation failed");
+    let pairing_secret = act.pairing_secret;
+
+    // Corrupt the stored pairing profile_id to empty string directly in SQLite
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE pairings SET profile_id = '' WHERE pairing_id = ?1",
+            rusqlite::params![pairing_id],
+        )
+        .unwrap();
+    }
+
+    // Reopen journal or use existing handle
+    let reopened = Journal::open(&db_path).expect("Failed to reopen journal");
+
+    // Authenticate with empty string profile must fail closed
+    let err_empty = reopened.authenticate_pairing(pairing_id, &pairing_secret, "");
+    assert_eq!(
+        err_empty.unwrap_err(),
+        PairingError::ProfileMismatch,
+        "Empty profile_id must not bypass authentication"
+    );
+
+    // Authenticate with original profile must fail closed
+    let err_orig = reopened.authenticate_pairing(pairing_id, &pairing_secret, "profile_alpha");
+    assert_eq!(
+        err_orig.unwrap_err(),
+        PairingError::ProfileMismatch,
+        "Corrupted empty profile must fail closed against original profile"
+    );
+
+    // Revoke must also fail closed
+    let err_revoke_empty = reopened.revoke_pairing(pairing_id, &pairing_secret, "");
+    assert_eq!(
+        err_revoke_empty.unwrap_err(),
+        PairingError::ProfileMismatch,
+        "Revoke with empty profile must fail closed"
+    );
+
+    let err_revoke_orig = reopened.revoke_pairing(pairing_id, &pairing_secret, "profile_alpha");
+    assert_eq!(
+        err_revoke_orig.unwrap_err(),
+        PairingError::ProfileMismatch,
+        "Revoke against corrupt empty profile must fail closed"
+    );
+}

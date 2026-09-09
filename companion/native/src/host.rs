@@ -257,17 +257,24 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         )
         .map_err(|e| HostError::Storage(e.to_string()))?;
 
-    // Persist expected extension ID in journal configuration
-    if let Err(e) = journal.set_expected_extension_id(&opts.extension_id) {
-        let _ = journal.delete_pairing(&pairing_id);
-        return Err(HostError::Storage(e.to_string()));
-    }
+    // Persist expected extension ID in journal configuration.
+    // An existing expected extension ID may only be reused if identical; a different ID must be rejected.
+    let newly_set_ext_id = match journal.set_expected_extension_id(&opts.extension_id) {
+        Ok(newly_set) => newly_set,
+        Err(e) => {
+            let _ = journal.delete_pairing(&pairing_id);
+            return Err(HostError::Storage(e.to_string()));
+        }
+    };
 
     // Generate manifest
     let current_exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
             let _ = journal.delete_pairing(&pairing_id);
+            if newly_set_ext_id {
+                let _ = journal.clear_expected_extension_id();
+            }
             return Err(HostError::Io(e));
         }
     };
@@ -285,6 +292,9 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 
     if let Err(e) = std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json)?) {
         let _ = journal.delete_pairing(&pairing_id);
+        if newly_set_ext_id {
+            let _ = journal.clear_expected_extension_id();
+        }
         return Err(HostError::Io(e));
     }
 
@@ -296,6 +306,9 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
                 // Cleanup orphan manifest and database row on registration failure
                 let _ = std::fs::remove_file(&manifest_path);
                 let _ = journal.delete_pairing(&pairing_id);
+                if newly_set_ext_id {
+                    let _ = journal.clear_expected_extension_id();
+                }
                 return Err(e);
             }
         }
@@ -377,43 +390,16 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
         }
     };
 
-    // Determine expected extension ID from journal host_config or state manifest
-    let expected_id = if let Ok(Some(id)) = journal.get_expected_extension_id() {
-        id
-    } else {
-        // Fallback: check manifest file in state_dir
-        let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
-        if let Ok(manifest_content) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&manifest_content) {
-                if let Some(origins) = val.get("allowed_origins").and_then(|v| v.as_array()) {
-                    if let Some(first_orig) = origins.first().and_then(|v| v.as_str()) {
-                        first_orig
-                            .trim_start_matches("chrome-extension://")
-                            .trim_end_matches('/')
-                            .to_string()
-                    } else {
-                        return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Native host manifest contains no allowed_origins",
-                        ))));
-                    }
-                } else {
-                    return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "Native host manifest missing allowed_origins array",
-                    ))));
-                }
-            } else {
-                return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
+    // Determine expected extension ID strictly from SQLite journal host_config (single origin authority)
+    let expected_id = match journal.get_expected_extension_id() {
+        Ok(Some(id)) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            return Err(HostError::Protocol(ProtocolError::Io(
+                std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "Invalid native host manifest JSON",
-                ))));
-            }
-        } else {
-            return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No expected extension ID configured in journal or manifest",
-            ))));
+                    "No valid expected extension ID configured in journal authority",
+                ),
+            )));
         }
     };
 

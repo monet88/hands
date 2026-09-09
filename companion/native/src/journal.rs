@@ -194,16 +194,54 @@ impl Journal {
         })
     }
 
-    pub fn set_expected_extension_id(&self, extension_id: &str) -> Result<(), rusqlite::Error> {
+    pub fn set_expected_extension_id(&self, extension_id: &str) -> Result<bool, PairingError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM host_config WHERE key = 'expected_extension_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let newly_set = match existing {
+            Some(curr) => {
+                if curr != extension_id {
+                    return Err(PairingError::StorageError(format!(
+                        "Host already configured with expected extension ID '{}'; cannot overwrite with '{}'",
+                        curr, extension_id
+                    )));
+                }
+                false
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO host_config (key, value) VALUES ('expected_extension_id', ?1)",
+                    params![extension_id],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+                true
+            }
+        };
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(newly_set)
+    }
+
+    pub fn clear_expected_extension_id(&self) -> Result<(), PairingError> {
         let conn = self.conn.lock();
         conn.execute(
-            r#"
-            INSERT INTO host_config (key, value)
-            VALUES ('expected_extension_id', ?1)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            "#,
-            params![extension_id],
-        )?;
+            "DELETE FROM host_config WHERE key = 'expected_extension_id'",
+            [],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -455,8 +493,8 @@ impl Journal {
             return Err(PairingError::InvalidSecret);
         }
 
-        // Verify profile isolation (N4)
-        if !stored_profile_id.is_empty() && stored_profile_id != profile_id {
+        // Verify profile isolation (N4): fail closed if stored profile_id is empty, then require exact equality
+        if stored_profile_id.trim().is_empty() || stored_profile_id != profile_id {
             return Err(PairingError::ProfileMismatch);
         }
 
