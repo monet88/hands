@@ -474,7 +474,8 @@ fn test_policy_enforcement_and_omp_startup_command() {
 
     // Standard policy: explicit tool set, no-extensions, -e, no-prewalk, approval-mode
     let cmd_standard = build_omp_startup_command(adapter_path, "standard", "prompt").unwrap();
-    assert!(cmd_standard.contains("--tools=read,edit,write,bash,grep,glob,lsp,todo"));
+    assert!(cmd_standard.starts_with("& "));
+    assert!(cmd_standard.contains("\"--tools=read,edit,write,bash,grep,glob,lsp,todo\""));
     assert!(cmd_standard.contains("--no-extensions"));
     assert!(cmd_standard.contains("-e \"F:/CodeBase/test/adapter.ts\""));
     assert!(cmd_standard.contains("--no-prewalk"));
@@ -482,14 +483,15 @@ fn test_policy_enforcement_and_omp_startup_command() {
 
     // Read-only policy
     let cmd_ro = build_omp_startup_command(adapter_path, "read_only", "write").unwrap();
-    assert!(cmd_ro.contains("--tools=read,grep,glob,lsp"));
+    assert!(cmd_ro.starts_with("& "));
+    assert!(cmd_ro.contains("\"--tools=read,grep,glob,lsp\""));
     assert!(cmd_ro.contains("--approval-mode=write"));
 
     // None / no_tools policy
     let cmd_none = build_omp_startup_command(adapter_path, "none", "auto").unwrap();
+    assert!(cmd_none.starts_with("& "));
     assert!(cmd_none.contains("--no-tools"));
     assert!(cmd_none.contains("--approval-mode=yolo"));
-
     // Unsupported tool policy fails closed
     assert!(build_omp_startup_command(adapter_path, "unrestricted", "prompt").is_err());
     // Unsupported approval policy fails closed
@@ -865,9 +867,21 @@ fn test_launch_preflight_check() {
 #[test]
 fn test_resolve_omp_binary_shapes() {
     use hands_return_bridge::launcher::{
-        build_omp_startup_command, resolve_omp_binary, verify_launch_preflight,
+        build_omp_startup_command, ensure_adapter_file, launch_orca_terminal,
+        resolve_omp_binary, verify_launch_preflight, wait_orca_terminal_idle,
     };
     use std::path::Path;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let adapter_path = ensure_adapter_file(dir.path()).unwrap();
+    let target_worktree = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
     // 1. Default token shape ("omp") - verify string shape AND actual compatibility preflight
     std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
@@ -877,6 +891,25 @@ fn test_resolve_omp_binary_shapes() {
         token_preflight.is_ok(),
         "Preflight for wrapper token 'omp' must succeed: {:?}",
         token_preflight
+    );
+
+    // 1b. Real Orca launch-shape acceptance for wrapper token ("omp") reaching tui-idle without model prompt
+    let cmd_wrapper = build_omp_startup_command(&adapter_path, "standard", "prompt").unwrap();
+    let evidence_wrapper = launch_orca_terminal(&target_worktree, &cmd_wrapper, "test_shape_wrap")
+        .expect("Launch owned OMP terminal for wrapper shape must succeed");
+    let handle_wrapper = evidence_wrapper
+        .orca_terminal_handle
+        .as_deref()
+        .expect("Terminal handle must be present");
+    let wait_wrapper = wait_orca_terminal_idle(handle_wrapper, 15000);
+    // Always clean up test-owned terminal before asserting
+    let _ = Command::new("orca")
+        .args(["terminal", "close", "--terminal", handle_wrapper, "--json"])
+        .output();
+    assert!(
+        wait_wrapper.is_ok(),
+        "Wrapper shape 'omp' must reach real tui-idle session: {:?}",
+        wait_wrapper
     );
 
     // 2. Direct executable path shape - verify string shape AND actual compatibility preflight
@@ -890,6 +923,26 @@ fn test_resolve_omp_binary_shapes() {
             "Preflight for direct executable '{}' must succeed: {:?}",
             direct_bin,
             direct_preflight
+        );
+
+        // 2b. Real Orca launch-shape acceptance for direct binary reaching tui-idle without model prompt
+        let cmd_direct = build_omp_startup_command(&adapter_path, "standard", "prompt").unwrap();
+        let evidence_direct = launch_orca_terminal(&target_worktree, &cmd_direct, "test_shape_dir")
+            .expect("Launch owned OMP terminal for direct binary shape must succeed");
+        let handle_direct = evidence_direct
+            .orca_terminal_handle
+            .as_deref()
+            .expect("Terminal handle must be present");
+        let wait_direct = wait_orca_terminal_idle(handle_direct, 15000);
+        // Always clean up test-owned terminal before asserting
+        let _ = Command::new("orca")
+            .args(["terminal", "close", "--terminal", handle_direct, "--json"])
+            .output();
+        assert!(
+            wait_direct.is_ok(),
+            "Direct binary '{}' must reach real tui-idle session: {:?}",
+            direct_bin,
+            wait_direct
         );
     }
 
@@ -906,13 +959,12 @@ fn test_resolve_omp_binary_shapes() {
     // 4. Verify startup command with quoted binary
     let dummy_adapter = Path::new("C:/temp/adapter.ts");
     let cmd = build_omp_startup_command(dummy_adapter, "standard", "prompt").unwrap();
-    assert!(cmd.starts_with("\"C:/Program Files/OMP Tools/omp.exe\""));
+    assert!(cmd.starts_with("& \"C:/Program Files/OMP Tools/omp.exe\""));
 
     // 5. Clean up env
     std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
 
     // 6. Security guard: browser messages must NEVER be able to provide or override executable/bin
-    let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("journal.sqlite");
     let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
     let browser_override_msg = json!({
@@ -933,6 +985,63 @@ fn test_resolve_omp_binary_shapes() {
     let resp = handle_native_message(&browser_override_msg, &journal);
     assert_eq!(resp["status"], "error");
     assert_eq!(resp["code"], "unauthorized_override");
+}
+#[test]
+fn test_powershell_startup_command_comma_and_call_operator_contract() {
+    use hands_return_bridge::launcher::{
+        build_omp_startup_command, ensure_adapter_file, launch_orca_terminal,
+        wait_orca_terminal_idle,
+    };
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let adapter_path = ensure_adapter_file(dir.path()).unwrap();
+    let target_worktree = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // 1. Build startup command for read_only policy containing commas
+    let cmd = build_omp_startup_command(&adapter_path, "read_only", "prompt").unwrap();
+
+    // Must start with PowerShell call operator '&' to support both quoted and unquoted executables
+    assert!(
+        cmd.starts_with("& "),
+        "Startup command must start with PowerShell call operator '&': {}",
+        cmd
+    );
+
+    // Must quote comma-containing --tools flag so PowerShell does not split it into positional subcommands
+    assert!(
+        cmd.contains("\"--tools=read,grep,glob,lsp\""),
+        "Comma-containing --tools flag must be quoted in startup command: {}",
+        cmd
+    );
+
+    // 2. Real regression test exercising the actual Orca/PowerShell startup path
+    let evidence = launch_orca_terminal(&target_worktree, &cmd, "test_ps_comma")
+        .expect("Launch owned OMP terminal with quoted tools flag must succeed");
+    let handle = evidence
+        .orca_terminal_handle
+        .as_deref()
+        .expect("Terminal handle must be present");
+
+    let wait_res = wait_orca_terminal_idle(handle, 15000);
+
+    // Always clean up test-owned terminal
+    let _ = Command::new("orca")
+        .args(["terminal", "close", "--terminal", handle, "--json"])
+        .output();
+
+    assert!(
+        wait_res.is_ok(),
+        "Orca terminal with quoted tools flag must reach real tui-idle without being misparsed by PowerShell: {:?}",
+        wait_res
+    );
 }
 
 #[test]
@@ -1075,7 +1184,7 @@ fn test_conflicting_inherited_policy_hardening() {
     assert!(cmd_ro.contains("--no-prewalk"), "Must disable prewalk broadening");
     assert!(cmd_ro.contains("--no-skills"), "Must disable inherited skills discovery");
     assert!(cmd_ro.contains("--no-rules"), "Must disable inherited rules discovery");
-    assert!(cmd_ro.contains("--tools=read,grep,glob,lsp"), "Must restrict to read_only tools");
+    assert!(cmd_ro.contains("\"--tools=read,grep,glob,lsp\""), "Must restrict to read_only tools");
     assert!(cmd_ro.contains("--approval-mode=always-ask"), "Must enforce prompt approval");
 
     // Case B: No tools policy with auto approval
@@ -1091,7 +1200,12 @@ fn test_conflicting_inherited_policy_hardening() {
 #[test]
 fn test_conflicting_inherited_omp_runtime_probe() {
     use std::fs;
-    use std::process::Command;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -1110,15 +1224,19 @@ fn test_conflicting_inherited_omp_runtime_probe() {
         r#"{"tools.approvalMode": "yolo", "prewalk.enabled": true}"#,
     ).unwrap();
 
-    // Rogue extension that should NEVER load under --no-extensions
+    // Rogue extension that writes a sentinel file if ambient discovery executes it
+    let sentinel_path = temp_path.join("rogue_sentinel.txt");
     fs::write(
-        omp_dir.join("extensions").join("rogue_ext.ts"),
-        r#"export default function() { console.error("ROGUE_EXTENSION_LOADED"); }"#,
+        omp_dir.join("extensions").join("rogue_ext.js"),
+        format!(
+            "const fs = require('fs'); fs.writeFileSync({:?}, 'pwned'); module.exports = function() {{}};",
+            sentinel_path.to_string_lossy().replace('\\', "/")
+        ),
     ).unwrap();
 
     fs::write(
         omp_dir.join("skills").join("rogue_skill").join("SKILL.md"),
-        "# Rogue Skill\n",
+        "---\nname: rogue-skill\ndescription: rogue\n---\n# Rogue Skill\n",
     ).unwrap();
     fs::write(
         omp_dir.join("rules").join("rogue_rule.md"),
@@ -1135,18 +1253,19 @@ fn test_conflicting_inherited_omp_runtime_probe() {
         "prompt",
     ).unwrap();
 
-    // Verify explicit CLI flags dominate
     assert!(startup_cmd.contains("--no-extensions"));
     assert!(startup_cmd.contains("--no-prewalk"));
     assert!(startup_cmd.contains("--no-skills"));
     assert!(startup_cmd.contains("--no-rules"));
-    assert!(startup_cmd.contains("--tools=read,grep,glob,lsp"));
+    assert!(startup_cmd.contains("\"--tools=read,grep,glob,lsp\""));
     assert!(startup_cmd.contains("--approval-mode=always-ask"));
 
-    // 3. Execute real OMP probe with these exact flags and verify runtime behavior
-    // Run omp with --help or probe to assert rogue extension was not loaded and CLI succeeds
-    let output = Command::new("omp")
+    // 3. Launch real OMP in RPC mode (deterministic runtime state without invoking an LLM)
+    let clean_bin = hands_return_bridge::launcher::resolve_omp_binary();
+    let mut child = Command::new(clean_bin.trim_matches('"'))
         .args([
+            "--mode=rpc",
+            &format!("--cwd={}", temp_path.display()),
             "--no-extensions",
             "-e",
             &adapter_path.to_string_lossy().replace('\\', "/"),
@@ -1155,17 +1274,114 @@ fn test_conflicting_inherited_omp_runtime_probe() {
             "--no-rules",
             "--tools=read,grep,glob,lsp",
             "--approval-mode=always-ask",
-            "--help",
         ])
         .current_dir(temp_path)
-        .output();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("OMP process must start successfully in RPC mode");
 
-    if let Ok(out) = output {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut stdin = child.stdin.take().expect("Child stdin must be available");
+    let stdout = child.stdout.take().expect("Child stdout must be available");
+
+    let (tx, rx) = mpsc::channel();
+    let _reader_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    });
+
+    let mut state_response: Option<serde_json::Value> = None;
+    let mut commands_response: Option<serde_json::Value> = None;
+    let start = Instant::now();
+
+    while start.elapsed() < Duration::from_secs(12) {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                if val.get("type").and_then(|v| v.as_str()) == Some("ready") {
+                    let _ = stdin.write_all(b"{\"id\":\"probe_state\",\"type\":\"get_state\"}\n");
+                    let _ = stdin.write_all(b"{\"id\":\"probe_cmd\",\"type\":\"get_available_commands\"}\n");
+                    let _ = stdin.flush();
+                } else if val.get("id").and_then(|v| v.as_str()) == Some("probe_state") {
+                    state_response = Some(val);
+                } else if val.get("id").and_then(|v| v.as_str()) == Some("probe_cmd") {
+                    commands_response = Some(val);
+                }
+                if state_response.is_some() && commands_response.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Terminate child cleanly
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 4. Assert runtime state proves isolation and flag dominance
+    assert!(
+        !sentinel_path.exists(),
+        "Rogue extension sentinel file must NOT exist; --no-extensions must suppress ambient extensions"
+    );
+
+    let state = state_response.expect("OMP RPC must respond to get_state query");
+    assert_eq!(state["success"], true, "get_state must succeed");
+    let dump_tools = state["data"]["dumpTools"]
+        .as_array()
+        .expect("dumpTools must be an array");
+    let tool_names: Vec<&str> = dump_tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .collect();
+
+    // Must contain native-selected read_only tools
+    assert!(tool_names.contains(&"read"), "Effective tools must contain 'read'");
+    assert!(tool_names.contains(&"grep"), "Effective tools must contain 'grep'");
+    assert!(tool_names.contains(&"glob"), "Effective tools must contain 'glob'");
+    assert!(tool_names.contains(&"lsp"), "Effective tools must contain 'lsp'");
+
+    // Must NOT contain unselected tools (bash, edit, etc.)
+    assert!(!tool_names.contains(&"bash"), "Unselected 'bash' tool must NOT be loaded");
+    assert!(!tool_names.contains(&"edit"), "Unselected 'edit' tool must NOT be loaded");
+    assert!(!tool_names.contains(&"browser"), "Unselected 'browser' tool must NOT be loaded");
+
+    let cmds = commands_response.expect("OMP RPC must respond to get_available_commands query");
+    assert_eq!(cmds["success"], true, "get_available_commands must succeed");
+    let cmd_list = cmds["data"]["commands"]
+        .as_array()
+        .expect("commands must be an array");
+    let cmd_names: Vec<&str> = cmd_list
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        !cmd_names.contains(&"rogue-skill"),
+        "Rogue skill must NOT be discovered; --no-skills must suppress ambient skills"
+    );
+
+    // 5. Source-level precedence verification from the installed OMP 18.1.15 package
+    let omp_main_ts = Path::new(r"C:\Users\monet\.bun\install\global\node_modules\@oh-my-pi\pi-coding-agent\src\main.ts");
+    if omp_main_ts.exists() {
+        let code = fs::read_to_string(omp_main_ts).unwrap();
         assert!(
-            !stderr.contains("ROGUE_EXTENSION_LOADED"),
-            "Rogue extension must not be executed when --no-extensions is active"
+            code.contains("settingsInstance.override(\"tools.approvalMode\", parsedArgs.approvalMode)"),
+            "OMP main.ts must override settings.json tools.approvalMode with CLI flag"
         );
-        assert!(out.status.success(), "OMP must execute cleanly with native startup flags");
+        assert!(
+            code.contains("const prewalkEnabled = parsed.noPrewalk"),
+            "OMP main.ts must enforce prewalkEnabled = false on --no-prewalk"
+        );
+        assert!(
+            code.contains("parsedArgs.noExtensions ? \"explicit-only\" : \"merge\""),
+            "OMP main.ts must isolate extension roots under --no-extensions"
+        );
     }
 }

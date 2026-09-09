@@ -166,10 +166,10 @@ pub fn build_omp_startup_command(
     tool_policy: &str,
     approval_policy: &str,
 ) -> Result<String, LauncherError> {
-    // Fail-closed explicit tool set mapping
+    // Fail-closed explicit tool set mapping with quotes to prevent PowerShell comma-splitting
     let tool_flag = match tool_policy.to_lowercase().as_str() {
-        "standard" | "all" => "--tools=read,edit,write,bash,grep,glob,lsp,todo",
-        "read_only" => "--tools=read,grep,glob,lsp",
+        "standard" | "all" => "\"--tools=read,edit,write,bash,grep,glob,lsp,todo\"",
+        "read_only" => "\"--tools=read,grep,glob,lsp\"",
         "none" | "no_tools" => "--no-tools",
         other => return Err(LauncherError::UnsupportedPolicy(format!("Unknown tool policy: {}", other))),
     };
@@ -184,6 +184,8 @@ pub fn build_omp_startup_command(
 
     let omp_bin = resolve_omp_binary();
     let mut parts = Vec::new();
+    // PowerShell call operator '&' ensures executable paths (whether quoted with spaces or plain tokens) execute properly
+    parts.push("&".to_string());
     parts.push(omp_bin);
     parts.push("--no-extensions".to_string());
     parts.push("-e".to_string());
