@@ -9,11 +9,13 @@ Verify these before mutating anything:
 - Source repo: `F:\CodeBase\hands`
 - Active development branch: `dev`
 - Installed runtime directory: `%LOCALAPPDATA%\Programs\hands\bin`
-- Existing lifecycle scripts: `hands-start.ps1` and `hands-stop.ps1` in that runtime directory
+- Existing lifecycle scripts: `hands-start` (`.cmd`/`.ps1`), `hands-stop` (`.cmd`/`.ps1`), and `hands-reset` (`.cmd`/`.ps1`) in `%LOCALAPPDATA%\Programs\hands\bin` (added to system PATH)
+- Machine autostart: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\hands-autostart.cmd` launching `hands-start.ps1` hidden on user logon
+- Process topology: lean background execution via WMI (`ShowWindow = [uint16]0`); `tunnel-client.exe` spawns `hands.exe` stdio child; no long-lived `hands.exe --http :8787` daemon
 - Hands config: `%APPDATA%\hands`
 - Tunnel profile: `%APPDATA%\tunnel-client\hands.yaml`
 - Canonical build staging checkout: `%LOCALAPPDATA%\hands\cache\grok-build`
-
+- Hourly state cleanup: Scheduled Task `HandsStateCleanup` running `%LOCALAPPDATA%\Programs\hands\bin\clean-hands-state.py`
 This workstation is intentionally allowed to use its existing machine-local tunnel/runtime dependencies. A routine dogfood update replaces only `hands.exe`; it does not rebuild the public Runtime Bundle or reinstall `tunnel-client`, ripgrep, profiles, autostart, or credentials.
 
 ## Safety and activation gate
@@ -81,6 +83,23 @@ Keep the printed `BACKUP_PATH`; rollback must use an explicit known-good backup 
 
 Do not stop the current runtime for this step. If step 1 found local WIP, preserve it: do not stash, reset, clean, or switch branches automatically. Resolve that repo state separately before pulling the dogfood source revision.
 
+### 3.1 Ensure canonical grok-build staging checkout
+
+If `%LOCALAPPDATA%\hands\cache\grok-build` does not yet exist on the machine, initialize it from the pinned Grok Build revision (`72a61251fcffb464bcc687aeb5a998e5a98ec0c9`):
+
+```powershell
+$cacheDir = "$env:LOCALAPPDATA\hands\cache\grok-build"
+if (-not (Test-Path $cacheDir)) {
+    New-Item -ItemType Directory -Force (Split-Path $cacheDir) | Out-Null
+    git clone "https://github.com/xai-org/grok-build.git" $cacheDir
+    git -C $cacheDir reset --hard 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+}
+```
+
+*(Note: If an existing local clone of grok-build at that pinned SHA exists under `F:\CodeBase`, cloning from that local path is also supported).*
+
+### 3.2 Update, inject, and build
+
 ```powershell
 Set-Location "F:\CodeBase\hands"
 
@@ -93,6 +112,12 @@ git pull --ff-only origin dev
 
 python scripts/inject.py . "$env:LOCALAPPDATA\hands\cache\grok-build"
 if ($LASTEXITCODE -ne 0) { throw "inject failed" }
+
+# On Windows, xai-proto-build requires a protoc wrapper to handle Unix-style /dev/stdout and /dev/null flags
+$prevProtoc = $env:PROTOC
+if (Test-Path "$env:LOCALAPPDATA\Temp\hands-protoc-wrap\bin\protoc.cmd") {
+    $env:PROTOC = "$env:LOCALAPPDATA\Temp\hands-protoc-wrap\bin\protoc.cmd"
+}
 
 $prevRustflags = $env:RUSTFLAGS
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
@@ -108,6 +133,11 @@ finally {
         $env:RUSTFLAGS = $prevRustflags
     } else {
         Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $prevProtoc) {
+        $env:PROTOC = $prevProtoc
+    } else {
+        Remove-Item Env:PROTOC -ErrorAction SilentlyContinue
     }
 }
 ```
@@ -213,6 +243,42 @@ curl.exe --fail http://127.0.0.1:18780/readyz
 ```
 
 **Done when:** the previous known-good revision is running and `/readyz` succeeds again.
+
+## 8. Hourly state cleanup (`resources_state.json`)
+
+To prevent MCP stdio stalls (HANDS-001) caused by unbounded accumulation of `ReportedTaskCompletions` in `%LOCALAPPDATA%\Temp\hands\resources_state.json`:
+
+- Cleanup helper: `%LOCALAPPDATA%\Programs\hands\bin\clean-hands-state.py`
+- Windows Scheduled Task: `HandsStateCleanup` (configured to trigger hourly).
+- Rule: if `reported` completions exceed 50 items, the list is trimmed to the 20 most recent entries.
+
+To register or inspect on this workstation:
+
+```powershell
+# Inspect
+Get-ScheduledTask -TaskName "HandsStateCleanup"
+Get-ScheduledTaskInfo -TaskName "HandsStateCleanup"
+
+# Re-register if missing
+$action = New-ScheduledTaskAction -Execute "pythonw.exe" -Argument "`"$env:LOCALAPPDATA\Programs\hands\bin\clean-hands-state.py`""
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName "HandsStateCleanup" -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
+## 9. Lifecycle control and machine autostart
+
+The dogfood runtime directory `%LOCALAPPDATA%\Programs\hands\bin` is registered in system `PATH`. Lifecycle commands can be executed directly from any terminal (CMD, PowerShell, Git Bash) or via Win+R:
+
+- **`hands-stop`** (`hands-stop.cmd` / `hands-stop.ps1`): Stops `tunnel-client` and `hands` processes cleanly.
+- **`hands-reset`** (`hands-reset.cmd` / `hands-reset.ps1`): Stops the active runtime, pauses 1 second, and launches a fresh clean background instance.
+- **`hands-start`** (`hands-start.cmd` / `hands-start.ps1`): Starts `tunnel-client.exe` detached via WMI with `ShowWindow = [uint16]0` (completely hidden).
+
+### Machine autostart
+
+- Startup entry: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\hands-autostart.cmd`
+- Execution: Runs `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Programs\hands\bin\hands-start.ps1"`.
+- WMI detachment ensures the process escapes terminal Job Objects and remains hidden in the background without spawning visible console or Windows Terminal windows.
 
 ## Routine update summary
 

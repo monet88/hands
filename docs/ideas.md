@@ -155,3 +155,45 @@ Canonical vocabulary nằm trong `CONTEXT.md`. Kiến trúc boundary được gh
 ### 1.6. Trạng thái quyết định
 
 Phase 1 design tree cho Windows Portable Tray Launcher đã được chốt đủ để chuyển sang implementation spec/tickets. Nhánh còn lại không chặn dogfood là **public code-signing provider/certificate choice**, được defer sang hardening phase trước khi phát hành public rộng.
+
+---
+
+## 2. Brainstorm: giao diện, Logs & Debug và Usage
+
+**Ghi nhận:** 2026-09-09. **Trạng thái:** ý tưởng để tham khảo về sau; chưa phải spec, yêu cầu triển khai hay điều kiện phát hành.
+
+Theo yêu cầu hiện tại, phần này chỉ lưu trong docs, chưa tạo issue/ticket. Không mở rộng phạm vi Windows Tray Launcher trong [#52](https://github.com/monet88/hands/issues/52) và [#65](https://github.com/monet88/hands/issues/65). Các mục Open Logs và Copy Diagnostics đã thuộc launcher hiện tại; màn hình Logs & Debug tập trung dưới đây là ý tưởng bổ sung.
+
+### 2.1. Hướng giao diện
+
+Lấy OpenCodex trong `.ref/opencodex` làm nguồn cảm hứng cho cách trình bày dễ nhìn: tổng quan trạng thái, chẩn đoán thuận tiện và thống kê đơn giản. Đây là các ý tưởng cho Hands, không phải xác nhận rằng OpenCodex đã triển khai mọi chi tiết bên dưới.
+
+* **Dashboard/tổng quan:** nhìn nhanh biết Hands đang ở trạng thái nào, dữ liệu được cập nhật khi nào và hành động tiếp theo phù hợp là gì.
+* **Thông tin ưu tiên:** trạng thái runtime/tunnel, phiên bản đang chạy, Start at Login và lỗi gần nhất có thể xử lý. Phân biệt đã bật autostart với runtime thực sự Ready.
+* **Điều hướng gọn:** có thể nhóm thành Overview, Logs & Debug và Usage; không cần nhiều trang hoặc nhiều chỉ số.
+* **Trạng thái giao diện rõ:** đang tải, chưa setup, chưa có dữ liệu, dữ liệu cũ và lỗi đọc dữ liệu cần có cách hiển thị riêng; không biến lỗi thành số 0 hoặc trạng thái Ready.
+* **Thao tác dễ hiểu:** phản hồi khi đang xử lý, tránh thao tác chồng nhau, hiển thị kết quả hoặc lỗi có hướng xử lý; status có chữ đi cùng màu/icon.
+
+Chưa chọn native window hay giao diện trình duyệt cho ý tưởng này. Khi xem xét triển khai, phải đối chiếu lại contract launcher đã được chấp nhận; brainstorm không quyết định thêm web server, daemon hay UI framework.
+
+### 2.2. Logs & Debug
+
+* Một nơi xem các sự kiện lifecycle và lỗi đã được làm sạch: thời gian, mức độ, nguồn launcher/tunnel/runtime và nội dung ngắn gọn.
+* Có thể tìm kiếm, lọc mức độ/thời gian, tạm dừng cuộn tự động và mở thư mục log.
+* Có thể xem trạng thái hiện tại cùng các lần chuyển trạng thái gần nhất, rồi Copy Diagnostics để gửi khi cần hỗ trợ.
+* Tái sử dụng nguồn log và diagnostics hiện có; giữ giới hạn lưu trữ và che dữ liệu nhạy cảm. Không mặc định thu thập raw tool arguments/results, nội dung file, API key hoặc môi trường tiến trình.
+
+### 2.3. Usage — chỉ tổng số tool call
+
+**Yêu cầu đã chốt của người dùng:** chỉ cần biết tổng số tool call; không cần biết đó là tool gì.
+
+* Ý tưởng tối thiểu: một con số tổng tool call với nhãn rõ về khoảng thời gian được tính.
+* Có thể cân nhắc biểu đồ số call theo ngày và bộ chọn khoảng thời gian nếu thực sự giúp đọc nhanh; đây là tùy chọn brainstorm, chưa phải yêu cầu.
+* Không phân loại theo tên/loại tool, workspace, người dùng hoặc phiên; không thêm tokens, chi phí, latency, tỷ lệ lỗi hay bảng lịch sử từng call vào Usage.
+* Nếu cần lưu dữ liệu cho Usage, hướng ưu tiên là bộ đếm tổng hợp; không cần lưu tên tool, arguments/results hay từng sự kiện call chỉ để làm thống kê.
+
+Các câu hỏi để dành khi chuyển thành spec: một call được đếm tại thời điểm nào; call thất bại/hủy/retry tính ra sao; tổng đếm thuộc phạm vi nào và có giữ qua restart/update không; nếu có biểu đồ thì dùng múi giờ, thời hạn lưu và cách reset nào. Chưa chọn schema lưu trữ hoặc cơ chế thu thập trong brainstorm này.
+
+### 2.4. Khi quay lại ý tưởng
+
+Bắt đầu từ một phác thảo nhỏ cho tổng quan, Logs & Debug và tổng tool call; kiểm tra xem có thể tận dụng UI/diagnostics hiện hữu đến đâu. Chỉ chuyển thành spec/tickets khi có yêu cầu triển khai tiếp theo.
