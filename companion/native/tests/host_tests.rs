@@ -419,3 +419,81 @@ fn test_setup_a_remains_authoritative_after_competing_setup_b_fails() {
     let res_reuse = execute_setup(&opts_a_reuse);
     assert!(res_reuse.is_ok(), "Setup reusing identical extension ID must succeed");
 }
+
+#[test]
+fn test_failed_setup_does_not_clear_sticky_extension_authority() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_path = target_dir.path().to_str().unwrap().to_string();
+
+    let ext_id = "sticky_extension_id_999".to_string();
+
+    // 1. Initial setup establishes the sticky expected_extension_id
+    let opts_init = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_init".to_string(),
+        target_path: target_path.clone(),
+        target_id: Some("target_init".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: ext_id.clone(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+    let res_init = execute_setup(&opts_init);
+    assert!(res_init.is_ok(), "Initial setup must succeed");
+
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some(ext_id.as_str())
+    );
+
+    // 2. Make the manifest path unwritable (replace file with a directory or lock)
+    // so a second setup attempt with the same extension ID fails during manifest writing
+    let manifest_path = state_dir.join("com.hands.return_bridge.json");
+    let _ = std::fs::remove_file(&manifest_path);
+    std::fs::create_dir_all(&manifest_path).unwrap(); // Directory at manifest path causes write error
+
+    let opts_failing = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_failing".to_string(),
+        target_path: target_path.clone(),
+        target_id: Some("target_failing".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: ext_id.clone(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    let res_failing = execute_setup(&opts_failing);
+    assert!(res_failing.is_err(), "Setup must fail when manifest cannot be written");
+
+    // 3. PROOF: Even though the second attempt failed after reaching set_expected_extension_id,
+    // the global expected_extension_id MUST REMAIN AUTHORITATIVE and intact!
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some(ext_id.as_str()),
+        "A later failed setup attempt must NEVER clear or erase sticky global authority"
+    );
+
+    // Origin validation continues to succeed for the pinned extension ID
+    let origin = format!("chrome-extension://{}/", ext_id);
+    let auth_check = run_native_host(Some(&state_dir), Some(&origin));
+    assert!(
+        auth_check.is_ok(),
+        "Native host origin authority must stay valid despite later failed setup attempt"
+    );
+
+    // Clean up unwritable dummy directory so retry succeeds
+    let _ = std::fs::remove_dir_all(&manifest_path);
+    let res_retry = execute_setup(&opts_failing);
+    assert!(res_retry.is_ok(), "Retry with same extension ID must succeed");
+}

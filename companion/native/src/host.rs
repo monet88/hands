@@ -259,22 +259,17 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 
     // Persist expected extension ID in journal configuration.
     // An existing expected extension ID may only be reused if identical; a different ID must be rejected.
-    let newly_set_ext_id = match journal.set_expected_extension_id(&opts.extension_id) {
-        Ok(newly_set) => newly_set,
-        Err(e) => {
-            let _ = journal.delete_pairing(&pairing_id);
-            return Err(HostError::Storage(e.to_string()));
-        }
-    };
+    // Expected extension ID is sticky once established and is not cleared on later failures.
+    if let Err(e) = journal.set_expected_extension_id(&opts.extension_id) {
+        let _ = journal.delete_pairing(&pairing_id);
+        return Err(HostError::Storage(e.to_string()));
+    }
 
     // Generate manifest
     let current_exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
             let _ = journal.delete_pairing(&pairing_id);
-            if newly_set_ext_id {
-                let _ = journal.clear_expected_extension_id();
-            }
             return Err(HostError::Io(e));
         }
     };
@@ -292,9 +287,6 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 
     if let Err(e) = std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json)?) {
         let _ = journal.delete_pairing(&pairing_id);
-        if newly_set_ext_id {
-            let _ = journal.clear_expected_extension_id();
-        }
         return Err(HostError::Io(e));
     }
 
@@ -306,9 +298,6 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
                 // Cleanup orphan manifest and database row on registration failure
                 let _ = std::fs::remove_file(&manifest_path);
                 let _ = journal.delete_pairing(&pairing_id);
-                if newly_set_ext_id {
-                    let _ = journal.clear_expected_extension_id();
-                }
                 return Err(e);
             }
         }

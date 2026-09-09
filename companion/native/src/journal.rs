@@ -194,7 +194,7 @@ impl Journal {
         })
     }
 
-    pub fn set_expected_extension_id(&self, extension_id: &str) -> Result<bool, PairingError> {
+    pub fn set_expected_extension_id(&self, extension_id: &str) -> Result<(), PairingError> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -209,7 +209,7 @@ impl Journal {
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        let newly_set = match existing {
+        match existing {
             Some(curr) => {
                 if curr != extension_id {
                     return Err(PairingError::StorageError(format!(
@@ -217,7 +217,6 @@ impl Journal {
                         curr, extension_id
                     )));
                 }
-                false
             }
             None => {
                 tx.execute(
@@ -225,23 +224,12 @@ impl Journal {
                     params![extension_id],
                 )
                 .map_err(|e| PairingError::StorageError(e.to_string()))?;
-                true
             }
-        };
+        }
 
         tx.commit()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        Ok(newly_set)
-    }
-
-    pub fn clear_expected_extension_id(&self) -> Result<(), PairingError> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM host_config WHERE key = 'expected_extension_id'",
-            [],
-        )
-        .map_err(|e| PairingError::StorageError(e.to_string()))?;
         Ok(())
     }
 
