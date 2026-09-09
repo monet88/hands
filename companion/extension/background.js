@@ -1,21 +1,46 @@
 const NATIVE_HOST = "com.hands.return_bridge";
 const TRUST_NOTICE = "Notice: A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.";
-async function configureStorageAccessLevel() {
+
+let storageAccessLevelEstablished = false;
+
+async function ensureStorageAccessLevel() {
+  if (storageAccessLevelEstablished) {
+    return true;
+  }
   if (chrome.storage?.local?.setAccessLevel) {
     try {
       await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+      storageAccessLevelEstablished = true;
+      return true;
     } catch (err) {
-      console.warn("Could not set chrome.storage.local accessLevel:", err);
+      console.error("Failed to set chrome.storage.local accessLevel to TRUSTED_CONTEXTS:", err);
+      storageAccessLevelEstablished = false;
+      return false;
     }
   }
+  return false;
 }
 
-configureStorageAccessLevel();
+// Initial attempt at background worker start
+ensureStorageAccessLevel();
 
 chrome.runtime.onInstalled?.addListener(() => {
-  configureStorageAccessLevel();
+  ensureStorageAccessLevel();
 });
 
+function isTrustedExtensionSender(sender) {
+  if (!sender || sender.id !== chrome.runtime.id) {
+    return false;
+  }
+  // Confused-deputy guard: content scripts share chrome.runtime.id but execute within web pages.
+  // Privileged actions must only accept extension documents (options, popup, test_runner)
+  // which have an exact chrome-extension://${chrome.runtime.id}/ URL prefix.
+  const extensionOriginPrefix = `chrome-extension://${chrome.runtime.id}/`;
+  if (typeof sender.url !== "string" || !sender.url.startsWith(extensionOriginPrefix)) {
+    return false;
+  }
+  return true;
+}
 
 async function getOrCreateProfileId() {
   const data = await chrome.storage.local.get(["profileId"]);
@@ -40,9 +65,9 @@ function sendNative(msg) {
 
 // Extension internal message router
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // Reject messages from web pages or content scripts that are not extension-internal
-  if (sender.id !== chrome.runtime.id) {
-    sendResponse({ status: "error", code: "unauthorized_origin" });
+  // Reject messages from web pages or content scripts that are not extension documents
+  if (!isTrustedExtensionSender(sender)) {
+    sendResponse({ status: "error", code: "unauthorized_sender", message: "Rejected non-extension document message" });
     return false;
   }
 
@@ -52,6 +77,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       switch (request.action) {
         case "getState": {
+          const isTrustedStorage = await ensureStorageAccessLevel();
+          if (!isTrustedStorage) {
+            sendResponse({
+              status: "ok",
+              profileId,
+              extensionId: chrome.runtime.id,
+              isPaired: false,
+              pairingId: null,
+              targets: [],
+              policyRevision: null,
+              trustNotice: TRUST_NOTICE,
+              storageAccessLevel: "UNTRUSTED"
+            });
+            break;
+          }
+
           const stored = await chrome.storage.local.get([
             "pairingId",
             "targets",
@@ -73,6 +114,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "setup": {
+          const isTrustedStorage = await ensureStorageAccessLevel();
+          if (!isTrustedStorage) {
+            sendResponse({
+              status: "error",
+              code: "storage_isolation_unavailable",
+              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
+            });
+            return;
+          }
+
           const token = request.bootstrapToken?.trim();
           if (!token) {
             sendResponse({ status: "error", code: "missing_token", message: "Bootstrap token is required" });
@@ -108,6 +159,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "status": {
+          const isTrustedStorage = await ensureStorageAccessLevel();
+          if (!isTrustedStorage) {
+            sendResponse({
+              status: "error",
+              code: "storage_isolation_unavailable",
+              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
+            });
+            return;
+          }
+
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "ok", isPaired: false, profileId });
@@ -142,6 +203,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "connect": {
+          const isTrustedStorage = await ensureStorageAccessLevel();
+          if (!isTrustedStorage) {
+            sendResponse({
+              status: "error",
+              code: "storage_isolation_unavailable",
+              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
+            });
+            return;
+          }
+
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
@@ -160,6 +231,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         case "revoke": {
+          const isTrustedStorage = await ensureStorageAccessLevel();
+          if (!isTrustedStorage) {
+            sendResponse({
+              status: "error",
+              code: "storage_isolation_unavailable",
+              message: "Storage isolation (TRUSTED_CONTEXTS) could not be established. Secret-bearing storage is disabled fail-closed."
+            });
+            return;
+          }
+
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
             sendResponse({ status: "ok", message: "Already unpaired" });

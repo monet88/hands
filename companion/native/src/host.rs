@@ -177,6 +177,16 @@ pub struct SetupResult {
 }
 
 pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
+    // Fail-closed explicitly on unsupported platforms before any durable setup side effects
+    if !opts.skip_registry {
+        #[cfg(not(windows))]
+        {
+            return Err(HostError::Registry(
+                "Native messaging host automatic registration is only supported on Windows in this issue. Use --skip-registry for manual host manifest setup on non-Windows platforms.".to_string(),
+            ));
+        }
+    }
+
     // Validate browser: reject invalid browsers rather than defaulting
     let browser_norm = opts.browser.to_lowercase();
     if browser_norm != "chrome" && browser_norm != "edge" {

@@ -246,3 +246,28 @@ fn test_setup_rejects_missing_explicit_options() {
     opts.approval_policy = "".to_string();
     assert!(execute_setup(&opts).is_err(), "Empty approval_policy must be rejected");
 }
+#[test]
+fn test_setup_skip_registry_semantics() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_path = target_dir.path().to_str().unwrap().to_string();
+
+    let opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "test_profile_1".to_string(),
+        target_path,
+        target_id: Some("test_target".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_id_123".to_string(),
+        state_dir: Some(state_dir),
+        skip_registry: true,
+    };
+
+    let result = execute_setup(&opts);
+    assert!(result.is_ok(), "--skip-registry must allow isolated setup without platform registry side effects");
+}
