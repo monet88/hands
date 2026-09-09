@@ -421,11 +421,7 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             };
 
             // 4. Build native-owned OMP startup command (NO user prompt in command line)
-            let startup_cmd = match build_omp_startup_command(
-                &adapter_path,
-                &claim.effective_tool_policy,
-                &claim.effective_approval_policy,
-            ) {
+            let startup_cmd = match build_omp_startup_command(&adapter_path) {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     return json!({ "status": "error", "code": "launcher_error", "message": e.to_string() });

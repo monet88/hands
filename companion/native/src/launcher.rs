@@ -143,58 +143,20 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
             omp_help.status.code()
         )));
     }
-    let omp_text = String::from_utf8_lossy(&omp_help.stdout);
-    if !omp_text.contains("--no-extensions")
-        || !omp_text.contains("--approval-mode")
-        || !omp_text.contains("--tools")
-        || !omp_text.contains("--no-skills")
-        || !omp_text.contains("--no-rules")
-        || !omp_text.contains("--no-prewalk")
-    {
-        return Err(LauncherError::PreflightFailed(format!(
-            "OMP CLI '{}' missing required flags (--no-extensions, --approval-mode, --tools, --no-skills, --no-rules, --no-prewalk)",
-            clean_bin
-        )));
-    }
-
     Ok(())
 }
 
-/// Fixed companion launcher building native-owned OMP startup command (NO user prompt)
+/// Builds native-owned OMP startup command for normal OMP execution with Return Bridge companion adapter (NO user prompt)
 pub fn build_omp_startup_command(
     adapter_path: &Path,
-    tool_policy: &str,
-    approval_policy: &str,
 ) -> Result<String, LauncherError> {
-    // Fail-closed explicit tool set mapping with quotes to prevent PowerShell comma-splitting
-    let tool_flag = match tool_policy.to_lowercase().as_str() {
-        "standard" | "all" => "\"--tools=read,edit,write,bash,grep,glob,lsp,todo\"",
-        "read_only" => "\"--tools=read,grep,glob,lsp\"",
-        "none" | "no_tools" => "--no-tools",
-        other => return Err(LauncherError::UnsupportedPolicy(format!("Unknown tool policy: {}", other))),
-    };
-
-    // Map approval_policy
-    let approval_flag = match approval_policy.to_lowercase().as_str() {
-        "prompt" | "ask" => "--approval-mode=always-ask",
-        "write" => "--approval-mode=write",
-        "auto" | "yolo" => "--approval-mode=yolo",
-        other => return Err(LauncherError::UnsupportedPolicy(format!("Unknown approval policy: {}", other))),
-    };
-
     let omp_bin = resolve_omp_binary();
     let mut parts = Vec::new();
     // PowerShell call operator '&' ensures executable paths (whether quoted with spaces or plain tokens) execute properly
     parts.push("&".to_string());
     parts.push(omp_bin);
-    parts.push("--no-extensions".to_string());
     parts.push("-e".to_string());
     parts.push(format!("\"{}\"", adapter_path.to_string_lossy().replace('\\', "/")));
-    parts.push("--no-prewalk".to_string());
-    parts.push("--no-skills".to_string());
-    parts.push("--no-rules".to_string());
-    parts.push(tool_flag.to_string());
-    parts.push(approval_flag.to_string());
 
     Ok(parts.join(" "))
 }
