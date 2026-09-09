@@ -102,3 +102,57 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     let err_revoked = reopened.authenticate_pairing(pairing_id, pairing_secret, profile_id);
     assert_eq!(err_revoked.unwrap_err(), PairingError::Retired);
 }
+
+#[test]
+fn test_bootstrap_persistence_atomic_rollback_on_failure() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_atomic_test";
+    let bootstrap_token = "boot_atomic_abc";
+    let pairing_secret = "secret_atomic_xyz";
+    let browser = "chrome";
+    let profile_id = "profile_alpha";
+
+    // Intentionally create duplicate targets to trigger SQLite PRIMARY KEY (pairing_id, target_id) constraint violation
+    let targets = vec![
+        TargetRecord {
+            target_id: "duplicate_id".to_string(),
+            canonical_path: "/workspace/a".to_string(),
+            name: "target_a".to_string(),
+        },
+        TargetRecord {
+            target_id: "duplicate_id".to_string(), // Duplicate target_id!
+            canonical_path: "/workspace/b".to_string(),
+            name: "target_b".to_string(),
+        },
+    ];
+
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    // create_bootstrap must fail due to constraint violation
+    let result = journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        pairing_secret,
+        browser,
+        profile_id,
+        &targets,
+        &policy,
+    );
+    assert!(result.is_err(), "create_bootstrap must return error on target constraint violation");
+
+    // Verify atomic rollback: pairing must NOT exist in the database!
+    let status_res = journal.get_pairing_status(pairing_id);
+    assert_eq!(status_res.unwrap_err(), PairingError::NotFound, "Rolled back pairing must not exist in pairings table");
+
+    // Targets must also not exist
+    let targets_res = journal.get_targets(pairing_id).unwrap();
+    assert!(targets_res.is_empty(), "Rolled back targets must be empty");
+}

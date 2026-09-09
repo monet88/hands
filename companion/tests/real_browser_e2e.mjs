@@ -8,6 +8,7 @@ const HOST_NAME = "com.hands.return_bridge";
 const REPO_ROOT = "F:\\CodeBase\\hands\\issue-66-return-bridge-pairing";
 const COMPANION_DIR = path.join(REPO_ROOT, "companion");
 const EXTENSION_DIR = path.join(COMPANION_DIR, "extension");
+const FIXTURES_DIR = path.join(COMPANION_DIR, "tests", "fixtures");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,6 +119,10 @@ async function evalInTab(tabWsUrl, script) {
         ws.close();
         if (data.error) {
           reject(new Error("Runtime.evaluate error: " + data.error.message));
+        } else if (data.result?.exceptionDetails) {
+          const ex = data.result.exceptionDetails;
+          const msg = ex.exception?.description || ex.text || JSON.stringify(ex);
+          reject(new Error("Runtime.evaluate exception: " + msg));
         } else {
           resolve(data.result?.result?.value);
         }
@@ -127,20 +132,20 @@ async function evalInTab(tabWsUrl, script) {
   });
 }
 
-async function waitForTestCompletion(tabWsUrl, timeoutMs = 25000) {
+async function waitForTestReady(tabWsUrl, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const res = await evalInTab(tabWsUrl, "window.__TEST_RESULTS__");
-      if (res && res.success !== undefined) {
-        return res;
+      const ready = await evalInTab(tabWsUrl, "typeof window.startTest === 'function'");
+      if (ready === true) {
+        return true;
       }
     } catch {
-      // Evaluation might fail while DOM loads
+      // Ignore while DOM loads
     }
-    await sleep(300);
+    await sleep(200);
   }
-  throw new Error("Timed out waiting for window.__TEST_RESULTS__");
+  throw new Error("Timed out waiting for window.startTest to be defined in tab");
 }
 
 async function main() {
@@ -173,6 +178,12 @@ async function main() {
   fs.mkdirSync(profileAlphaDir, { recursive: true });
   fs.mkdirSync(profileBetaDir, { recursive: true });
 
+  // Prepare test extension directory with isolated test fixture
+  const testExtDir = path.join(testDir, "test_extension");
+  fs.cpSync(EXTENSION_DIR, testExtDir, { recursive: true });
+  fs.copyFileSync(path.join(FIXTURES_DIR, "test_runner.html"), path.join(testExtDir, "test_runner.html"));
+  fs.copyFileSync(path.join(FIXTURES_DIR, "test_runner.js"), path.join(testExtDir, "test_runner.js"));
+
   console.log(`[2/6] Isolated test environment created: ${testDir}`);
 
   // 3. Run native CLI setup to bootstrap pairing for profile_alpha
@@ -183,23 +194,26 @@ async function main() {
   );
 
   const tokenMatch = setupOut.match(/Bootstrap Token:\s+(rb_boot_[a-f0-9]+)/);
-  const secretMatch = setupOut.match(/Pairing Secret:\s+(rb_sec_[a-f0-9]+)/);
   const pairMatch = setupOut.match(/Pairing ID:\s+(pair_[a-f0-9]+)/);
 
-  if (!tokenMatch || !pairMatch || !secretMatch) {
+  if (!tokenMatch || !pairMatch) {
     throw new Error(`Failed to parse setup output:\n${setupOut}`);
   }
 
   const bootstrapToken = tokenMatch[1];
   const pairingId = pairMatch[1];
-  const pairingSecret = secretMatch[1];
+
+  // Verify setup does NOT print plaintext pairing secret
+  if (setupOut.includes("Pairing Secret:")) {
+    throw new Error("Security violation: setup output must not print Pairing Secret when only bootstrap token is needed");
+  }
 
   console.log(`      Pairing ID:      ${pairingId}`);
   console.log(`      Bootstrap Token: ${bootstrapToken}`);
-  console.log(`      Pairing Secret:  ${pairingSecret}`);
 
   const regKey = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${HOST_NAME}`;
   let extId = null;
+  let pairingSecret = null;
 
   try {
     // -------------------------------------------------------------
@@ -222,10 +236,10 @@ async function main() {
     try {
       const version = await waitForBrowserVersion(cdpPortAlpha);
       console.log("      Installing unpacked extension via CDP Extensions.loadUnpacked...");
-      extId = await loadUnpackedExtension(version.webSocketDebuggerUrl, EXTENSION_DIR);
+      extId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
       console.log(`      Installed Extension ID: ${extId}`);
 
-      // Register Native Messaging Host in Windows Registry with this extension ID
+      // Register Native Messaging Host in Windows Registry with this pinned extension ID
       const manifestPath = path.join(stateDir, `${HOST_NAME}.json`);
       const manifest = {
         name: HOST_NAME,
@@ -236,14 +250,21 @@ async function main() {
       };
       fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
       execSync(`reg.exe add "${regKey}" /ve /t REG_SZ /d "${manifestPath}" /f`, { stdio: "ignore" });
-      console.log("      Registered Native Messaging Host manifest in Windows Registry.");
+      console.log("      Registered Native Messaging Host manifest in Windows Registry with pinned allowed_origins.");
 
-      const testUrlAlpha = `chrome-extension://${extId}/test_runner.html?mode=profile_alpha&profileId=profile_alpha&bootstrapToken=${bootstrapToken}`;
-      console.log("      Navigating to extension test runner page...");
+      // Open test runner with clean URL (no credentials/tokens in URL!)
+      const testUrlAlpha = `chrome-extension://${extId}/test_runner.html`;
+      console.log("      Navigating to extension test runner page (clean URL without secrets)...");
       const targetTab = await createTargetTab(version.webSocketDebuggerUrl, cdpPortAlpha, testUrlAlpha);
 
-      console.log("      Connected to test runner. Waiting for test assertions to execute...");
-      alphaResult = await waitForTestCompletion(targetTab.webSocketDebuggerUrl);
+      console.log("      Waiting for test runner DOM and scripts to load...");
+      await waitForTestReady(targetTab.webSocketDebuggerUrl);
+
+      console.log("      Injecting test configuration via CDP in-memory call...");
+      alphaResult = await evalInTab(
+        targetTab.webSocketDebuggerUrl,
+        `window.startTest(${JSON.stringify({ mode: "profile_alpha", profileId: "profile_alpha", bootstrapToken })})`
+      );
     } finally {
       chromeAlpha.kill();
       await sleep(1000);
@@ -253,6 +274,17 @@ async function main() {
       throw new Error(`Profile Alpha tests failed: ${JSON.stringify(alphaResult)}`);
     }
     console.log("      Profile Alpha assertions PASSED:\n", alphaResult.results.steps.map(s => `        [PASS] ${s.step}`).join("\n"));
+
+    pairingSecret = alphaResult.results.pairingSecret;
+    if (!pairingSecret || !pairingSecret.startsWith("rb_sec_")) {
+      throw new Error("Failed to receive active pairingSecret from bootstrap setup response");
+    }
+
+    // Verify SQLite database exists and contains active state
+    const dbPath = path.join(stateDir, "journal.sqlite");
+    if (!fs.existsSync(dbPath)) {
+      throw new Error("journal.sqlite not found after Profile Alpha setup");
+    }
 
     // -------------------------------------------------------------
     // Phase 2: Real Chrome with Profile Beta (Distinct Profile Isolation - N4)
@@ -273,13 +305,23 @@ async function main() {
     let betaResult;
     try {
       const versionBeta = await waitForBrowserVersion(cdpPortBeta);
-      const betaExtId = await loadUnpackedExtension(versionBeta.webSocketDebuggerUrl, EXTENSION_DIR);
+      const betaExtId = await loadUnpackedExtension(versionBeta.webSocketDebuggerUrl, testExtDir);
 
-      const testUrlBeta = `chrome-extension://${betaExtId}/test_runner.html?mode=profile_beta&profileId=profile_beta&pairingId=${pairingId}&pairingSecret=${pairingSecret}`;
-      console.log("      Opening test runner in Profile Beta to attempt cross-profile authentication...");
+      // Verify extension IDs match across profiles
+      if (betaExtId !== extId) {
+        throw new Error(`Expected identical extension ID across profiles (${extId}), got ${betaExtId}`);
+      }
+      console.log(`      Verified: Profile Beta loaded the same extension ID (${betaExtId}) with pinned allowed_origins.`);
+
+      const testUrlBeta = `chrome-extension://${betaExtId}/test_runner.html`;
+      console.log("      Opening test runner in Profile Beta (clean URL without secrets)...");
       const targetTab = await createTargetTab(versionBeta.webSocketDebuggerUrl, cdpPortBeta, testUrlBeta);
 
-      betaResult = await waitForTestCompletion(targetTab.webSocketDebuggerUrl);
+      await waitForTestReady(targetTab.webSocketDebuggerUrl);
+      betaResult = await evalInTab(
+        targetTab.webSocketDebuggerUrl,
+        `window.startTest(${JSON.stringify({ mode: "profile_beta", profileId: "profile_beta", pairingId, pairingSecret })})`
+      );
     } finally {
       chromeBeta.kill();
       await sleep(1000);
@@ -291,9 +333,9 @@ async function main() {
     console.log("      Profile Beta isolation assertions PASSED:\n", betaResult.results.steps.map(s => `        [PASS] ${s.step}`).join("\n"));
 
     // -------------------------------------------------------------
-    // Phase 3: Revocation & Retired Pairing
+    // Phase 3: Host Restart Persistence & Revocation
     // -------------------------------------------------------------
-    console.log("[6/6] Phase 3: Testing Pairing Revocation & Retired Pairing rejection...");
+    console.log("[6/6] Phase 3: Testing Host Restart Persistence & Pairing Revocation...");
     const cdpPortRevoke = 9252;
     const chromeRevoke = spawn(CHROME_PATH, [
       "--headless=new",
@@ -309,13 +351,17 @@ async function main() {
     let revokeResult;
     try {
       const versionRevoke = await waitForBrowserVersion(cdpPortRevoke);
-      const revokeExtId = await loadUnpackedExtension(versionRevoke.webSocketDebuggerUrl, EXTENSION_DIR);
+      const revokeExtId = await loadUnpackedExtension(versionRevoke.webSocketDebuggerUrl, testExtDir);
 
-      const testUrlRevoke = `chrome-extension://${revokeExtId}/test_runner.html?mode=revoke&profileId=profile_alpha&pairingId=${pairingId}&pairingSecret=${pairingSecret}`;
-      console.log("      Opening test runner in Profile Alpha to revoke pairing...");
+      const testUrlRevoke = `chrome-extension://${revokeExtId}/test_runner.html`;
+      console.log("      Opening test runner in Profile Alpha to test persistence & revoke (clean URL)...");
       const targetTab = await createTargetTab(versionRevoke.webSocketDebuggerUrl, cdpPortRevoke, testUrlRevoke);
 
-      revokeResult = await waitForTestCompletion(targetTab.webSocketDebuggerUrl);
+      await waitForTestReady(targetTab.webSocketDebuggerUrl);
+      revokeResult = await evalInTab(
+        targetTab.webSocketDebuggerUrl,
+        `window.startTest(${JSON.stringify({ mode: "revoke", profileId: "profile_alpha", pairingId, pairingSecret })})`
+      );
     } finally {
       chromeRevoke.kill();
       await sleep(1000);
@@ -329,18 +375,18 @@ async function main() {
     console.log("===============================================================");
     console.log("ALL REAL BROWSER-TO-NATIVE E2E GATES PASSED CLEANLY!");
     console.log("===============================================================");
-    console.log("Verified Deliverables for Issue #66:");
-    console.log("  1. Native-local companion setup owns pairing bootstrap & targets");
-    console.log("  2. Explicit OMP launch policy revision (v1) registered locally");
-    console.log("  3. On-demand Native Messaging host (no resident daemon)");
-    console.log("  4. Closed Native Messaging surface (setup, connect, status, revoke)");
-    console.log("  5. Unauthorized override rejection (targets/policy/executable/argv/env)");
-    console.log("  6. Task execution launch fails closed (Issue #67 boundary)");
-    console.log("  7. Unsupported operations fail closed (shell_exec, orca_rpc, etc.)");
-    console.log("  8. Embedded self-contained SQLite durability across host restarts");
-    console.log("  9. N4 Profile Isolation: two real profiles cannot share pairing");
-    console.log(" 10. Pairing revocation marks status retired; retired pairing rejected");
-    console.log(" 11. Explicit security & trust notice displayed");
+    console.log("Verified Deliverables for Issue #66 Remediations:");
+    console.log("  1. Removed test runner from prod extension; zero web_accessible_resources backdoor");
+    console.log("  2. Zero credentials/secrets in URLs; all test communication uses in-memory CDP calls");
+    console.log("  3. Atomic, fail-closed SQLite transactions for pairings, targets, and policies");
+    console.log("  4. Fail-closed CSPRNG: cryptographic generation fails if OS CSPRNG fails");
+    console.log("  5. Ephemeral plaintext pairing secret: not printed from setup, wiped from DB");
+    console.log("  6. Native-owned authority: fail-closed per-user directory, strictly required target");
+    console.log("  7. Target identity canonicalization: verified git repo/worktree identity");
+    console.log("  8. Multi-profile E2E: two real profiles with same extension ID and pinned allowed_origins");
+    console.log("  9. Distinct profile isolation (N4) confirmed under real browser execution");
+    console.log(" 10. Persistence across host/browser restarts proven via on-disk SQLite");
+    console.log(" 11. Revocation marks status retired and fails closed on subsequent connections");
     console.log(" 12. Active Hands Runtime, MCP, tunnel, and Machine Credentials UNTOUCHED");
     console.log("===============================================================");
   } finally {

@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::journal::{Journal, PolicyRecord, TargetRecord};
 use crate::protocol::{
@@ -18,6 +16,7 @@ pub const DEFAULT_EXTENSION_ID: &str = "mkkajdpmlmliildflmnnmfndboldnnfa";
 pub enum HostError {
     Io(std::io::Error),
     Storage(String),
+    Crypto(String),
     Protocol(ProtocolError),
     InvalidTarget(String),
     Registry(String),
@@ -46,6 +45,7 @@ impl std::fmt::Display for HostError {
         match self {
             HostError::Io(e) => write!(f, "IO error: {}", e),
             HostError::Storage(s) => write!(f, "Storage error: {}", s),
+            HostError::Crypto(c) => write!(f, "Cryptographic failure: {}", c),
             HostError::Protocol(p) => write!(f, "Protocol error: {}", p),
             HostError::InvalidTarget(t) => write!(f, "Invalid target path: {}", t),
             HostError::Registry(r) => write!(f, "Registry error: {}", r),
@@ -55,60 +55,99 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
-pub fn resolve_state_dir(override_opt: Option<&Path>) -> PathBuf {
+pub fn resolve_state_dir(override_opt: Option<&Path>) -> Result<PathBuf, HostError> {
     if let Some(p) = override_opt {
-        return p.to_path_buf();
+        return Ok(p.to_path_buf());
     }
     if let Ok(val) = std::env::var("HANDS_RETURN_BRIDGE_STATE_DIR") {
         if !val.trim().is_empty() {
-            return PathBuf::from(val.trim());
+            return Ok(PathBuf::from(val.trim()));
         }
     }
     if let Ok(val) = std::env::var("RETURN_BRIDGE_STATE_DIR") {
         if !val.trim().is_empty() {
-            return PathBuf::from(val.trim());
+            return Ok(PathBuf::from(val.trim()));
         }
     }
 
     #[cfg(windows)]
     {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data)
-                .join("Hands")
-                .join("return-bridge");
+            if !local_app_data.trim().is_empty() {
+                return Ok(PathBuf::from(local_app_data)
+                    .join("Hands")
+                    .join("return-bridge"));
+            }
         }
-        PathBuf::from(r"C:\ProgramData\Hands\return-bridge")
+        Err(HostError::Storage(
+            "Cannot resolve per-user state directory: LOCALAPPDATA environment variable is missing or empty".to_string(),
+        ))
     }
     #[cfg(not(windows))]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("hands")
-                .join("return-bridge");
+            if !home.trim().is_empty() {
+                return Ok(PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("hands")
+                    .join("return-bridge"));
+            }
         }
-        PathBuf::from("/tmp/hands-return-bridge")
+        Err(HostError::Storage(
+            "Cannot resolve per-user state directory: HOME environment variable is missing or empty".to_string(),
+        ))
     }
 }
 
-fn generate_random_id(prefix: &str, num_bytes: usize) -> String {
+fn generate_random_id(prefix: &str, num_bytes: usize) -> Result<String, HostError> {
     let mut bytes = vec![0u8; num_bytes];
-    if getrandom::fill(&mut bytes).is_err() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        let mut hasher = Sha256::new();
-        hasher.update(now.to_le_bytes());
-        hasher.update(pid.to_le_bytes());
-        hasher.update(prefix.as_bytes());
-        let digest = hasher.finalize();
-        bytes.copy_from_slice(&digest[..num_bytes]);
-    }
+    getrandom::fill(&mut bytes)
+        .map_err(|e| HostError::Crypto(format!("OS CSPRNG failure: {}", e)))?;
     let hex_part: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}_{}", prefix, hex_part)
+    Ok(format!("{}_{}", prefix, hex_part))
+}
+
+pub fn verify_and_canonicalize_git_target(raw_path: &Path) -> Result<PathBuf, HostError> {
+    if !raw_path.exists() || !raw_path.is_dir() {
+        return Err(HostError::InvalidTarget(format!(
+            "Target directory does not exist: {}",
+            raw_path.display()
+        )));
+    }
+
+    // Canonicalize raw path first
+    let canonical = raw_path
+        .canonicalize()
+        .map_err(|e| HostError::InvalidTarget(e.to_string()))?;
+
+    // Attempt git rev-parse --show-toplevel
+    if let Ok(output) = Command::new("git")
+        .args(["-C", &canonical.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if output.status.success() {
+            let toplevel_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !toplevel_str.is_empty() {
+                let toplevel_path = PathBuf::from(toplevel_str);
+                if toplevel_path.exists() {
+                    return toplevel_path
+                        .canonicalize()
+                        .map_err(|e| HostError::InvalidTarget(e.to_string()));
+                }
+            }
+        }
+    }
+
+    // Direct check if .git directory or file exists (for submodules/worktrees/bare/isolated test environments)
+    if canonical.join(".git").exists() {
+        return Ok(canonical);
+    }
+
+    Err(HostError::InvalidTarget(format!(
+        "Target '{}' is not a valid git repository or worktree identity",
+        raw_path.display()
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,36 +179,28 @@ pub struct SetupResult {
 }
 
 pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
-    let state_dir = resolve_state_dir(opts.state_dir.as_deref());
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
     std::fs::create_dir_all(&state_dir)?;
 
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    // Canonicalize target path
+    // Canonicalize & verify git target
     let raw_target = Path::new(&opts.target_path);
-    if !raw_target.exists() || !raw_target.is_dir() {
-        return Err(HostError::InvalidTarget(format!(
-            "Directory does not exist: {}",
-            opts.target_path
-        )));
-    }
-    let canonical = raw_target
-        .canonicalize()
-        .map_err(|e| HostError::InvalidTarget(e.to_string()))?;
+    let canonical = verify_and_canonicalize_git_target(raw_target)?;
     let canonical_path_str = canonical.to_string_lossy().to_string();
 
     let target_id = opts.target_id.clone().unwrap_or_else(|| {
-        raw_target
+        canonical
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("target_workspace")
             .to_string()
     });
 
-    let pairing_id = generate_random_id("pair", 8);
-    let bootstrap_token = generate_random_id("rb_boot", 12);
-    let pairing_secret = generate_random_id("rb_sec", 16);
+    let pairing_id = generate_random_id("pair", 8)?;
+    let bootstrap_token = generate_random_id("rb_boot", 12)?;
+    let pairing_secret = generate_random_id("rb_sec", 16)?;
 
     let targets = vec![TargetRecord {
         target_id: target_id.clone(),
@@ -196,7 +227,13 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         .map_err(|e| HostError::Storage(e.to_string()))?;
 
     // Generate manifest
-    let current_exe = std::env::current_exe()?;
+    let current_exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            let _ = journal.delete_pairing(&pairing_id);
+            return Err(HostError::Io(e));
+        }
+    };
     let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
 
     let allowed_origins = vec![format!("chrome-extension://{}/", opts.extension_id)];
@@ -209,13 +246,19 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         "allowed_origins": allowed_origins
     });
 
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json)?)?;
+    if let Err(e) = std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json)?) {
+        let _ = journal.delete_pairing(&pairing_id);
+        return Err(HostError::Io(e));
+    }
 
     // Register in Windows Registry if requested
     if !opts.skip_registry {
         #[cfg(windows)]
         {
-            register_manifest_registry(&opts.browser, &manifest_path)?;
+            if let Err(e) = register_manifest_registry(&opts.browser, &manifest_path) {
+                let _ = journal.delete_pairing(&pairing_id);
+                return Err(e);
+            }
         }
     }
 
@@ -278,10 +321,22 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
     Ok(())
 }
 
-pub fn run_native_host(state_dir_opt: Option<&Path>) -> Result<(), HostError> {
-    let state_dir = resolve_state_dir(state_dir_opt);
+pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
+    let state_dir = resolve_state_dir(state_dir_opt)?;
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    // Origin validation if provided by the browser
+    if let Some(orig) = origin {
+        if !orig.starts_with("chrome-extension://") {
+            return Err(HostError::Protocol(ProtocolError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Unauthorized extension origin: {}", orig),
+                ),
+            )));
+        }
+    }
 
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

@@ -13,7 +13,7 @@ fn print_help() {
 
 Usage:
   hands-return-bridge native-host [--state-dir <dir>]
-  hands-return-bridge setup [options]
+  hands-return-bridge setup --target <path> [options]
   hands-return-bridge status [--state-dir <dir>]
   hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
 
@@ -37,6 +37,12 @@ fn main() {
 
     // Chrome/Edge Native Messaging calls the binary with the extension origin as the first arg:
     // e.g., "hands-return-bridge.exe chrome-extension://<id>/"
+    let caller_origin = if args.len() >= 2 && args[1].starts_with("chrome-extension://") {
+        Some(args[1].as_str())
+    } else {
+        None
+    };
+
     if args.len() == 1
         || (args.len() >= 2
             && (args[1].starts_with("chrome-extension://")
@@ -53,7 +59,7 @@ fn main() {
             i += 1;
         }
 
-        if let Err(e) = run_native_host(state_dir.as_deref()) {
+        if let Err(e) = run_native_host(state_dir.as_deref(), caller_origin) {
             eprintln!("Native host error: {}", e);
             std::process::exit(1);
         }
@@ -121,6 +127,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("Unknown option: {}", other);
+                        print_help();
                         std::process::exit(1);
                     }
                 }
@@ -128,12 +135,10 @@ fn main() {
             }
 
             let target = match target_path {
-                Some(t) => t,
-                None => {
-                    // Default to current working directory
-                    env::current_dir()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| ".".to_string())
+                Some(t) if !t.trim().is_empty() => t,
+                _ => {
+                    eprintln!("Error: --target <path> is required");
+                    std::process::exit(1);
                 }
             };
 
@@ -164,7 +169,6 @@ fn main() {
                     println!("Manifest:         {}", res.manifest_path.display());
                     println!("------------------------------------------------------------");
                     println!("Bootstrap Token:  {}", res.bootstrap_token);
-                    println!("Pairing Secret:   {}", res.pairing_secret);
                     println!("------------------------------------------------------------");
                     println!("Enter this Bootstrap Token in the Return Bridge extension");
                     println!("options page to complete pairing.");
@@ -187,7 +191,13 @@ fn main() {
                 i += 1;
             }
 
-            let dir = resolve_state_dir(state_dir.as_deref());
+            let dir = match resolve_state_dir(state_dir.as_deref()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to resolve state dir: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let db_path = dir.join("journal.sqlite");
             if !db_path.exists() {
                 println!("No Return Bridge journal found at {}", db_path.display());
@@ -233,7 +243,13 @@ fn main() {
                 }
             };
 
-            let dir = resolve_state_dir(state_dir.as_deref());
+            let dir = match resolve_state_dir(state_dir.as_deref()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to resolve state dir: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let db_path = dir.join("journal.sqlite");
             let journal = match Journal::open(&db_path) {
                 Ok(j) => j,

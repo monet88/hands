@@ -14,19 +14,26 @@ function sendNative(msg) {
 function logResult(step, pass, details) {
   const line = `[${pass ? "PASS" : "FAIL"}] ${step}: ${JSON.stringify(details)}`;
   console.log(line);
-  document.getElementById("results").textContent += line + "\n";
+  const el = document.getElementById("results");
+  if (el) {
+    el.textContent += line + "\n";
+  }
   if (!pass) {
     throw new Error(`Test failed at step: ${step}`);
   }
 }
 
-async function run() {
-  const params = new URLSearchParams(window.location.search);
-  const mode = params.get("mode") || "profile_alpha";
-  const profileId = params.get("profileId") || (mode === "profile_alpha" ? "profile_alpha" : "profile_beta");
-  const bootstrapToken = params.get("bootstrapToken");
-  const pairingId = params.get("pairingId");
-  const pairingSecret = params.get("pairingSecret");
+window.startTest = async function(config = {}) {
+  const mode = config.mode || "profile_alpha";
+  const profileId = config.profileId || (mode === "profile_alpha" ? "profile_alpha" : "profile_beta");
+  const bootstrapToken = config.bootstrapToken;
+  const pairingId = config.pairingId;
+  const pairingSecret = config.pairingSecret;
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = `Running mode: ${mode}...`;
+  }
 
   const results = { mode, profileId, steps: [] };
 
@@ -174,14 +181,18 @@ async function run() {
       results.steps.push({ step: "reject_retired_pairing", pass: retiredRejected });
     }
 
-    document.getElementById("status").textContent = "SUCCESS";
+    if (statusEl) {
+      statusEl.textContent = "SUCCESS";
+    }
     document.title = "TESTS_FINISHED_SUCCESS";
     window.__TEST_RESULTS__ = { success: true, results };
+    return window.__TEST_RESULTS__;
   } catch (err) {
-    document.getElementById("status").textContent = "ERROR: " + err.message;
+    if (statusEl) {
+      statusEl.textContent = "ERROR: " + err.message;
+    }
     document.title = "TESTS_FINISHED_ERROR";
     window.__TEST_RESULTS__ = { success: false, error: err.message, results };
+    return window.__TEST_RESULTS__;
   }
-}
-
-window.addEventListener("DOMContentLoaded", run);
+};

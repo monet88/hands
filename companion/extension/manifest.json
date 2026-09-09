@@ -21,16 +21,5 @@
   },
   "host_permissions": [
     "https://chatgpt.com/*"
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "test_runner.html",
-        "test_runner.js"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    }
   ]
 }

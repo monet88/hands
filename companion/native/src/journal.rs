@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use parking_lot::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -90,7 +91,7 @@ impl std::fmt::Display for PairingError {
 impl std::error::Error for PairingError {}
 
 pub struct Journal {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 fn now_epoch_secs() -> i64 {
@@ -174,7 +175,9 @@ impl Journal {
             );
             "#,
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn create_bootstrap(
@@ -190,7 +193,10 @@ impl Journal {
         let now = now_epoch_secs();
         let secret_hash = hash_secret(pairing_secret);
 
-        self.conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+
+        tx.execute(
             r#"
             INSERT INTO pairings (
                 pairing_id, bootstrap_token, pairing_secret, pairing_secret_hash,
@@ -212,7 +218,7 @@ impl Journal {
         )?;
 
         for target in targets {
-            self.conn.execute(
+            tx.execute(
                 r#"
                 INSERT INTO targets (pairing_id, target_id, canonical_path, name)
                 VALUES (?1, ?2, ?3, ?4)
@@ -226,7 +232,7 @@ impl Journal {
             )?;
         }
 
-        self.conn.execute(
+        tx.execute(
             r#"
             INSERT INTO policies (pairing_id, policy_revision, tool_policy, approval_policy)
             VALUES (?1, ?2, ?3, ?4)
@@ -239,12 +245,22 @@ impl Journal {
             ],
         )?;
 
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_pairing(&self, pairing_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM pairings WHERE pairing_id = ?1",
+            params![pairing_id],
+        )?;
         Ok(())
     }
 
     pub fn get_pairing_status(&self, pairing_id: &str) -> Result<PairingStatus, PairingError> {
-        let status_str: Option<String> = self
-            .conn
+        let conn = self.conn.lock();
+        let status_str: Option<String> = conn
             .query_row(
                 "SELECT status FROM pairings WHERE pairing_id = ?1",
                 params![pairing_id],
@@ -267,9 +283,13 @@ impl Journal {
     ) -> Result<ActivatedPairing, PairingError> {
         let now = now_epoch_secs();
 
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
         // Find pairing with this bootstrap token
-        let row: Option<(String, String, String, String)> = self
-            .conn
+        let row: Option<(String, String, String, String)> = tx
             .query_row(
                 r#"
                 SELECT pairing_id, pairing_secret, status, policy_revision
@@ -294,9 +314,8 @@ impl Journal {
             return Err(PairingError::Retired);
         }
 
-        // Consume bootstrap token atomically and update profile_id if provided
-        let affected = self
-            .conn
+        // Consume bootstrap token atomically, wipe plaintext pairing secret from DB, and activate
+        let affected = tx
             .execute(
                 r#"
                 UPDATE pairings
@@ -320,8 +339,11 @@ impl Journal {
             return Err(PairingError::NotFound);
         }
 
-        let targets = self.get_targets(&pairing_id)?;
-        let policy = self.get_policy(&pairing_id, &policy_rev)?;
+        let targets = Self::get_targets_inner(&tx, &pairing_id)?;
+        let policy = Self::get_policy_inner(&tx, &pairing_id, &policy_rev)?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(ActivatedPairing {
             pairing_id,
@@ -338,8 +360,8 @@ impl Journal {
         pairing_secret: &str,
         profile_id: &str,
     ) -> Result<PairingContext, PairingError> {
-        let row: Option<(String, String, String, String, String)> = self
-            .conn
+        let conn = self.conn.lock();
+        let row: Option<(String, String, String, String, String)> = conn
             .query_row(
                 r#"
                 SELECT pairing_secret_hash, browser, profile_id, status, policy_revision
@@ -375,8 +397,8 @@ impl Journal {
             return Err(PairingError::ProfileMismatch);
         }
 
-        let targets = self.get_targets(pairing_id)?;
-        let policy = self.get_policy(pairing_id, &policy_rev)?;
+        let targets = Self::get_targets_inner(&conn, pairing_id)?;
+        let policy = Self::get_policy_inner(&conn, pairing_id, &policy_rev)?;
 
         Ok(PairingContext {
             pairing_id: pairing_id.to_string(),
@@ -399,28 +421,28 @@ impl Journal {
         let _ = self.authenticate_pairing(pairing_id, pairing_secret, profile_id)?;
         let now = now_epoch_secs();
 
-        self.conn
-            .execute(
-                r#"
-                UPDATE pairings
-                SET status = ?1, updated_at = ?2
-                WHERE pairing_id = ?3
-                "#,
-                params![PairingStatus::Revoked.as_str(), now, pairing_id],
-            )
-            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+            UPDATE pairings
+            SET status = ?1, bootstrap_token = NULL, pairing_secret = NULL, updated_at = ?2
+            WHERE pairing_id = ?3
+            "#,
+            params![PairingStatus::Revoked.as_str(), now, pairing_id],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(())
     }
 
     pub fn revoke_pairing_admin(&self, pairing_id: &str) -> Result<(), PairingError> {
         let now = now_epoch_secs();
-        let affected = self
-            .conn
+        let conn = self.conn.lock();
+        let affected = conn
             .execute(
                 r#"
                 UPDATE pairings
-                SET status = ?1, updated_at = ?2
+                SET status = ?1, bootstrap_token = NULL, pairing_secret = NULL, updated_at = ?2
                 WHERE pairing_id = ?3
                 "#,
                 params![PairingStatus::Revoked.as_str(), now, pairing_id],
@@ -435,8 +457,24 @@ impl Journal {
     }
 
     pub fn get_targets(&self, pairing_id: &str) -> Result<Vec<TargetRecord>, PairingError> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock();
+        Self::get_targets_inner(&conn, pairing_id)
+    }
+
+    pub fn get_policy(
+        &self,
+        pairing_id: &str,
+        policy_revision: &str,
+    ) -> Result<PolicyRecord, PairingError> {
+        let conn = self.conn.lock();
+        Self::get_policy_inner(&conn, pairing_id, policy_revision)
+    }
+
+    fn get_targets_inner(
+        conn: &Connection,
+        pairing_id: &str,
+    ) -> Result<Vec<TargetRecord>, PairingError> {
+        let mut stmt = conn
             .prepare(
                 r#"
                 SELECT target_id, canonical_path, name
@@ -464,30 +502,29 @@ impl Journal {
         Ok(targets)
     }
 
-    pub fn get_policy(
-        &self,
+    fn get_policy_inner(
+        conn: &Connection,
         pairing_id: &str,
         policy_revision: &str,
     ) -> Result<PolicyRecord, PairingError> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT policy_revision, tool_policy, approval_policy
-                FROM policies
-                WHERE pairing_id = ?1 AND policy_revision = ?2
-                "#,
-                params![pairing_id, policy_revision],
-                |r| {
-                    Ok(PolicyRecord {
-                        policy_revision: r.get(0)?,
-                        tool_policy: r.get(1)?,
-                        approval_policy: r.get(2)?,
-                    })
-                },
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => PairingError::NotFound,
-                _ => PairingError::StorageError(e.to_string()),
-            })
+        conn.query_row(
+            r#"
+            SELECT policy_revision, tool_policy, approval_policy
+            FROM policies
+            WHERE pairing_id = ?1 AND policy_revision = ?2
+            "#,
+            params![pairing_id, policy_revision],
+            |r| {
+                Ok(PolicyRecord {
+                    policy_revision: r.get(0)?,
+                    tool_policy: r.get(1)?,
+                    approval_policy: r.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => PairingError::NotFound,
+            _ => PairingError::StorageError(e.to_string()),
+        })
     }
 }
