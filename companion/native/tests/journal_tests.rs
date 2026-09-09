@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 use tempfile::tempdir;
 
-// We will import from hands_return_bridge::journal
 use hands_return_bridge::journal::{
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
 };
@@ -15,7 +15,6 @@ fn test_journal_bootstrap_activate_and_authenticate() {
 
     let pairing_id = "pair_test_123";
     let bootstrap_token = "boot_token_abc";
-    let pairing_secret = "secret_xyz";
     let browser = "chrome";
     let profile_id = "profile_alpha";
     let targets = vec![TargetRecord {
@@ -33,7 +32,6 @@ fn test_journal_bootstrap_activate_and_authenticate() {
         .create_bootstrap(
             pairing_id,
             bootstrap_token,
-            pairing_secret,
             browser,
             profile_id,
             &targets,
@@ -45,7 +43,15 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     let status = journal.get_pairing_status(pairing_id).unwrap();
     assert_eq!(status, PairingStatus::Pending);
 
-    // Activate using bootstrap token
+    // Finding 3: authenticate/connect/status must reject non-Active (Pending) pairings
+    let err_pending_auth = journal.authenticate_pairing(pairing_id, "any_secret", profile_id);
+    assert_eq!(err_pending_auth.unwrap_err(), PairingError::NotActive);
+
+    // Finding 2: Activation with mismatched profile ID must fail closed
+    let err_profile_act = journal.activate_bootstrap(bootstrap_token, "wrong_profile");
+    assert_eq!(err_profile_act.unwrap_err(), PairingError::ProfileMismatch);
+
+    // Activate using bootstrap token with correct profile ID
     let activated = journal
         .activate_bootstrap(bootstrap_token, profile_id)
         .expect("Activation failed");
@@ -54,6 +60,9 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     assert_eq!(activated.targets.len(), 1);
     assert_eq!(activated.targets[0].target_id, "target_canonical");
     assert_eq!(activated.policy.policy_revision, "v1");
+    assert!(activated.pairing_secret.starts_with("rb_sec_"));
+
+    let pairing_secret = activated.pairing_secret;
 
     // Token is one-time: second activation must fail
     let second_act = journal.activate_bootstrap(bootstrap_token, profile_id);
@@ -67,13 +76,13 @@ fn test_journal_bootstrap_activate_and_authenticate() {
 
     // Authenticate with matching credentials
     let auth = journal
-        .authenticate_pairing(pairing_id, pairing_secret, profile_id)
+        .authenticate_pairing(pairing_id, &pairing_secret, profile_id)
         .expect("Authentication failed");
     assert_eq!(auth.pairing_id, pairing_id);
     assert_eq!(auth.profile_id, profile_id);
 
     // Rejection 1: Mismatched profile ID (N4 profile isolation)
-    let err_profile = journal.authenticate_pairing(pairing_id, pairing_secret, "profile_beta");
+    let err_profile = journal.authenticate_pairing(pairing_id, &pairing_secret, "profile_beta");
     assert_eq!(err_profile.unwrap_err(), PairingError::ProfileMismatch);
 
     // Rejection 2: Wrong secret
@@ -81,7 +90,7 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     assert_eq!(err_secret.unwrap_err(), PairingError::InvalidSecret);
 
     // Rejection 3: Unknown pairing
-    let err_unknown = journal.authenticate_pairing("unknown_id", pairing_secret, profile_id);
+    let err_unknown = journal.authenticate_pairing("unknown_id", &pairing_secret, profile_id);
     assert_eq!(err_unknown.unwrap_err(), PairingError::NotFound);
 
     // Reopen DB to prove committed setup survives host exit/restart
@@ -89,18 +98,138 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     let reopened = Journal::open(&db_path).expect("Failed to reopen journal");
 
     let auth_reopened = reopened
-        .authenticate_pairing(pairing_id, pairing_secret, profile_id)
+        .authenticate_pairing(pairing_id, &pairing_secret, profile_id)
         .expect("Authentication on reopened DB failed");
     assert_eq!(auth_reopened.pairing_id, pairing_id);
 
     // Revocation
     reopened
-        .revoke_pairing(pairing_id, pairing_secret, profile_id)
+        .revoke_pairing(pairing_id, &pairing_secret, profile_id)
         .expect("Revoke failed");
 
     // After revocation, authentication must fail with Retired
-    let err_revoked = reopened.authenticate_pairing(pairing_id, pairing_secret, profile_id);
+    let err_revoked = reopened.authenticate_pairing(pairing_id, &pairing_secret, profile_id);
     assert_eq!(err_revoked.unwrap_err(), PairingError::Retired);
+}
+
+#[test]
+fn test_concurrent_activation_exactly_one_winner() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Arc::new(Journal::open(&db_path).expect("Failed to open journal"));
+
+    let pairing_id = "pair_race_test";
+    let bootstrap_token = "boot_race_token_123";
+    let browser = "chrome";
+    let profile_id = "profile_race";
+    let targets = vec![TargetRecord {
+        target_id: "target_race".to_string(),
+        canonical_path: "/workspace/race".to_string(),
+        name: "race".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            browser,
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .expect("Create bootstrap failed");
+
+    // Spawn 8 concurrent threads attempting activation with the same token
+    let num_threads = 8;
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        let j = Arc::clone(&journal);
+        let token = bootstrap_token.to_string();
+        let prof = profile_id.to_string();
+        handles.push(thread::spawn(move || {
+            j.activate_bootstrap(&token, &prof)
+        }));
+    }
+
+    let mut successes = 0;
+    let mut failures = 0;
+
+    for handle in handles {
+        match handle.join().expect("Thread panicked") {
+            Ok(act) => {
+                successes += 1;
+                assert_eq!(act.pairing_id, pairing_id);
+                assert!(act.pairing_secret.starts_with("rb_sec_"));
+            }
+            Err(_) => {
+                failures += 1;
+            }
+        }
+    }
+
+    assert_eq!(successes, 1, "Exactly one concurrent thread must win activation");
+    assert_eq!(failures, num_threads - 1, "All losing concurrent threads must fail closed");
+}
+
+#[test]
+fn test_no_plaintext_credentials_at_rest() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_cred_test";
+    let bootstrap_token = "boot_super_secret_token_never_plain_12345";
+    let browser = "chrome";
+    let profile_id = "profile_cred";
+    let targets = vec![TargetRecord {
+        target_id: "target_cred".to_string(),
+        canonical_path: "/workspace/cred".to_string(),
+        name: "cred".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            browser,
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .expect("Create bootstrap failed");
+
+    let act = journal
+        .activate_bootstrap(bootstrap_token, profile_id)
+        .expect("Activation failed");
+    let pairing_secret = act.pairing_secret;
+
+    // Flush & close connection
+    drop(journal);
+
+    // Read raw SQLite database file contents from disk
+    let raw_bytes = std::fs::read(&db_path).expect("Failed to read raw sqlite file");
+    let raw_text = String::from_utf8_lossy(&raw_bytes);
+
+    // Finding 4: No plaintext bootstrap token or pairing secret at rest in SQLite
+    assert!(
+        !raw_text.contains(bootstrap_token),
+        "Plaintext bootstrap token must NOT exist anywhere in SQLite file at rest"
+    );
+    assert!(
+        !raw_text.contains(&pairing_secret),
+        "Plaintext pairing secret must NOT exist anywhere in SQLite file at rest"
+    );
 }
 
 #[test]
@@ -112,7 +241,6 @@ fn test_bootstrap_persistence_atomic_rollback_on_failure() {
 
     let pairing_id = "pair_atomic_test";
     let bootstrap_token = "boot_atomic_abc";
-    let pairing_secret = "secret_atomic_xyz";
     let browser = "chrome";
     let profile_id = "profile_alpha";
 
@@ -140,7 +268,6 @@ fn test_bootstrap_persistence_atomic_rollback_on_failure() {
     let result = journal.create_bootstrap(
         pairing_id,
         bootstrap_token,
-        pairing_secret,
         browser,
         profile_id,
         &targets,

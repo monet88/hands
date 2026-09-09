@@ -13,13 +13,13 @@ fn print_help() {
 
 Usage:
   hands-return-bridge native-host [--state-dir <dir>]
-  hands-return-bridge setup --target <path> [options]
+  hands-return-bridge setup --target <path> --profile <profile_id> [options]
   hands-return-bridge status [--state-dir <dir>]
   hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
-  --profile <profile_id>        Browser profile identifier (default: Default)
+  --profile <profile_id>        Browser profile identifier (required)
   --target <path>               Canonical workspace/worktree target path (required)
   --target-id <id>              Target ID identifier (default: dir name)
   --policy-revision <rev>       Explicit OMP launch policy revision (default: v1)
@@ -69,7 +69,7 @@ fn main() {
     match args[1].as_str() {
         "setup" => {
             let mut browser = "chrome".to_string();
-            let mut profile_id = "Default".to_string();
+            let mut profile_id = None;
             let mut target_path = None;
             let mut target_id = None;
             let mut policy_revision = "v1".to_string();
@@ -87,7 +87,7 @@ fn main() {
                         i += 1;
                     }
                     "--profile" if i + 1 < args.len() => {
-                        profile_id = args[i + 1].clone();
+                        profile_id = Some(args[i + 1].clone());
                         i += 1;
                     }
                     "--target" if i + 1 < args.len() => {
@@ -138,6 +138,14 @@ fn main() {
                 Some(t) if !t.trim().is_empty() => t,
                 _ => {
                     eprintln!("Error: --target <path> is required");
+                    std::process::exit(1);
+                }
+            };
+
+            let profile_id = match profile_id {
+                Some(p) if !p.trim().is_empty() => p,
+                _ => {
+                    eprintln!("Error: --profile <profile_id> is required (obtain from Return Bridge extension settings)");
                     std::process::exit(1);
                 }
             };

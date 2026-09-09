@@ -51,7 +51,6 @@ fn test_closed_operation_set_and_security_guards() {
         .create_bootstrap(
             pairing_id,
             bootstrap_token,
-            pairing_secret,
             browser,
             profile_id,
             &targets,
@@ -68,7 +67,8 @@ fn test_closed_operation_set_and_security_guards() {
     let setup_resp = handle_native_message(&setup_msg, &journal);
     assert_eq!(setup_resp["status"], "ok");
     assert_eq!(setup_resp["pairingId"], pairing_id);
-    assert_eq!(setup_resp["pairingSecret"], pairing_secret);
+    let pairing_secret = setup_resp["pairingSecret"].as_str().unwrap();
+    assert!(pairing_secret.starts_with("rb_sec_"));
     assert_eq!(setup_resp["policyRevision"], "v1");
     assert_eq!(setup_resp["targets"][0]["target_id"], "target_hands");
 

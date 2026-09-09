@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +73,7 @@ pub enum PairingError {
     InvalidSecret,
     ProfileMismatch,
     Retired,
+    NotActive,
     StorageError(String),
 }
 
@@ -83,6 +84,7 @@ impl std::fmt::Display for PairingError {
             PairingError::InvalidSecret => write!(f, "invalid_pairing_secret"),
             PairingError::ProfileMismatch => write!(f, "profile_mismatch"),
             PairingError::Retired => write!(f, "pairing_retired"),
+            PairingError::NotActive => write!(f, "pairing_not_active"),
             PairingError::StorageError(e) => write!(f, "storage_error: {}", e),
         }
     }
@@ -106,6 +108,14 @@ fn hash_secret(secret: &str) -> String {
     hasher.update(b"hands_rb_salt_v1:");
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn generate_random_secret(prefix: &str, num_bytes: usize) -> Result<String, PairingError> {
+    let mut bytes = vec![0u8; num_bytes];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| PairingError::StorageError(format!("OS CSPRNG failure: {}", e)))?;
+    let hex_part: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    Ok(format!("{}_{}", prefix, hex_part))
 }
 
 // Simple hex encoder to avoid another dependency
@@ -140,14 +150,13 @@ impl Journal {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS pairings (
                 pairing_id TEXT PRIMARY KEY,
-                bootstrap_token TEXT UNIQUE,
-                pairing_secret TEXT,
-                pairing_secret_hash TEXT NOT NULL,
+                bootstrap_token_hash TEXT UNIQUE,
+                pairing_secret_hash TEXT,
                 browser TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -173,6 +182,11 @@ impl Journal {
                 PRIMARY KEY (pairing_id, policy_revision),
                 FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS host_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(Self {
@@ -180,35 +194,58 @@ impl Journal {
         })
     }
 
+    pub fn set_expected_extension_id(&self, extension_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+            INSERT INTO host_config (key, value)
+            VALUES ('expected_extension_id', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![extension_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_expected_extension_id(&self) -> Result<Option<String>, PairingError> {
+        let conn = self.conn.lock();
+        let res: Option<String> = conn
+            .query_row(
+                "SELECT value FROM host_config WHERE key = 'expected_extension_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Ok(res)
+    }
+
     pub fn create_bootstrap(
         &self,
         pairing_id: &str,
         bootstrap_token: &str,
-        pairing_secret: &str,
         browser: &str,
         profile_id: &str,
         targets: &[TargetRecord],
         policy: &PolicyRecord,
     ) -> Result<(), rusqlite::Error> {
         let now = now_epoch_secs();
-        let secret_hash = hash_secret(pairing_secret);
+        let token_hash = hash_secret(bootstrap_token);
 
         let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         tx.execute(
             r#"
             INSERT INTO pairings (
-                pairing_id, bootstrap_token, pairing_secret, pairing_secret_hash,
+                pairing_id, bootstrap_token_hash, pairing_secret_hash,
                 browser, profile_id, status, policy_revision,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?7)
             "#,
             params![
                 pairing_id,
-                bootstrap_token,
-                pairing_secret,
-                secret_hash,
+                token_hash,
                 browser,
                 profile_id,
                 PairingStatus::Pending.as_str(),
@@ -282,27 +319,28 @@ impl Journal {
         profile_id: &str,
     ) -> Result<ActivatedPairing, PairingError> {
         let now = now_epoch_secs();
+        let token_hash = hash_secret(bootstrap_token);
 
         let mut conn = self.conn.lock();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        // Find pairing with this bootstrap token
+        // Find pairing with this bootstrap token hash
         let row: Option<(String, String, String, String)> = tx
             .query_row(
                 r#"
-                SELECT pairing_id, pairing_secret, status, policy_revision
+                SELECT pairing_id, profile_id, status, policy_revision
                 FROM pairings
-                WHERE bootstrap_token = ?1
+                WHERE bootstrap_token_hash = ?1
                 "#,
-                params![bootstrap_token],
+                params![token_hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        let (pairing_id, pairing_secret, status_str, policy_rev) = match row {
+        let (pairing_id, stored_profile_id, status_str, policy_rev) = match row {
             Some(r) => r,
             None => return Err(PairingError::NotFound),
         };
@@ -313,24 +351,41 @@ impl Journal {
         if status == PairingStatus::Revoked {
             return Err(PairingError::Retired);
         }
+        if status != PairingStatus::Pending {
+            return Err(PairingError::NotActive);
+        }
 
-        // Consume bootstrap token atomically, wipe plaintext pairing secret from DB, and activate
+        // Profile ID must match the one selected during native setup!
+        if stored_profile_id != profile_id {
+            return Err(PairingError::ProfileMismatch);
+        }
+
+        // Generate the pairing secret ONLY upon successful activation using CSPRNG
+        let pairing_secret = generate_random_secret("rb_sec", 16)?;
+        let secret_hash = hash_secret(&pairing_secret);
+
+        // Atomic conditional update: exactly one winner under concurrency!
         let affected = tx
             .execute(
                 r#"
                 UPDATE pairings
-                SET bootstrap_token = NULL,
-                    pairing_secret = NULL,
-                    profile_id = ?1,
+                SET bootstrap_token_hash = NULL,
+                    pairing_secret_hash = ?1,
                     status = ?2,
                     updated_at = ?3
                 WHERE pairing_id = ?4
+                  AND status = ?5
+                  AND profile_id = ?6
+                  AND bootstrap_token_hash = ?7
                 "#,
                 params![
-                    profile_id,
+                    secret_hash,
                     PairingStatus::Active.as_str(),
                     now,
-                    pairing_id
+                    pairing_id,
+                    PairingStatus::Pending.as_str(),
+                    profile_id,
+                    token_hash
                 ],
             )
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
@@ -361,7 +416,7 @@ impl Journal {
         profile_id: &str,
     ) -> Result<PairingContext, PairingError> {
         let conn = self.conn.lock();
-        let row: Option<(String, String, String, String, String)> = conn
+        let row: Option<(Option<String>, String, String, String, String)> = conn
             .query_row(
                 r#"
                 SELECT pairing_secret_hash, browser, profile_id, status, policy_revision
@@ -374,7 +429,7 @@ impl Journal {
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        let (stored_hash, browser, stored_profile_id, status_str, policy_rev) = match row {
+        let (stored_hash_opt, browser, stored_profile_id, status_str, policy_rev) = match row {
             Some(r) => r,
             None => return Err(PairingError::NotFound),
         };
@@ -385,6 +440,14 @@ impl Journal {
         if status == PairingStatus::Revoked {
             return Err(PairingError::Retired);
         }
+        if status == PairingStatus::Pending || status != PairingStatus::Active {
+            return Err(PairingError::NotActive);
+        }
+
+        let stored_hash = match stored_hash_opt {
+            Some(h) if !h.is_empty() => h,
+            _ => return Err(PairingError::NotActive),
+        };
 
         // Verify secret hash
         let given_hash = hash_secret(pairing_secret);
@@ -425,7 +488,7 @@ impl Journal {
         conn.execute(
             r#"
             UPDATE pairings
-            SET status = ?1, bootstrap_token = NULL, pairing_secret = NULL, updated_at = ?2
+            SET status = ?1, bootstrap_token_hash = NULL, pairing_secret_hash = NULL, updated_at = ?2
             WHERE pairing_id = ?3
             "#,
             params![PairingStatus::Revoked.as_str(), now, pairing_id],
@@ -442,7 +505,7 @@ impl Journal {
             .execute(
                 r#"
                 UPDATE pairings
-                SET status = ?1, bootstrap_token = NULL, pairing_secret = NULL, updated_at = ?2
+                SET status = ?1, bootstrap_token_hash = NULL, pairing_secret_hash = NULL, updated_at = ?2
                 WHERE pairing_id = ?3
                 "#,
                 params![PairingStatus::Revoked.as_str(), now, pairing_id],

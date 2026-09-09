@@ -116,38 +116,37 @@ pub fn verify_and_canonicalize_git_target(raw_path: &Path) -> Result<PathBuf, Ho
         )));
     }
 
-    // Canonicalize raw path first
     let canonical = raw_path
         .canonicalize()
         .map_err(|e| HostError::InvalidTarget(e.to_string()))?;
 
-    // Attempt git rev-parse --show-toplevel
-    if let Ok(output) = Command::new("git")
+    // Require real git rev-parse --show-toplevel success. No fake .git fallback!
+    let output = Command::new("git")
         .args(["-C", &canonical.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
-    {
-        if output.status.success() {
-            let toplevel_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !toplevel_str.is_empty() {
-                let toplevel_path = PathBuf::from(toplevel_str);
-                if toplevel_path.exists() {
-                    return toplevel_path
-                        .canonicalize()
-                        .map_err(|e| HostError::InvalidTarget(e.to_string()));
-                }
-            }
-        }
+        .map_err(|e| HostError::InvalidTarget(format!("Failed to execute git: {}", e)))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(HostError::InvalidTarget(format!(
+            "Target '{}' is not a valid git repository or worktree: {}",
+            raw_path.display(),
+            err.trim()
+        )));
     }
 
-    // Direct check if .git directory or file exists (for submodules/worktrees/bare/isolated test environments)
-    if canonical.join(".git").exists() {
-        return Ok(canonical);
+    let toplevel_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if toplevel_str.is_empty() {
+        return Err(HostError::InvalidTarget(format!(
+            "git rev-parse returned empty toplevel for '{}'",
+            raw_path.display()
+        )));
     }
 
-    Err(HostError::InvalidTarget(format!(
-        "Target '{}' is not a valid git repository or worktree identity",
-        raw_path.display()
-    )))
+    let toplevel_path = PathBuf::from(toplevel_str);
+    toplevel_path
+        .canonicalize()
+        .map_err(|e| HostError::InvalidTarget(e.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +167,6 @@ pub struct SetupOptions {
 pub struct SetupResult {
     pub pairing_id: String,
     pub bootstrap_token: String,
-    pub pairing_secret: String,
     pub browser: String,
     pub profile_id: String,
     pub target_id: String,
@@ -179,13 +177,22 @@ pub struct SetupResult {
 }
 
 pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
+    // Validate browser: reject invalid browsers rather than defaulting
+    let browser_norm = opts.browser.to_lowercase();
+    if browser_norm != "chrome" && browser_norm != "edge" {
+        return Err(HostError::Storage(format!(
+            "Invalid browser '{}': only 'chrome' and 'edge' are supported",
+            opts.browser
+        )));
+    }
+
     let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
     std::fs::create_dir_all(&state_dir)?;
 
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    // Canonicalize & verify git target
+    // Canonicalize & verify git target (real git rev-parse required)
     let raw_target = Path::new(&opts.target_path);
     let canonical = verify_and_canonicalize_git_target(raw_target)?;
     let canonical_path_str = canonical.to_string_lossy().to_string();
@@ -200,7 +207,6 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 
     let pairing_id = generate_random_id("pair", 8)?;
     let bootstrap_token = generate_random_id("rb_boot", 12)?;
-    let pairing_secret = generate_random_id("rb_sec", 16)?;
 
     let targets = vec![TargetRecord {
         target_id: target_id.clone(),
@@ -214,16 +220,21 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         approval_policy: opts.approval_policy.clone(),
     };
 
+    // Store bootstrap token hash (zero plaintext credential at rest)
     journal
         .create_bootstrap(
             &pairing_id,
             &bootstrap_token,
-            &pairing_secret,
-            &opts.browser,
+            &browser_norm,
             &opts.profile_id,
             &targets,
             &policy,
         )
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    // Persist expected extension ID in journal configuration
+    journal
+        .set_expected_extension_id(&opts.extension_id)
         .map_err(|e| HostError::Storage(e.to_string()))?;
 
     // Generate manifest
@@ -255,7 +266,9 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     if !opts.skip_registry {
         #[cfg(windows)]
         {
-            if let Err(e) = register_manifest_registry(&opts.browser, &manifest_path) {
+            if let Err(e) = register_manifest_registry(&browser_norm, &manifest_path) {
+                // Cleanup orphan manifest and database row on registration failure
+                let _ = std::fs::remove_file(&manifest_path);
                 let _ = journal.delete_pairing(&pairing_id);
                 return Err(e);
             }
@@ -265,8 +278,7 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     Ok(SetupResult {
         pairing_id,
         bootstrap_token,
-        pairing_secret,
-        browser: opts.browser.clone(),
+        browser: browser_norm,
         profile_id: opts.profile_id.clone(),
         target_id,
         canonical_target_path: canonical_path_str,
@@ -326,16 +338,58 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    // Origin validation if provided by the browser
-    if let Some(orig) = origin {
-        if !orig.starts_with("chrome-extension://") {
+    // Exact native origin authority: caller origin is mandatory
+    let origin_str = match origin {
+        Some(o) if !o.trim().is_empty() => o.trim(),
+        _ => {
             return Err(HostError::Protocol(ProtocolError::Io(
                 std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!("Unauthorized extension origin: {}", orig),
+                    "Missing native messaging caller origin",
                 ),
             )));
         }
+    };
+
+    // Determine expected extension ID from journal host_config or state manifest
+    let expected_id = if let Ok(Some(id)) = journal.get_expected_extension_id() {
+        id
+    } else {
+        // Fallback: check manifest file in state_dir
+        let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
+        if let Ok(manifest_content) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&manifest_content) {
+                if let Some(origins) = val.get("allowed_origins").and_then(|v| v.as_array()) {
+                    if let Some(first_orig) = origins.first().and_then(|v| v.as_str()) {
+                        first_orig
+                            .trim_start_matches("chrome-extension://")
+                            .trim_end_matches('/')
+                            .to_string()
+                    } else {
+                        DEFAULT_EXTENSION_ID.to_string()
+                    }
+                } else {
+                    DEFAULT_EXTENSION_ID.to_string()
+                }
+            } else {
+                DEFAULT_EXTENSION_ID.to_string()
+            }
+        } else {
+            DEFAULT_EXTENSION_ID.to_string()
+        }
+    };
+
+    let expected_origin = format!("chrome-extension://{}/", expected_id);
+    if origin_str != expected_origin {
+        return Err(HostError::Protocol(ProtocolError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Unauthorized extension origin: expected exact '{}', got '{}'",
+                    expected_origin, origin_str
+                ),
+            ),
+        )));
     }
 
     let mut stdin = std::io::stdin();

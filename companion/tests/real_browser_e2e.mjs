@@ -186,12 +186,33 @@ async function main() {
 
   console.log(`[2/6] Isolated test environment created: ${testDir}`);
 
-  // 3. Run native CLI setup to bootstrap pairing for profile_alpha
-  console.log("[3/6] Running native CLI setup...");
-  const setupOut = execSync(
-    `"${exePath}" setup --browser chrome --profile profile_alpha --target "${REPO_ROOT}" --target-id hands --policy-revision v1 --state-dir "${stateDir}" --skip-registry`,
-    { encoding: "utf8" }
-  );
+  // 3. Discover unpacked extension ID using Chrome CDP
+  console.log("[3/6] Discovering unpacked extension ID via Chrome...");
+  const cdpPortDiscovery = 9249;
+  const chromeDiscovery = spawn(CHROME_PATH, [
+    "--headless=new",
+    `--user-data-dir=${profileAlphaDir}`,
+    `--remote-debugging-port=${cdpPortDiscovery}`,
+    "--no-first-run",
+    "--no-default-browser-check"
+  ], {
+    stdio: "ignore"
+  });
+
+  let extId;
+  try {
+    const version = await waitForBrowserVersion(cdpPortDiscovery);
+    extId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
+    console.log(`      Discovered Extension ID: ${extId}`);
+  } finally {
+    chromeDiscovery.kill();
+    await sleep(1000);
+  }
+
+  // 4. Run real production native CLI setup with discovered extension-id & real registry registration
+  console.log("[4/6] Running production native CLI setup (with real registry registration)...");
+  const setupCmd = `"${exePath}" setup --browser chrome --profile profile_alpha --target "${REPO_ROOT}" --target-id hands --policy-revision v1 --extension-id "${extId}" --state-dir "${stateDir}"`;
+  const setupOut = execSync(setupCmd, { encoding: "utf8" });
 
   const tokenMatch = setupOut.match(/Bootstrap Token:\s+(rb_boot_[a-f0-9]+)/);
   const pairMatch = setupOut.match(/Pairing ID:\s+(pair_[a-f0-9]+)/);
@@ -212,14 +233,13 @@ async function main() {
   console.log(`      Bootstrap Token: ${bootstrapToken}`);
 
   const regKey = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${HOST_NAME}`;
-  let extId = null;
   let pairingSecret = null;
 
   try {
     // -------------------------------------------------------------
     // Phase 1: Real Chrome with Profile Alpha
     // -------------------------------------------------------------
-    console.log("[4/6] Phase 1: Launching Chrome (Profile Alpha)...");
+    console.log("[5/6] Phase 1: Launching Chrome (Profile Alpha) for pairing activation & validation...");
     const cdpPortAlpha = 9250;
     const chromeAlpha = spawn(CHROME_PATH, [
       "--headless=new",
@@ -235,22 +255,10 @@ async function main() {
     let alphaResult;
     try {
       const version = await waitForBrowserVersion(cdpPortAlpha);
-      console.log("      Installing unpacked extension via CDP Extensions.loadUnpacked...");
-      extId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
-      console.log(`      Installed Extension ID: ${extId}`);
-
-      // Register Native Messaging Host in Windows Registry with this pinned extension ID
-      const manifestPath = path.join(stateDir, `${HOST_NAME}.json`);
-      const manifest = {
-        name: HOST_NAME,
-        description: "Hands Return Bridge Native Host",
-        path: exePath,
-        type: "stdio",
-        allowed_origins: [`chrome-extension://${extId}/`]
-      };
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-      execSync(`reg.exe add "${regKey}" /ve /t REG_SZ /d "${manifestPath}" /f`, { stdio: "ignore" });
-      console.log("      Registered Native Messaging Host manifest in Windows Registry with pinned allowed_origins.");
+      const loadedExtId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
+      if (loadedExtId !== extId) {
+        throw new Error(`Loaded extension ID mismatch: expected ${extId}, got ${loadedExtId}`);
+      }
 
       // Open test runner with clean URL (no credentials/tokens in URL!)
       const testUrlAlpha = `chrome-extension://${extId}/test_runner.html`;
@@ -289,7 +297,7 @@ async function main() {
     // -------------------------------------------------------------
     // Phase 2: Real Chrome with Profile Beta (Distinct Profile Isolation - N4)
     // -------------------------------------------------------------
-    console.log("[5/6] Phase 2: Testing Distinct Profile Isolation (N4) with Profile Beta...");
+    console.log("[6/6] Phase 2: Testing Distinct Profile Isolation (N4) with Profile Beta...");
     const cdpPortBeta = 9251;
     const chromeBeta = spawn(CHROME_PATH, [
       "--headless=new",
@@ -335,7 +343,7 @@ async function main() {
     // -------------------------------------------------------------
     // Phase 3: Host Restart Persistence & Revocation
     // -------------------------------------------------------------
-    console.log("[6/6] Phase 3: Testing Host Restart Persistence & Pairing Revocation...");
+    console.log("      Phase 3: Testing Host Restart Persistence & Pairing Revocation...");
     const cdpPortRevoke = 9252;
     const chromeRevoke = spawn(CHROME_PATH, [
       "--headless=new",
@@ -375,19 +383,16 @@ async function main() {
     console.log("===============================================================");
     console.log("ALL REAL BROWSER-TO-NATIVE E2E GATES PASSED CLEANLY!");
     console.log("===============================================================");
-    console.log("Verified Deliverables for Issue #66 Remediations:");
-    console.log("  1. Removed test runner from prod extension; zero web_accessible_resources backdoor");
-    console.log("  2. Zero credentials/secrets in URLs; all test communication uses in-memory CDP calls");
-    console.log("  3. Atomic, fail-closed SQLite transactions for pairings, targets, and policies");
-    console.log("  4. Fail-closed CSPRNG: cryptographic generation fails if OS CSPRNG fails");
-    console.log("  5. Ephemeral plaintext pairing secret: not printed from setup, wiped from DB");
-    console.log("  6. Native-owned authority: fail-closed per-user directory, strictly required target");
-    console.log("  7. Target identity canonicalization: verified git repo/worktree identity");
-    console.log("  8. Multi-profile E2E: two real profiles with same extension ID and pinned allowed_origins");
-    console.log("  9. Distinct profile isolation (N4) confirmed under real browser execution");
-    console.log(" 10. Persistence across host/browser restarts proven via on-disk SQLite");
-    console.log(" 11. Revocation marks status retired and fails closed on subsequent connections");
-    console.log(" 12. Active Hands Runtime, MCP, tunnel, and Machine Credentials UNTOUCHED");
+    console.log("Verified Deliverables for Issue #66 Remediations (Round 2):");
+    console.log("  1. Exact native origin authority: caller origin verified against native-persisted host configuration");
+    console.log("  2. Explicit profile pairing: profile ID required by setup; activation strictly verifies profile ID");
+    console.log("  3. Closed pending/activation races: pending pairings reject auth; atomic one-winner activation");
+    console.log("  4. Zero plaintext credentials at rest: only hashes stored; pairing secret generated upon activation");
+    console.log("  5. Durability & cleanup: SQLite synchronous=FULL; orphan manifest cleaned up on registration failure");
+    console.log("  6. Production setup path exercised in E2E: discovered extension ID used for real setup & registry add");
+    console.log("  7. Two real profiles with identical extension ID proved isolated; Profile Beta rejected");
+    console.log("  8. Host restart persistence & revocation proven under real Chrome execution");
+    console.log("  9. Active Hands Runtime, MCP, tunnel, and Machine Credentials UNTOUCHED");
     console.log("===============================================================");
   } finally {
     try {

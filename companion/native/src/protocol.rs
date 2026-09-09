@@ -294,6 +294,11 @@ fn map_pairing_error(err: PairingError) -> Value {
             "code": "pairing_retired",
             "message": "This pairing has been revoked or retired"
         }),
+        PairingError::NotActive => json!({
+            "status": "error",
+            "code": "pairing_not_active",
+            "message": "Pairing is not active"
+        }),
         PairingError::StorageError(e) => json!({
             "status": "error",
             "code": "storage_error",
