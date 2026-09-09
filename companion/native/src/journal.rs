@@ -182,6 +182,23 @@ pub struct LaunchClaimResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionReceipt {
+    pub receipt_id: String,
+    pub execution_id: String,
+    pub pairing_id: String,
+    pub return_token: String,
+    pub origin_conversation_id: String,
+    pub turn_index: i64,
+    pub stop_reason: String,
+    pub assistant_message_id: Option<String>,
+    pub assistant_text: String,
+    pub content_digest: String,
+    pub tool_call_count: i64,
+    pub state: String,
+    pub committed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchSummary {
     pub launch_request_id: String,
     pub execution_id: String,
@@ -193,6 +210,7 @@ pub struct LaunchSummary {
     pub created_at: i64,
     pub attempt_marked_at: Option<i64>,
     pub orca_terminal_handle: Option<String>,
+    pub completion_receipt: Option<CompletionReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +356,32 @@ impl Journal {
                 payload_digest TEXT NOT NULL,
                 tombstoned_at INTEGER NOT NULL,
                 PRIMARY KEY (pairing_id, launch_request_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS completion_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                pairing_id TEXT NOT NULL,
+                return_token TEXT NOT NULL UNIQUE,
+                origin_conversation_id TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                stop_reason TEXT NOT NULL,
+                assistant_message_id TEXT,
+                assistant_text TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                tool_call_count INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                committed_at INTEGER NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE,
+                FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_adapter_claims (
+                execution_id TEXT PRIMARY KEY,
+                adapter_instance_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                claimed_at INTEGER NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE
             );
             "#,
         )?;
@@ -1258,9 +1302,10 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
 
         let rows = stmt
             .query_map(params![pairing_id], |r| {
+                let exec_id: String = r.get(1)?;
                 Ok(LaunchSummary {
                     launch_request_id: r.get(0)?,
-                    execution_id: r.get(1)?,
+                    execution_id: exec_id,
                     origin_conversation_id: r.get(2)?,
                     origin_conversation_url: r.get(3)?,
                     target_id: r.get(4)?,
@@ -1269,13 +1314,46 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     created_at: r.get(7)?,
                     attempt_marked_at: r.get(8)?,
                     orca_terminal_handle: r.get(9)?,
+                    completion_receipt: None,
                 })
             })
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         let mut list = Vec::new();
         for row in rows {
-            list.push(row.map_err(|e| PairingError::StorageError(e.to_string()))?);
+            let mut summary = row.map_err(|e| PairingError::StorageError(e.to_string()))?;
+            summary.completion_receipt = conn
+                .query_row(
+                    r#"
+                    SELECT receipt_id, execution_id, pairing_id, return_token,
+                           origin_conversation_id, turn_index, stop_reason,
+                           assistant_message_id, assistant_text, content_digest,
+                           tool_call_count, state, committed_at
+                    FROM completion_receipts
+                    WHERE execution_id = ?1
+                    "#,
+                    params![&summary.execution_id],
+                    |r| {
+                        Ok(CompletionReceipt {
+                            receipt_id: r.get(0)?,
+                            execution_id: r.get(1)?,
+                            pairing_id: r.get(2)?,
+                            return_token: r.get(3)?,
+                            origin_conversation_id: r.get(4)?,
+                            turn_index: r.get(5)?,
+                            stop_reason: r.get(6)?,
+                            assistant_message_id: r.get(7)?,
+                            assistant_text: r.get(8)?,
+                            content_digest: r.get(9)?,
+                            tool_call_count: r.get(10)?,
+                            state: r.get(11)?,
+                            committed_at: r.get(12)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+            list.push(summary);
         }
         Ok(list)
     }
@@ -1286,7 +1364,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         launch_request_id: &str,
     ) -> Result<Option<LaunchSummary>, PairingError> {
         let conn = self.conn.lock();
-        let summary: Option<LaunchSummary> = conn
+        let mut summary: Option<LaunchSummary> = conn
             .query_row(
                 r#"
                 SELECT lr.launch_request_id, lr.execution_id, lr.origin_conversation_id,
@@ -1309,13 +1387,87 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                         created_at: r.get(7)?,
                         attempt_marked_at: r.get(8)?,
                         orca_terminal_handle: r.get(9)?,
+                        completion_receipt: None,
                     })
                 },
             )
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
+        if let Some(s) = &mut summary {
+            s.completion_receipt = conn
+                .query_row(
+                    r#"
+                    SELECT receipt_id, execution_id, pairing_id, return_token,
+                           origin_conversation_id, turn_index, stop_reason,
+                           assistant_message_id, assistant_text, content_digest,
+                           tool_call_count, state, committed_at
+                    FROM completion_receipts
+                    WHERE execution_id = ?1
+                    "#,
+                    params![&s.execution_id],
+                    |r| {
+                        Ok(CompletionReceipt {
+                            receipt_id: r.get(0)?,
+                            execution_id: r.get(1)?,
+                            pairing_id: r.get(2)?,
+                            return_token: r.get(3)?,
+                            origin_conversation_id: r.get(4)?,
+                            turn_index: r.get(5)?,
+                            stop_reason: r.get(6)?,
+                            assistant_message_id: r.get(7)?,
+                            assistant_text: r.get(8)?,
+                            content_digest: r.get(9)?,
+                            tool_call_count: r.get(10)?,
+                            state: r.get(11)?,
+                            committed_at: r.get(12)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        }
+
         Ok(summary)
     }
 
+    pub fn get_completion_receipt(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<CompletionReceipt>, PairingError> {
+        let conn = self.conn.lock();
+        let receipt = conn
+            .query_row(
+                r#"
+                SELECT receipt_id, execution_id, pairing_id, return_token,
+                       origin_conversation_id, turn_index, stop_reason,
+                       assistant_message_id, assistant_text, content_digest,
+                       tool_call_count, state, committed_at
+                FROM completion_receipts
+                WHERE execution_id = ?1
+                "#,
+                params![execution_id],
+                |r| {
+                    Ok(CompletionReceipt {
+                        receipt_id: r.get(0)?,
+                        execution_id: r.get(1)?,
+                        pairing_id: r.get(2)?,
+                        return_token: r.get(3)?,
+                        origin_conversation_id: r.get(4)?,
+                        turn_index: r.get(5)?,
+                        stop_reason: r.get(6)?,
+                        assistant_message_id: r.get(7)?,
+                        assistant_text: r.get(8)?,
+                        content_digest: r.get(9)?,
+                        tool_call_count: r.get(10)?,
+                        state: r.get(11)?,
+                        committed_at: r.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(receipt)
+    }
 }

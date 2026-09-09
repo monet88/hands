@@ -2,6 +2,10 @@ use std::io::Cursor;
 use tempfile::tempdir;
 
 use hands_return_bridge::journal::{Journal, PolicyRecord, TargetRecord};
+use hands_return_bridge::launcher::{
+    build_omp_startup_command_with_env, ensure_adapter_file, is_exact_supported_omp_version,
+    COMPANION_ADAPTER_REVISION, SUPPORTED_OMP_CLI_SHAPE, SUPPORTED_OMP_REVISION,
+};
 use hands_return_bridge::protocol::{
     handle_native_message, read_native_message, write_native_message,
 };
@@ -622,10 +626,10 @@ fn test_adapter_pinning_and_deterministic_content() {
     };
     let dir = tempdir().unwrap();
     let adapter_path = ensure_adapter_file(dir.path()).expect("Must write adapter file");
-    assert_eq!(COMPANION_ADAPTER_REVISION, "v1");
+    assert_eq!(COMPANION_ADAPTER_REVISION, "v3");
     let read_back = std::fs::read_to_string(&adapter_path).unwrap();
     assert_eq!(read_back, ADAPTER_TS_CONTENT);
-    assert!(read_back.contains("revision: v1"));
+    assert!(read_back.contains("revision: v3"));
 }
 
 #[test]
@@ -1098,4 +1102,204 @@ fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     assert_eq!(replay_resp["isReplayed"], true);
     assert_eq!(replay_resp["executionId"], accepted_exec_id);
     assert_eq!(replay_resp["returnToken"], accepted_ret_token);
+}
+
+#[test]
+fn test_recover_includes_completion_receipt_after_owned_turn() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_rcpt_proto";
+    let bootstrap_token = "boot_rcpt_proto";
+    let profile_id = "profile_proto";
+    let targets = vec![TargetRecord {
+        target_id: "target_proto".to_string(),
+        canonical_path: repo_dir.to_string_lossy().to_string(),
+        name: "target_proto".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let pairing_secret = &activated.pairing_secret;
+
+    let launch_params = hands_return_bridge::journal::LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_rcpt_proto_1".to_string(),
+        origin_conversation_id: "conv_proto_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_proto_1".to_string(),
+        transcript_evidence_hash: "thash_p".to_string(),
+        account_evidence_hash: "ahash_p".to_string(),
+        target_id: "target_proto".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Recovery with receipt test".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&launch_params).unwrap();
+
+    // Before receipt, recover shows no completion receipt
+    let rec_msg = json!({
+        "op": "recover",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": "req_rcpt_proto_1"
+    });
+    let rec_resp = handle_native_message(&rec_msg, &journal);
+    assert_eq!(rec_resp["status"], "ok");
+    assert_eq!(rec_resp["summary"]["state"], "claimed");
+    assert!(rec_resp["summary"]["completion_receipt"].is_null());
+
+    // Commit completion receipt directly via SQLite
+    let receipt_id = "rcpt_rec_1";
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO completion_receipts (
+            receipt_id, execution_id, pairing_id, return_token,
+            origin_conversation_id, turn_index, stop_reason,
+            assistant_message_id, assistant_text, content_digest,
+            tool_call_count, state, committed_at
+        ) VALUES (?1, ?2, ?3, ?4, 'conv_123', 0, 'stop', 'msg_p_1', 'Finished task in owned turn', 'digest_p_1', 2, 'completed', 1000)
+        "#,
+        rusqlite::params![receipt_id, &claim.execution_id, pairing_id, &claim.return_token],
+    ).unwrap();
+    conn.execute(
+        "UPDATE launch_requests SET state = 'completed', updated_at = 1000 WHERE execution_id = ?1",
+        rusqlite::params![&claim.execution_id],
+    ).unwrap();
+    // Recover after receipt commit
+    let rec_resp2 = handle_native_message(&rec_msg, &journal);
+    assert_eq!(rec_resp2["status"], "ok");
+    assert_eq!(rec_resp2["summary"]["state"], "completed");
+    let summary_rcpt = &rec_resp2["summary"]["completion_receipt"];
+    assert!(!summary_rcpt.is_null(), "completion_receipt must be present");
+    assert_eq!(summary_rcpt["receipt_id"], receipt_id);
+    assert_eq!(summary_rcpt["stop_reason"], "stop");
+    assert_eq!(summary_rcpt["assistant_text"], "Finished task in owned turn");
+    assert_eq!(summary_rcpt["tool_call_count"], 2);
+    assert_eq!(summary_rcpt["state"], "completed");
+}
+
+#[test]
+fn test_adapter_v3_generation_and_revision() {
+    assert_eq!(COMPANION_ADAPTER_REVISION, "v3");
+
+    let dir = tempdir().unwrap();
+    let adapter_path = ensure_adapter_file(dir.path()).unwrap();
+    let content = std::fs::read_to_string(&adapter_path).unwrap();
+    assert!(content.contains("Return Bridge companion OMP adapter (revision: v3)"));
+    assert!(content.contains("HANDS_RETURN_BRIDGE_EXECUTION_ID"));
+    assert!(content.contains("execution_adapter_claims"));
+    assert!(content.contains("completion_receipts"));
+    assert!(content.contains("session_stop"));
+    assert!(content.contains("agent_end"));
+    assert!(content.contains("willContinue"));
+
+    let cmd = build_omp_startup_command_with_env(
+        &adapter_path,
+        Some("exec_test_rev3"),
+        Some(dir.path()),
+    ).unwrap();
+    assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID=\"exec_test_rev3\";"));
+    assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_STATE_DIR="));
+    assert!(cmd.contains("-e \""));
+    assert!(cmd.contains("adapter.ts\""));
+}
+
+#[test]
+fn test_launch_preflight_supported_omp_revision_pin() {
+    use hands_return_bridge::launcher::verify_launch_preflight;
+    assert_eq!(SUPPORTED_OMP_REVISION, "18.1.15");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.15");
+
+    // Default preflight against system OMP (18.1.15) must succeed
+    let res = verify_launch_preflight(None);
+    assert!(res.is_ok(), "Preflight should succeed with exact supported OMP revision: {:?}", res);
+
+    // Preflight against a script that outputs an unsupported version must fail closed
+    let dir = tempdir().unwrap();
+    let mock_omp = dir.path().join("mock_omp_wrong_ver.bat");
+    std::fs::write(&mock_omp, "@echo off\r\nif \"%1\"==\"--version\" (echo omp/19.0.0 & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n").unwrap();
+
+    let bad_ver_res = verify_launch_preflight(Some(&mock_omp.to_string_lossy()));
+    assert!(bad_ver_res.is_err(), "Preflight must fail closed for unsupported OMP revision");
+    let err_msg = bad_ver_res.unwrap_err().to_string();
+    assert!(err_msg.contains("Unsupported OMP revision"), "Error should report revision mismatch: {}", err_msg);
+    assert!(err_msg.contains("omp/18.1.15"), "Error should name expected revision omp/18.1.15: {}", err_msg);
+}
+
+#[test]
+fn test_exact_supported_omp_version_matching() {
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.15");
+
+    // Exact match must pass
+    assert!(is_exact_supported_omp_version("omp/18.1.15"));
+    assert!(is_exact_supported_omp_version("omp/18.1.15\n"));
+    assert!(is_exact_supported_omp_version("omp/18.1.15\r\n"));
+    assert!(is_exact_supported_omp_version("  omp/18.1.15  \n"));
+
+    // Lookalikes, prefixes, suffixes, and extra wrapper text MUST BE REJECTED
+    assert!(!is_exact_supported_omp_version("omp/118.1.15"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.15-beta"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.15.1"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.15_rc1"));
+    assert!(!is_exact_supported_omp_version("v18.1.15"));
+    assert!(!is_exact_supported_omp_version("18.1.15"));
+    assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.15"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.15 extra text"));
+    assert!(!is_exact_supported_omp_version("node omp/18.1.15"));
+    assert!(!is_exact_supported_omp_version("omp/19.0.0"));
+    assert!(!is_exact_supported_omp_version(""));
+}
+
+#[test]
+fn test_launch_preflight_adversarial_lookalike_rejection() {
+    use hands_return_bridge::launcher::verify_launch_preflight;
+    let dir = tempdir().unwrap();
+
+    let lookalikes = [
+        "omp/118.1.15",
+        "omp/18.1.15-beta",
+        "wrapper: omp/18.1.15",
+        "18.1.15",
+        "omp/18.1.15 extra",
+    ];
+
+    for (idx, lookalike) in lookalikes.iter().enumerate() {
+        let mock_file = dir.path().join(format!("mock_omp_adv_{}.bat", idx));
+        std::fs::write(
+            &mock_file,
+            format!(
+                "@echo off\r\nif \"%1\"==\"--version\" (echo {} & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n",
+                lookalike
+            ),
+        )
+        .unwrap();
+
+        let res = verify_launch_preflight(Some(&mock_file.to_string_lossy()));
+        assert!(
+            res.is_err(),
+            "Preflight must fail closed for adversarial lookalike '{}'",
+            lookalike
+        );
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("Unsupported OMP revision"),
+            "Error should reject lookalike '{}': {}",
+            lookalike,
+            err_str
+        );
+    }
 }

@@ -7,7 +7,7 @@ use crate::journal::{
     Journal, LaunchRequestParams, PairingError,
 };
 use crate::launcher::{
-    build_omp_startup_command, ensure_adapter_file, launch_orca_terminal,
+    build_omp_startup_command_with_env, ensure_adapter_file, launch_orca_terminal,
     send_orca_terminal_prompt, verify_launch_preflight, wait_orca_terminal_idle, LauncherError,
 };
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
@@ -421,7 +421,7 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             };
 
             // 4. Build native-owned OMP startup command (NO user prompt in command line)
-            let startup_cmd = match build_omp_startup_command(&adapter_path) {
+            let startup_cmd = match build_omp_startup_command_with_env(&adapter_path, Some(&claim.execution_id), Some(&state_dir)) {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     return json!({ "status": "error", "code": "launcher_error", "message": e.to_string() });

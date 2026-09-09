@@ -966,3 +966,177 @@ fn test_unsupported_registered_policy_fails_closed_without_allocating_claim_or_t
     assert_eq!(replay_claim.execution_id, original_exec_id);
     assert_eq!(replay_claim.return_token, original_ret_token);
 }
+
+fn insert_test_receipt(
+    db_path: &std::path::Path,
+    receipt_id: &str,
+    execution_id: &str,
+    pairing_id: &str,
+    return_token: &str,
+    text: &str,
+) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO completion_receipts (
+            receipt_id, execution_id, pairing_id, return_token,
+            origin_conversation_id, turn_index, stop_reason,
+            assistant_message_id, assistant_text, content_digest,
+            tool_call_count, state, committed_at
+        ) VALUES (?1, ?2, ?3, ?4, 'conv_rcpt_1', 0, 'stop', 'msg_final_1', ?5, 'digest_123', 3, 'completed', 1000)
+        "#,
+        rusqlite::params![receipt_id, execution_id, pairing_id, return_token, text],
+    ).unwrap();
+    conn.execute(
+        "UPDATE launch_requests SET state = 'completed', updated_at = 1000 WHERE execution_id = ?1",
+        rusqlite::params![execution_id],
+    ).unwrap();
+}
+
+#[test]
+fn test_completion_receipt_readability_across_reopen() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_rcpt_1";
+    let boot_token = "boot_rcpt_1";
+    let targets = vec![TargetRecord {
+        target_id: "t_main".to_string(),
+        canonical_path: repo_dir.to_string_lossy().to_string(),
+        name: "test".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal.create_bootstrap(pairing_id, boot_token, "chrome", "profile_1", &targets, &policy).unwrap();
+    journal.activate_bootstrap(boot_token, "profile_1").unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_rcpt_1".to_string(),
+        origin_conversation_id: "conv_rcpt_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_rcpt_1".to_string(),
+        transcript_evidence_hash: "hash_trans_1".to_string(),
+        account_evidence_hash: "hash_acct_1".to_string(),
+        target_id: "t_main".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Test prompt for receipt".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+    assert_eq!(claim.state, "claimed");
+
+    journal.mark_launch_attempt(&claim.execution_id, pairing_id).unwrap();
+    let ev = AttemptEvidence {
+        orca_terminal_handle: Some("term_rcpt_1".to_string()),
+        orca_tab_id: Some("tab_rcpt_1".to_string()),
+        orca_pane_key: Some("pane_rcpt_1".to_string()),
+        orca_pty_id: Some("pty_rcpt_1".to_string()),
+    };
+    journal.record_launch_started(&claim.execution_id, &ev).unwrap();
+
+    // Commit receipt via SQLite
+    let receipt_id = "rcpt_test_read_1";
+    insert_test_receipt(
+        &db_path,
+        receipt_id,
+        &claim.execution_id,
+        pairing_id,
+        &claim.return_token,
+        "Final completed turn result from agent",
+    );
+
+    // Verify state transitioned to completed and receipt is returned
+    let summary_before = journal.get_launch_request_by_id(pairing_id, &params.launch_request_id).unwrap().unwrap();
+    assert_eq!(summary_before.state, "completed");
+    let rcpt = summary_before.completion_receipt.unwrap();
+    assert_eq!(rcpt.receipt_id, receipt_id);
+    assert_eq!(rcpt.execution_id, claim.execution_id);
+    assert_eq!(rcpt.pairing_id, pairing_id);
+    assert_eq!(rcpt.assistant_text, "Final completed turn result from agent");
+    assert_eq!(rcpt.tool_call_count, 3);
+
+    // Drop original journal to simulate producer / native-host exit
+    drop(journal);
+
+    // Reopen journal fresh and verify receipt survives
+    let journal2 = Journal::open(&db_path).unwrap();
+    let loaded = journal2.get_completion_receipt(&claim.execution_id).unwrap().unwrap();
+    assert_eq!(loaded, rcpt);
+
+    let summary_after = journal2.get_launch_request_by_id(pairing_id, &params.launch_request_id).unwrap().unwrap();
+    assert_eq!(summary_after.state, "completed");
+    assert_eq!(summary_after.completion_receipt, Some(rcpt));
+}
+
+#[test]
+fn test_execution_adapter_claims_one_time_uniqueness() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_claim_test";
+    let boot_token = "boot_claim_test";
+    let targets = vec![TargetRecord {
+        target_id: "t_main".to_string(),
+        canonical_path: repo_dir.to_string_lossy().to_string(),
+        name: "test".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal.create_bootstrap(pairing_id, boot_token, "chrome", "profile_claim", &targets, &policy).unwrap();
+    journal.activate_bootstrap(boot_token, "profile_claim").unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_claim_1".to_string(),
+        origin_conversation_id: "conv_claim_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_claim_1".to_string(),
+        transcript_evidence_hash: "thash".to_string(),
+        account_evidence_hash: "ahash".to_string(),
+        target_id: "t_main".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Claim test prompt".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    // First adapter claims ownership
+    let first_insert = conn.execute(
+        "INSERT INTO execution_adapter_claims (execution_id, adapter_instance_id, session_id, claimed_at) VALUES (?1, 'adp_owner_1', 'sess_1', 1000)",
+        rusqlite::params![&claim.execution_id],
+    );
+    assert!(first_insert.is_ok(), "First adapter claim must succeed");
+
+    // Second adapter instance attempts to claim same execution_id -> MUST fail closed on PRIMARY KEY
+    let second_insert = conn.execute(
+        "INSERT INTO execution_adapter_claims (execution_id, adapter_instance_id, session_id, claimed_at) VALUES (?1, 'adp_intruder_2', 'sess_2', 1001)",
+        rusqlite::params![&claim.execution_id],
+    );
+    assert!(second_insert.is_err(), "Second adapter claim must fail due to unique constraint");
+
+    // Verify the owner remains adp_owner_1
+    let owner: String = conn.query_row(
+        "SELECT adapter_instance_id FROM execution_adapter_claims WHERE execution_id = ?1",
+        rusqlite::params![&claim.execution_id],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(owner, "adp_owner_1");
+}

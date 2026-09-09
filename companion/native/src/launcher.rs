@@ -42,16 +42,412 @@ impl std::fmt::Display for LauncherError {
 
 impl std::error::Error for LauncherError {}
 
+/// Pinned supported OMP CLI revision
+pub const SUPPORTED_OMP_REVISION: &str = "18.1.15";
+/// Exact verified OMP CLI version output shape
+pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/18.1.15";
+
+/// Validates exact verified OMP CLI version output shape ("omp/18.1.15")
+pub fn is_exact_supported_omp_version(output: &str) -> bool {
+    output.trim() == SUPPORTED_OMP_CLI_SHAPE
+}
+
 /// Pinned companion adapter revision identifier
-pub const COMPANION_ADAPTER_REVISION: &str = "v1";
+pub const COMPANION_ADAPTER_REVISION: &str = "v3";
 
 /// The embedded TypeScript adapter loaded explicitly via `-e` for owned OMP turns
-pub const ADAPTER_TS_CONTENT: &str = r#"// Return Bridge companion OMP adapter (revision: v1)
-export default function (pi) {
-  // Scoped initialization for owned execution
-  if (process.env.HANDS_RETURN_BRIDGE_EXECUTION_ID) {
-    // Registered for owned execution
+pub const ADAPTER_TS_CONTENT: &str = r#"// Return Bridge companion OMP adapter (revision: v3)
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as crypto from "node:crypto";
+import { Database } from "bun:sqlite";
+
+function computeCanonicalReceiptDigest(params: {
+  turnIndex: number;
+  stopReason: string;
+  assistantMessageId?: string | null;
+  assistantText: string;
+  toolCallCount: number;
+  sessionId: string;
+  adapterInstanceId: string;
+}): string {
+  const hasher = crypto.createHash("sha256");
+  hasher.update("hands_rb_receipt_v2:");
+  hasher.update(`${params.turnIndex}:`);
+  hasher.update(`${params.stopReason}:`);
+  hasher.update(`${params.assistantMessageId ?? ""}:`);
+  hasher.update(`${params.toolCallCount}:`);
+  hasher.update(`${params.sessionId}:`);
+  hasher.update(`${params.adapterInstanceId}:`);
+  hasher.update(params.assistantText);
+  return hasher.digest("hex");
+}
+
+function generateRandomHex(bytes: number): string {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+interface MessageContentItem {
+  type: string;
+  text?: string;
+}
+
+interface AssistantMessageLike {
+  id?: string;
+  role?: string;
+  stopReason?: string;
+  content?: MessageContentItem[];
+}
+
+interface SessionStopEventLike {
+  turn_id?: number;
+  messages?: unknown[];
+  last_assistant_message?: AssistantMessageLike;
+  session_id?: string;
+  stop_hook_active?: boolean;
+}
+
+interface AgentEndEventLike {
+  messages?: unknown[];
+  willContinue?: boolean;
+}
+
+interface ExtensionContextLike {
+  sessionManager?: {
+    getSessionId?: () => string;
+    getSessionFile?: () => string;
+  };
+}
+
+export default function (pi: { on: (event: string, handler: (event: unknown, ctx?: unknown) => Promise<unknown> | unknown) => void }) {
+  const executionId = process.env.HANDS_RETURN_BRIDGE_EXECUTION_ID?.trim();
+  if (!executionId) {
+    return;
   }
+
+  const stateDir = process.env.HANDS_RETURN_BRIDGE_STATE_DIR?.trim() || import.meta.dir;
+  const dbPath = path.join(stateDir, "journal.sqlite");
+
+  const adapterInstanceId = "adp_" + generateRandomHex(16);
+  let initialSessionId: string | null = null;
+  let isOwner: boolean | null = null;
+  let receiptCommitted = false;
+  let completionCandidate: {
+    turnId: number;
+    text: string;
+    messageId?: string;
+    stopReason: string;
+    toolCallCount: number;
+    sessionId: string;
+    stopHookActive: boolean;
+  } | null = null;
+
+  function countToolCalls(messages: unknown): number {
+    let count = 0;
+    if (Array.isArray(messages)) {
+      for (const msg of messages) {
+        if (msg && typeof msg === "object" && "content" in msg) {
+          const content = (msg as { content: unknown }).content;
+          if (Array.isArray(content)) {
+            for (const item of content) {
+              if (item && typeof item === "object" && "type" in item) {
+                if ((item as { type: unknown }).type === "toolCall") {
+                  count++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  function claimExecutionOwnership(sid: string): boolean {
+    if (isOwner !== null) {
+      return isOwner;
+    }
+    try {
+      if (!fs.existsSync(dbPath)) {
+        isOwner = false;
+        return false;
+      }
+      const db = new Database(dbPath);
+      db.run("PRAGMA foreign_keys = ON;");
+      const timeoutMs = parseInt(process.env.HANDS_RETURN_BRIDGE_BUSY_TIMEOUT_MS || "5000", 10) || 5000;
+      db.run(`PRAGMA busy_timeout = ${timeoutMs};`);
+
+      const nowSecs = Math.floor(Date.now() / 1000);
+      try {
+        db.run(
+          `INSERT INTO execution_adapter_claims (execution_id, adapter_instance_id, session_id, claimed_at)
+           VALUES (?, ?, ?, ?)`,
+          [executionId, adapterInstanceId, sid, nowSecs]
+        );
+        isOwner = true;
+      } catch (_err) {
+        const row = db
+          .query(
+            "SELECT adapter_instance_id, session_id FROM execution_adapter_claims WHERE execution_id = ?"
+          )
+          .get(executionId) as
+          | { adapter_instance_id: string; session_id: string }
+          | undefined;
+        isOwner = row?.adapter_instance_id === adapterInstanceId && row?.session_id === sid;
+      } finally {
+        db.close();
+      }
+    } catch (_err) {
+      isOwner = false;
+    }
+    return isOwner;
+  }
+
+  pi.on("agent_start", (_event: unknown, ctxRaw: unknown) => {
+    const ctx = ctxRaw as ExtensionContextLike | undefined;
+    const sid = ctx?.sessionManager?.getSessionId?.();
+    if (typeof sid !== "string" || !sid.trim()) {
+      return;
+    }
+    if (initialSessionId === null) {
+      initialSessionId = sid;
+      claimExecutionOwnership(sid);
+    }
+  });
+
+  pi.on("session_before_switch", () => {
+    completionCandidate = null;
+    isOwner = false;
+  });
+
+  pi.on("session_switch", () => {
+    completionCandidate = null;
+    isOwner = false;
+  });
+  pi.on("session_stop", (eventRaw: unknown, ctxRaw: unknown) => {
+    const ctx = ctxRaw as ExtensionContextLike | undefined;
+    const sid = ctx?.sessionManager?.getSessionId?.();
+    if (typeof sid !== "string" || !sid.trim()) {
+      completionCandidate = null;
+      return;
+    }
+    if (initialSessionId === null) {
+      initialSessionId = sid;
+      claimExecutionOwnership(sid);
+    }
+    if (sid !== initialSessionId || !isOwner) {
+      completionCandidate = null;
+      return;
+    }
+
+    const event = eventRaw as SessionStopEventLike | undefined;
+    if (typeof event?.turn_id !== "number" || !Number.isInteger(event.turn_id) || event.turn_id < 0) {
+      completionCandidate = null;
+      return;
+    }
+    // Fail closed if stop_hook_active is missing or not strictly boolean false (OMP 18.1.15 guarantees stop_hook_active: boolean)
+    if (typeof event?.stop_hook_active !== "boolean" || event.stop_hook_active !== false) {
+      completionCandidate = null;
+      return;
+    }
+    const lastMsg = event?.last_assistant_message;
+    if (!lastMsg) {
+      completionCandidate = null;
+      return;
+    }
+
+    const stopReason = lastMsg.stopReason;
+    if (stopReason !== "stop" && stopReason !== "end_turn") {
+      completionCandidate = null;
+      return;
+    }
+
+    const content = lastMsg.content;
+    if (!Array.isArray(content) || content.length === 0) {
+      completionCandidate = null;
+      return;
+    }
+
+    // Must not end mid-tool-use
+    const hasToolCalls = content.some(c => c && c.type === "toolCall");
+    if (hasToolCalls) {
+      completionCandidate = null;
+      return;
+    }
+
+    // Extract text parts
+    const textParts = content
+      .filter(c => c && c.type === "text" && typeof c.text === "string")
+      .map(c => c.text!.trim())
+      .filter(Boolean);
+
+    const fullText = textParts.join("\n").trim();
+    if (!fullText) {
+      completionCandidate = null;
+      return;
+    }
+
+    completionCandidate = {
+      turnId: event.turn_id,
+      text: fullText,
+      messageId: typeof lastMsg.id === "string" ? lastMsg.id : undefined,
+      stopReason,
+      toolCallCount: countToolCalls(event?.messages),
+      sessionId: sid,
+      stopHookActive: event.stop_hook_active,
+    };
+  });
+
+  pi.on("agent_end", (eventRaw: unknown, ctxRaw: unknown) => {
+    const ctx = ctxRaw as ExtensionContextLike | undefined;
+    const sid = ctx?.sessionManager?.getSessionId?.();
+    if (typeof sid !== "string" || !sid.trim() || sid !== initialSessionId || !isOwner) {
+      return;
+    }
+
+    const event = eventRaw as AgentEndEventLike | undefined;
+    // Explicit terminal check: willContinue must be strictly boolean false,
+    // OR under verified OMP 18.1.15 provider lifecycle contract where agent-session.ts:3604
+    // emits options?: { willContinue?: boolean } as undefined on terminal completion,
+    // undefined is accepted ONLY when paired with a completionCandidate whose session_stop
+    // event verified stop_hook_active === false and all required authority fields.
+    const isExplicitFalse = event?.willContinue === false;
+    const isOmp18Terminal = event?.willContinue === undefined && completionCandidate?.stopHookActive === false;
+    if (!isExplicitFalse && !isOmp18Terminal) {
+      completionCandidate = null;
+      return;
+    }
+    if (event?.willContinue === true) {
+      completionCandidate = null;
+      return;
+    }
+    if (!completionCandidate || completionCandidate.sessionId !== sid) {
+      return;
+    }
+
+    const candidate = completionCandidate;
+    completionCandidate = null;
+
+    try {
+      if (!fs.existsSync(dbPath)) {
+        return;
+      }
+
+      const db = new Database(dbPath);
+      db.run("PRAGMA foreign_keys = ON;");
+      const timeoutMs = parseInt(process.env.HANDS_RETURN_BRIDGE_BUSY_TIMEOUT_MS || "5000", 10) || 5000;
+      db.run(`PRAGMA busy_timeout = ${timeoutMs};`);
+
+      // Test-only fault hook simulating SQLite SQLITE_FULL without filling physical disk
+      if (process.env.HANDS_RETURN_BRIDGE_FAULT_INJECT === "disk_full") {
+        db.run("PRAGMA max_page_count = 1;");
+      }
+      const tx = db.transaction(() => {
+        // Verify durable ownership claim in SQLite matches this adapter instance
+        const claim = db
+          .query(
+            "SELECT adapter_instance_id, session_id FROM execution_adapter_claims WHERE execution_id = ?"
+          )
+          .get(executionId) as
+          | { adapter_instance_id: string; session_id: string }
+          | undefined;
+
+        if (!claim || claim.adapter_instance_id !== adapterInstanceId || claim.session_id !== sid) {
+          return;
+        }
+
+        // 1. Verify launch request exists
+        const req = db
+          .query(
+            "SELECT pairing_id, return_token, origin_conversation_id FROM launch_requests WHERE execution_id = ?"
+          )
+          .get(executionId) as
+          | { pairing_id: string; return_token: string; origin_conversation_id: string }
+          | undefined;
+
+        if (!req) {
+          return;
+        }
+
+        const digest = computeCanonicalReceiptDigest({
+          turnIndex: candidate.turnId,
+          stopReason: candidate.stopReason,
+          assistantMessageId: candidate.messageId,
+          assistantText: candidate.text,
+          toolCallCount: candidate.toolCallCount,
+          sessionId: candidate.sessionId,
+          adapterInstanceId,
+        });
+
+        // 2. Check existing receipt for deterministic duplicate or conflict
+        const existing = db
+          .query(
+            "SELECT receipt_id, content_digest FROM completion_receipts WHERE execution_id = ?"
+          )
+          .get(executionId) as { receipt_id: string; content_digest: string } | undefined;
+
+        if (existing) {
+          if (existing.content_digest === digest) {
+            receiptCommitted = true;
+            return;
+          } else {
+            // Conflict: different digest for same execution -> reject explicitly and never overwrite
+            receiptCommitted = false;
+            console.error(
+              `[ReturnBridge] Conflict: execution ${executionId} already has receipt ${existing.receipt_id} with conflicting digest ${existing.content_digest} vs ${digest}`
+            );
+            throw new Error(`payload_conflict: conflicting completion digest for execution ${executionId}`);
+          }
+        }
+
+        const receiptId = "rcpt_" + generateRandomHex(16);
+        const nowSecs = Math.floor(Date.now() / 1000);
+
+        db.run(
+          `INSERT INTO completion_receipts (
+            receipt_id, execution_id, pairing_id, return_token,
+            origin_conversation_id, turn_index, stop_reason,
+            assistant_message_id, assistant_text, content_digest,
+            tool_call_count, state, committed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)`,
+          [
+            receiptId,
+            executionId,
+            req.pairing_id,
+            req.return_token,
+            req.origin_conversation_id,
+            candidate.turnId,
+            candidate.stopReason,
+            candidate.messageId ?? null,
+            candidate.text,
+            digest,
+            candidate.toolCallCount,
+            nowSecs,
+          ]
+        );
+
+        db.run(
+          "UPDATE launch_requests SET state = 'completed', updated_at = ? WHERE execution_id = ?",
+          [nowSecs, executionId]
+        );
+
+        db.run(
+          "UPDATE launch_attempts SET state = 'completed' WHERE execution_id = ?",
+          [executionId]
+        );
+
+        receiptCommitted = true;
+      });
+
+      tx.immediate();
+      db.close();
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("payload_conflict")) {
+        throw err;
+      }
+      // Storage/disk/lock failure: fail closed without false acknowledgement
+    }
+  });
 }
 "#;
 
@@ -67,7 +463,6 @@ pub fn ensure_adapter_file(state_dir: &Path) -> Result<PathBuf, LauncherError> {
     }
     Ok(adapter_path)
 }
-
 /// Resolves the native OMP binary token or path based on local authority
 pub fn resolve_omp_binary() -> String {
     if let Ok(bin) = std::env::var("HANDS_RETURN_BRIDGE_OMP_BIN") {
@@ -127,11 +522,33 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
         ));
     }
 
-    // 4. Verify OMP security and policy flags
+    // 4. Verify exact supported OMP CLI revision
     let raw_bin = omp_bin_override
         .map(str::to_string)
         .unwrap_or_else(resolve_omp_binary);
     let clean_bin = raw_bin.trim_matches('"');
+    let omp_version = Command::new(clean_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute '{} --version': {}", clean_bin, e)))?;
+    if !omp_version.status.success() {
+        return Err(LauncherError::PreflightFailed(format!(
+            "OMP CLI '{} --version' failed with exit code: {:?}",
+            clean_bin,
+            omp_version.status.code()
+        )));
+    }
+    let ver_text = String::from_utf8_lossy(&omp_version.stdout);
+    let trimmed_ver = ver_text.trim();
+    if !is_exact_supported_omp_version(trimmed_ver) {
+        return Err(LauncherError::PreflightFailed(format!(
+            "Unsupported OMP revision: '{}'. Return Bridge requires exact supported revision '{}'",
+            trimmed_ver,
+            SUPPORTED_OMP_CLI_SHAPE
+        )));
+    }
+
+    // 5. Verify basic OMP CLI responsiveness
     let omp_help = Command::new(clean_bin)
         .arg("--help")
         .output()
@@ -150,8 +567,31 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
 pub fn build_omp_startup_command(
     adapter_path: &Path,
 ) -> Result<String, LauncherError> {
+    build_omp_startup_command_with_env(adapter_path, None, None)
+}
+
+/// Builds native-owned OMP startup command for normal OMP execution with Return Bridge companion adapter and optional execution environment
+pub fn build_omp_startup_command_with_env(
+    adapter_path: &Path,
+    execution_id: Option<&str>,
+    state_dir: Option<&Path>,
+) -> Result<String, LauncherError> {
     let omp_bin = resolve_omp_binary();
     let mut parts = Vec::new();
+
+    if let Some(dir) = state_dir {
+        parts.push(format!(
+            "$env:HANDS_RETURN_BRIDGE_STATE_DIR=\"{}\";",
+            dir.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    if let Some(exec_id) = execution_id {
+        parts.push(format!(
+            "$env:HANDS_RETURN_BRIDGE_EXECUTION_ID=\"{}\";",
+            exec_id
+        ));
+    }
+
     // PowerShell call operator '&' ensures executable paths (whether quoted with spaces or plain tokens) execute properly
     parts.push("&".to_string());
     parts.push(omp_bin);
