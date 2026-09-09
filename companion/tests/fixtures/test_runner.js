@@ -51,6 +51,13 @@ window.startTest = async function(config = {}) {
 
       const activePairingId = setupResp.pairingId;
       const activePairingSecret = setupResp.pairingSecret;
+      // Pairing credential isolation: verify chrome.storage.local retains secret in trusted context
+      await chrome.storage.local.set({ pairingSecret: activePairingSecret });
+      const stored = await chrome.storage.local.get(["pairingSecret"]);
+      const storageOk = stored.pairingSecret === activePairingSecret;
+      logResult("storage_credential_retention", storageOk, { retained: storageOk });
+      results.steps.push({ step: "storage_credential_retention", pass: storageOk });
+
 
       // Step 2: Connect with valid credentials
       const connectResp = await sendNative({

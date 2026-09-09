@@ -199,3 +199,50 @@ fn test_resolve_state_dir_fails_closed_when_env_empty() {
     let res = resolve_state_dir(Some(dir.path())).unwrap();
     assert_eq!(res, dir.path());
 }
+#[test]
+fn test_setup_rejects_missing_explicit_options() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_path = target_dir.path().to_str().unwrap().to_string();
+
+    let valid_opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "test_profile_1".to_string(),
+        target_path: target_path.clone(),
+        target_id: Some("test_target".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_id_123".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    // 1. Missing profile_id
+    let mut opts = valid_opts.clone();
+    opts.profile_id = "".to_string();
+    assert!(execute_setup(&opts).is_err(), "Empty profile_id must be rejected");
+
+    // 2. Missing extension_id
+    let mut opts = valid_opts.clone();
+    opts.extension_id = "".to_string();
+    assert!(execute_setup(&opts).is_err(), "Empty extension_id must be rejected");
+
+    // 3. Missing policy_revision
+    let mut opts = valid_opts.clone();
+    opts.policy_revision = "".to_string();
+    assert!(execute_setup(&opts).is_err(), "Empty policy_revision must be rejected");
+
+    // 4. Missing tool_policy
+    let mut opts = valid_opts.clone();
+    opts.tool_policy = "".to_string();
+    assert!(execute_setup(&opts).is_err(), "Empty tool_policy must be rejected");
+
+    // 5. Missing approval_policy
+    let mut opts = valid_opts.clone();
+    opts.approval_policy = "".to_string();
+    assert!(execute_setup(&opts).is_err(), "Empty approval_policy must be rejected");
+}

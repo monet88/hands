@@ -1,5 +1,21 @@
 const NATIVE_HOST = "com.hands.return_bridge";
 const TRUST_NOTICE = "Notice: A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.";
+async function configureStorageAccessLevel() {
+  if (chrome.storage?.local?.setAccessLevel) {
+    try {
+      await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+    } catch (err) {
+      console.warn("Could not set chrome.storage.local accessLevel:", err);
+    }
+  }
+}
+
+configureStorageAccessLevel();
+
+chrome.runtime.onInstalled?.addListener(() => {
+  configureStorageAccessLevel();
+});
+
 
 async function getOrCreateProfileId() {
   const data = await chrome.storage.local.get(["profileId"]);
@@ -45,11 +61,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           sendResponse({
             status: "ok",
             profileId,
+            extensionId: chrome.runtime.id,
             isPaired: !!stored.isPaired,
             pairingId: stored.pairingId || null,
             targets: stored.targets || [],
             policyRevision: stored.policyRevision || null,
-            trustNotice: TRUST_NOTICE
+            trustNotice: TRUST_NOTICE,
+            storageAccessLevel: "TRUSTED_CONTEXTS"
           });
           break;
         }

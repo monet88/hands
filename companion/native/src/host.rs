@@ -185,6 +185,21 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
             opts.browser
         )));
     }
+    if opts.profile_id.trim().is_empty() {
+        return Err(HostError::Storage("Missing required --profile identifier".to_string()));
+    }
+    if opts.extension_id.trim().is_empty() {
+        return Err(HostError::Storage("Missing required --extension-id".to_string()));
+    }
+    if opts.policy_revision.trim().is_empty() {
+        return Err(HostError::Storage("Missing required --policy-revision".to_string()));
+    }
+    if opts.tool_policy.trim().is_empty() {
+        return Err(HostError::Storage("Missing required --tool-policy".to_string()));
+    }
+    if opts.approval_policy.trim().is_empty() {
+        return Err(HostError::Storage("Missing required --approval-policy".to_string()));
+    }
 
     let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
     std::fs::create_dir_all(&state_dir)?;
@@ -366,16 +381,28 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
                             .trim_end_matches('/')
                             .to_string()
                     } else {
-                        DEFAULT_EXTENSION_ID.to_string()
+                        return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Native host manifest contains no allowed_origins",
+                        ))));
                     }
                 } else {
-                    DEFAULT_EXTENSION_ID.to_string()
+                    return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Native host manifest missing allowed_origins array",
+                    ))));
                 }
             } else {
-                DEFAULT_EXTENSION_ID.to_string()
+                return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Invalid native host manifest JSON",
+                ))));
             }
         } else {
-            DEFAULT_EXTENSION_ID.to_string()
+            return Err(HostError::Protocol(ProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "No expected extension ID configured in journal or manifest",
+            ))));
         }
     };
 

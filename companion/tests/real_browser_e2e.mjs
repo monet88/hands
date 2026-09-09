@@ -211,7 +211,7 @@ async function main() {
 
   // 4. Run real production native CLI setup with discovered extension-id & real registry registration
   console.log("[4/6] Running production native CLI setup (with real registry registration)...");
-  const setupCmd = `"${exePath}" setup --browser chrome --profile profile_alpha --target "${REPO_ROOT}" --target-id hands --policy-revision v1 --extension-id "${extId}" --state-dir "${stateDir}"`;
+  const setupCmd = `"${exePath}" setup --browser chrome --profile profile_alpha --target "${REPO_ROOT}" --target-id hands --extension-id "${extId}" --policy-revision v1 --tool-policy standard --approval-policy prompt --state-dir "${stateDir}"`;
   const setupOut = execSync(setupCmd, { encoding: "utf8" });
 
   const tokenMatch = setupOut.match(/Bootstrap Token:\s+(rb_boot_[a-f0-9]+)/);

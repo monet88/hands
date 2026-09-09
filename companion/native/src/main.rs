@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use hands_return_bridge::host::{
-    DEFAULT_EXTENSION_ID, SetupOptions, execute_setup, resolve_state_dir, run_native_host,
+    SetupOptions, execute_setup, resolve_state_dir, run_native_host,
 };
 use hands_return_bridge::journal::Journal;
 use hands_return_bridge::protocol::TRUST_NOTICE;
@@ -13,7 +13,7 @@ fn print_help() {
 
 Usage:
   hands-return-bridge native-host [--state-dir <dir>]
-  hands-return-bridge setup --target <path> --profile <profile_id> [options]
+  hands-return-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
   hands-return-bridge status [--state-dir <dir>]
   hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
 
@@ -21,11 +21,11 @@ Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
   --profile <profile_id>        Browser profile identifier (required)
   --target <path>               Canonical workspace/worktree target path (required)
+  --extension-id <id>           Expected extension ID to pair and pin allowed origin (required)
+  --policy-revision <rev>       Explicit launch policy revision (required, e.g. v1)
+  --tool-policy <policy>        Tool policy (required, e.g. standard)
+  --approval-policy <policy>    Approval policy (required, e.g. prompt)
   --target-id <id>              Target ID identifier (default: dir name)
-  --policy-revision <rev>       Explicit OMP launch policy revision (default: v1)
-  --tool-policy <policy>        Tool policy (default: standard)
-  --approval-policy <policy>    Approval policy (default: prompt)
-  --extension-id <id>           Expected extension ID (default: {DEFAULT_EXTENSION_ID})
   --state-dir <dir>             Override per-user companion state directory
   --skip-registry               Skip Windows Registry NativeMessagingHosts registration
 "#
@@ -72,10 +72,10 @@ fn main() {
             let mut profile_id = None;
             let mut target_path = None;
             let mut target_id = None;
-            let mut policy_revision = "v1".to_string();
-            let mut tool_policy = "standard".to_string();
-            let mut approval_policy = "prompt".to_string();
-            let mut extension_id = DEFAULT_EXTENSION_ID.to_string();
+            let mut policy_revision = None;
+            let mut tool_policy = None;
+            let mut approval_policy = None;
+            let mut extension_id = None;
             let mut state_dir = None;
             let mut skip_registry = false;
 
@@ -99,19 +99,19 @@ fn main() {
                         i += 1;
                     }
                     "--policy-revision" if i + 1 < args.len() => {
-                        policy_revision = args[i + 1].clone();
+                        policy_revision = Some(args[i + 1].clone());
                         i += 1;
                     }
                     "--tool-policy" if i + 1 < args.len() => {
-                        tool_policy = args[i + 1].clone();
+                        tool_policy = Some(args[i + 1].clone());
                         i += 1;
                     }
                     "--approval-policy" if i + 1 < args.len() => {
-                        approval_policy = args[i + 1].clone();
+                        approval_policy = Some(args[i + 1].clone());
                         i += 1;
                     }
                     "--extension-id" if i + 1 < args.len() => {
-                        extension_id = args[i + 1].clone();
+                        extension_id = Some(args[i + 1].clone());
                         i += 1;
                     }
                     "--state-dir" if i + 1 < args.len() => {
@@ -150,6 +150,37 @@ fn main() {
                 }
             };
 
+            let extension_id = match extension_id {
+                Some(e) if !e.trim().is_empty() => e,
+                _ => {
+                    eprintln!("Error: --extension-id <id> is required (obtain from Return Bridge extension settings)");
+                    std::process::exit(1);
+                }
+            };
+
+            let policy_revision = match policy_revision {
+                Some(r) if !r.trim().is_empty() => r,
+                _ => {
+                    eprintln!("Error: --policy-revision <rev> is required (e.g. v1)");
+                    std::process::exit(1);
+                }
+            };
+
+            let tool_policy = match tool_policy {
+                Some(t) if !t.trim().is_empty() => t,
+                _ => {
+                    eprintln!("Error: --tool-policy <policy> is required (e.g. standard)");
+                    std::process::exit(1);
+                }
+            };
+
+            let approval_policy = match approval_policy {
+                Some(a) if !a.trim().is_empty() => a,
+                _ => {
+                    eprintln!("Error: --approval-policy <policy> is required (e.g. prompt)");
+                    std::process::exit(1);
+                }
+            };
             let opts = SetupOptions {
                 browser,
                 profile_id,

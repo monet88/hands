@@ -1,9 +1,10 @@
 document.addEventListener("DOMContentLoaded", async () => {
   const profileIdSpan = document.getElementById("profileIdSpan");
+  const extensionIdSpan = document.getElementById("extensionIdSpan");
   const statusSpan = document.getElementById("statusSpan");
   const pairFormCard = document.getElementById("pairFormCard");
   const pairedInfoCard = document.getElementById("pairedInfoCard");
-
+  const setupCmdBlock = document.getElementById("setupCmdBlock");
   const pairingIdSpan = document.getElementById("pairingIdSpan");
   const policyRevSpan = document.getElementById("policyRevSpan");
   const targetsListSpan = document.getElementById("targetsListSpan");
@@ -21,8 +22,14 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     try {
       const state = await chrome.runtime.sendMessage({ action: "getState" });
-      profileIdSpan.textContent = state?.profileId || "Unknown";
-
+      const profileId = state?.profileId || "Unknown";
+      profileIdSpan.textContent = profileId;
+      if (extensionIdSpan) {
+        extensionIdSpan.textContent = chrome.runtime.id;
+      }
+      if (setupCmdBlock) {
+        setupCmdBlock.textContent = `hands-return-bridge setup --target <path> --profile ${profileId} --extension-id ${chrome.runtime.id} --policy-revision v1 --tool-policy standard --approval-policy prompt`;
+      }
       if (state && state.isPaired) {
         const status = await chrome.runtime.sendMessage({ action: "status" });
         if (status && status.status === "ok" && status.pairingStatus === "active") {
