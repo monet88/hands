@@ -590,3 +590,137 @@ fn test_workspace_path_with_spaces_and_unicode() {
     assert_eq!(claim.canonical_target_path, canonical_path);
     assert_eq!(claim.state, "claimed");
 }
+
+#[test]
+fn test_verify_git_target_identity_rejects_subdirectory() {
+    let dir = tempdir().unwrap();
+    init_git_repo(dir.path());
+    let subdir = dir.path().join("src").join("nested");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    // OpenCode claim: subdirectories should be accepted.
+    // Requirement: Keep exact canonical worktree-root identity fail-closed; reject subdirectories.
+    let res = Journal::verify_git_target_identity(&subdir.to_string_lossy());
+    assert_eq!(res.unwrap_err(), PairingError::TargetRevokedOrMismatched);
+}
+
+#[test]
+fn test_crash_immediately_after_attempt_mark_and_replay_semantics() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_crash_test";
+    let bootstrap_token = "boot_crash_token";
+    let profile_id = "profile_crash";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let targets = vec![TargetRecord {
+        target_id: "target_crash".to_string(),
+        canonical_path,
+        name: "target_crash".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_crash_1".to_string(),
+        origin_conversation_id: "conv_crash".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_crash".to_string(),
+        transcript_evidence_hash: "hash_crash_t".to_string(),
+        account_evidence_hash: "hash_crash_a".to_string(),
+        target_id: "target_crash".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Crash recovery probe".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+    assert_eq!(claim.state, "claimed");
+
+    // Finding 3: mark_launch_attempt MUST persist an unresolved/unknown state at that boundary,
+    // NOT 'attempting'. If process dies right after attempt mark, replay/recovery must see 'unknown'.
+    let marked = journal.mark_launch_attempt(&claim.execution_id, pairing_id).unwrap();
+    assert!(marked, "First attempt mark must succeed");
+
+    // Simulate process death & reboot by reopening SQLite DB from disk
+    drop(journal);
+    let journal_reboot = Journal::open(&db_path).expect("Reopened journal after simulated crash");
+
+    // Summary after crash must report 'unknown', not 'attempting'
+    let summary = journal_reboot.get_launch_request_by_id(pairing_id, "req_crash_1").unwrap().expect("Summary must exist");
+    assert_eq!(summary.state, "unknown", "State after crash around attempt mark must be 'unknown', not 'attempting'");
+
+    // Replay of same request must NOT invoke a second attempt and must return 'unknown'
+    let replay_claim = journal_reboot.reserve_or_claim_launch(&params).unwrap();
+    assert!(replay_claim.is_replayed);
+    assert_eq!(replay_claim.state, "unknown");
+    assert_eq!(replay_claim.execution_id, claim.execution_id);
+
+    // Automatic re-invocation is forbidden: attempt mark returns false
+    let second_attempt = journal_reboot.mark_launch_attempt(&claim.execution_id, pairing_id).unwrap();
+    assert!(!second_attempt, "Replay must never allow a second launch attempt");
+}
+
+#[test]
+fn test_zero_side_effects_on_rejected_journal_launches() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_zero_side_effect";
+    let bootstrap_token = "boot_zero";
+    let profile_id = "profile_zero";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let targets = vec![TargetRecord {
+        target_id: "target_zero".to_string(),
+        canonical_path,
+        name: "target_zero".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    // Case A: Unknown target
+    let mut bad_target_params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_bad_t".to_string(),
+        origin_conversation_id: "c_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/c_1".to_string(),
+        transcript_evidence_hash: "hash_t".to_string(),
+        account_evidence_hash: "hash_a".to_string(),
+        target_id: "nonexistent_target".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "test".to_string(),
+    };
+    let res_t = journal.reserve_or_claim_launch(&bad_target_params);
+    assert_eq!(res_t.unwrap_err(), PairingError::TargetNotFound);
+
+    // Case B: Policy mismatch
+    bad_target_params.target_id = "target_zero".to_string();
+    bad_target_params.policy_revision = "v_mismatch".to_string();
+    let res_p = journal.reserve_or_claim_launch(&bad_target_params);
+    assert_eq!(res_p.unwrap_err(), PairingError::PolicyMismatch);
+
+    // Verify ZERO side effects in journal tables
+    let summaries = journal.get_launch_summaries(pairing_id).unwrap();
+    assert_eq!(summaries.len(), 0, "Zero launch requests must exist after rejected launch claims");
+}

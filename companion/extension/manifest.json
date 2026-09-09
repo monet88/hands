@@ -5,7 +5,12 @@
   "description": "Companion extension for Hands Return Bridge",
   "permissions": [
     "nativeMessaging",
-    "storage"
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
   ],
   "content_scripts": [
     {

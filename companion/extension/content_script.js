@@ -44,17 +44,27 @@
           }
         }
         if (!transcriptText) {
-          // Fallback to main container text if turn containers not rendered
-          const main = document.querySelector("main");
-          transcriptText = (main?.innerText || "chatgpt_conversation").slice(0, 128 * 1024);
+          sendResponse({
+            ok: false,
+            error: "missing_rendered_transcript",
+            message: "No rendered conversation transcript turns found in page"
+          });
+          return true;
         }
 
         // Collect account / workspace evidence if available
         const accountNode = document.querySelector(
           '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]'
         );
-        const accountText = (accountNode?.innerText || "chatgpt_user_context").trim();
-
+        const accountText = (accountNode?.innerText || "").trim();
+        if (!accountText) {
+          sendResponse({
+            ok: false,
+            error: "missing_account_context",
+            message: "No account or workspace context evidence found in page"
+          });
+          return true;
+        }
         sendResponse({
           ok: true,
           originConversationId: conversationId,

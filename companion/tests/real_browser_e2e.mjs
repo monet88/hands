@@ -259,7 +259,6 @@ async function main() {
       if (loadedExtId !== extId) {
         throw new Error(`Loaded extension ID mismatch: expected ${extId}, got ${loadedExtId}`);
       }
-
       // Open test runner with clean URL (no credentials/tokens in URL!)
       const testUrlAlpha = `chrome-extension://${extId}/test_runner.html`;
       console.log("      Navigating to extension test runner page (clean URL without secrets)...");
@@ -277,7 +276,6 @@ async function main() {
       chromeAlpha.kill();
       await sleep(1000);
     }
-
     if (!alphaResult || !alphaResult.success) {
       throw new Error(`Profile Alpha tests failed: ${JSON.stringify(alphaResult)}`);
     }

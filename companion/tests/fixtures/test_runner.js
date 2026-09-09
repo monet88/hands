@@ -130,20 +130,42 @@ window.startTest = async function(config = {}) {
       logResult("reject_launch_unauthorized_field", launchBadRejected, launchBadResp);
       results.steps.push({ step: "reject_launch_unauthorized_field", pass: launchBadRejected });
 
-      // Step 7b: Valid launch request through extension internal messaging with first-request durability & replay
+      // Step 7b: Valid launch request through extension internal messaging with exact bound ChatGPT tab
       const targetList = setupResp.targets || [];
       const validTargetId = targetList.length > 0 ? targetList[0].target_id : "hands";
       const launchReqId = "e2e_req_" + Date.now();
+
+      // Find or create bound ChatGPT tab
+      const existingTabs = await chrome.tabs.query({ url: "https://chatgpt.com/c/*" });
+      let chatTab = existingTabs[0];
+      if (!chatTab) {
+        chatTab = await chrome.tabs.create({ url: "https://chatgpt.com/c/conv_e2e_123" });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      // Helper to render conversation turns and user context in the ChatGPT tab
+      async function ensureMockChatGptDom() {
+        await chrome.scripting.executeScript({
+          target: { tabId: chatTab.id },
+          func: () => {
+            document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
+          }
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: chatTab.id },
+          files: ["content_script.js"]
+        });
+      }
+
+      await ensureMockChatGptDom();
+
       const launchPayload = {
         action: "launch",
         launchRequestId: launchReqId,
-        originConversationId: "conv_e2e_123",
-        originConversationUrl: "https://chatgpt.com/c/conv_e2e_123",
-        transcriptEvidenceHash: "hash_transcript_e2e",
-        accountEvidenceHash: "hash_account_e2e",
+        tabId: chatTab.id,
         targetId: validTargetId,
         requestedPolicyRevision: "v1",
-        promptText: 'Test literal task prompt: --flag @some_file "quotes"'
+        promptText: 'Test literal task prompt: --flag @some_file "quotes" ; echo pipe | unicode: Đại Ca \n line2'
       };
 
       const internalLaunchResp = await chrome.runtime.sendMessage(launchPayload);
@@ -154,12 +176,14 @@ window.startTest = async function(config = {}) {
       results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
 
       // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
+      await ensureMockChatGptDom();
       const replayResp = await chrome.runtime.sendMessage(launchPayload);
       const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
       logResult("launch_idempotent_replay", replayOk, replayResp);
       results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
 
       // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
+      await ensureMockChatGptDom();
       const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
       const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
       const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";
@@ -171,7 +195,6 @@ window.startTest = async function(config = {}) {
       const recoverOk = recoverResp && recoverResp.status === "ok" && Array.isArray(recoverResp.summaries) && recoverResp.summaries.length >= 1;
       logResult("recover_launch_summaries", recoverOk, recoverResp);
       results.steps.push({ step: "recover_launch_summaries", pass: recoverOk });
-
       // Step 8: Security: Unsupported operations fail closed
       const unknownOpResp = await sendNative({
         op: "shell_exec",

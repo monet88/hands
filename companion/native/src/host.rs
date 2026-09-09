@@ -363,9 +363,10 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
     let state_dir = resolve_state_dir(state_dir_opt)?;
+    std::fs::create_dir_all(&state_dir)?;
+    std::env::set_var("HANDS_RETURN_BRIDGE_STATE_DIR", &state_dir);
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
-
     // Exact native origin authority: caller origin is mandatory
     let origin_str = match origin {
         Some(o) if !o.trim().is_empty() => o.trim(),

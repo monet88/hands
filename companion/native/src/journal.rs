@@ -1039,18 +1039,17 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 execution_id, pairing_id, attempt_marked_at, invoked_at,
                 orca_terminal_handle, orca_tab_id, orca_pane_key, orca_pty_id,
                 state, failure_reason
-            ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, 'attempting', NULL)
+            ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, 'unknown', NULL)
             "#,
             params![execution_id, pairing_id, now],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         tx.execute(
-            "UPDATE launch_requests SET state = 'attempting', updated_at = ?1 WHERE execution_id = ?2",
+            "UPDATE launch_requests SET state = 'unknown', updated_at = ?1 WHERE execution_id = ?2",
             params![now, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
-
         tx.commit()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 

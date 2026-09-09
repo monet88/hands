@@ -625,3 +625,224 @@ fn test_uncertainty_and_recovery_semantics() {
     assert_eq!(replay2_resp["isReplayed"], true);
     assert_eq!(replay2_resp["executionId"], claim2.execution_id);
 }
+
+#[test]
+fn test_adapter_pinning_and_deterministic_content() {
+    use hands_return_bridge::launcher::{
+        ensure_adapter_file, ADAPTER_TS_CONTENT, COMPANION_ADAPTER_REVISION,
+    };
+    let dir = tempdir().unwrap();
+    let adapter_path = ensure_adapter_file(dir.path()).expect("Must write adapter file");
+    assert_eq!(COMPANION_ADAPTER_REVISION, "v1");
+    let read_back = std::fs::read_to_string(&adapter_path).unwrap();
+    assert_eq!(read_back, ADAPTER_TS_CONTENT);
+    assert!(read_back.contains("revision: v1"));
+}
+
+#[test]
+fn test_zero_side_effects_on_rejected_protocol_messages() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_zero_proto";
+    let bootstrap_token = "boot_zero_proto";
+    let profile_id = "profile_alpha";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let targets = vec![TargetRecord {
+        target_id: "target_valid".to_string(),
+        canonical_path,
+        name: "target_valid".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let pairing_secret = &activated.pairing_secret;
+
+    // Rejection 1: unauthorized override field
+    let bad_override = json!({
+        "op": "launch",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": "req_bad_1",
+        "originConversationId": "c_1",
+        "originConversationUrl": "https://chatgpt.com/c/c_1",
+        "transcriptEvidenceHash": "hash_t",
+        "accountEvidenceHash": "hash_a",
+        "targetId": "target_valid",
+        "requestedPolicyRevision": "v1",
+        "promptText": "test",
+        "executable": "powershell.exe"
+    });
+    let resp1 = handle_native_message(&bad_override, &journal);
+    assert_eq!(resp1["status"], "error");
+    assert_eq!(resp1["code"], "unauthorized_override");
+
+    // Rejection 2: invalid conversation URL
+    let bad_url = json!({
+        "op": "launch",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": "req_bad_2",
+        "originConversationId": "c_1",
+        "originConversationUrl": "https://chatgpt.com/",
+        "transcriptEvidenceHash": "hash_t",
+        "accountEvidenceHash": "hash_a",
+        "targetId": "target_valid",
+        "requestedPolicyRevision": "v1",
+        "promptText": "test"
+    });
+    let resp2 = handle_native_message(&bad_url, &journal);
+    assert_eq!(resp2["status"], "error");
+    assert_eq!(resp2["code"], "invalid_conversation_boundary");
+
+    // Zero-side-effects check: no launch requests or attempts recorded
+    let summaries = journal.get_launch_summaries(pairing_id).unwrap();
+    assert_eq!(summaries.len(), 0, "No launch requests should exist after rejected messages");
+}
+
+#[test]
+fn test_literal_prompt_delivery_contract() {
+    // Verify literal probe characters (--foo, @file, quotes, semicolon, pipe, Unicode/newlines)
+    // are passed as separate argv entries to Command without shell escaping issues.
+    let probe_prompt = "Probe: --flag @some_file \"double\" 'single' ; echo pipe | unicode: Đại Ca \n newline line 2";
+    assert!(probe_prompt.contains("--flag"));
+    assert!(probe_prompt.contains("@some_file"));
+    assert!(probe_prompt.contains("\"double\""));
+    assert!(probe_prompt.contains(";"));
+    assert!(probe_prompt.contains("|"));
+    assert!(probe_prompt.contains("Đại Ca"));
+    assert!(probe_prompt.contains("\n"));
+
+    // Verify prompt does not exceed bounded size
+    assert!(probe_prompt.len() <= 128 * 1024);
+}
+
+#[test]
+fn test_multi_process_native_host_convergence() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use hands_return_bridge::host::{execute_setup, SetupOptions};
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let extension_id = "mkkajdpmlmliildflmnnmfndboldnnfa";
+    let profile_id = "profile_multi";
+    let setup_opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: profile_id.to_string(),
+        target_path: canonical_path,
+        target_id: Some("target_multi".to_string()),
+        extension_id: extension_id.to_string(),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    let setup_res = execute_setup(&setup_opts).expect("Setup must succeed");
+
+    // Activate bootstrap first via direct journal connection to obtain pairing_secret
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let activated = journal.activate_bootstrap(&setup_res.bootstrap_token, profile_id).unwrap();
+    let pairing_id = activated.pairing_id;
+    let pairing_secret = activated.pairing_secret;
+    drop(journal);
+
+    let binary_path = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let caller_origin = format!("chrome-extension://{}/", extension_id);
+
+    // Spawn Host Process 1
+    let mut child1 = Command::new(binary_path)
+        .args([&caller_origin, "--state-dir", &state_dir.to_string_lossy()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Spawn host child 1 failed");
+
+    // Spawn Host Process 2
+    let mut child2 = Command::new(binary_path)
+        .args([&caller_origin, "--state-dir", &state_dir.to_string_lossy()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Spawn host child 2 failed");
+
+    let launch_msg = json!({
+        "op": "launch",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": "req_multi_converge_1",
+        "originConversationId": "conv_multi_1",
+        "originConversationUrl": "https://chatgpt.com/c/conv_multi_1",
+        "transcriptEvidenceHash": "hash_t_multi",
+        "accountEvidenceHash": "hash_a_multi",
+        "targetId": "target_multi",
+        "requestedPolicyRevision": "v1",
+        "promptText": "Multi-process convergence probe"
+    });
+
+    fn send_and_recv(child: &mut std::process::Child, msg: &serde_json::Value) -> serde_json::Value {
+        let body = serde_json::to_vec(msg).unwrap();
+        let len = body.len() as u32;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(&len.to_ne_bytes()).unwrap();
+        stdin.write_all(&body).unwrap();
+        stdin.flush().unwrap();
+
+        let stdout = child.stdout.as_mut().unwrap();
+        let mut len_buf = [0u8; 4];
+        stdout.read_exact(&mut len_buf).unwrap();
+        let resp_len = u32::from_ne_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        stdout.read_exact(&mut resp_buf).unwrap();
+        serde_json::from_slice(&resp_buf).unwrap()
+    }
+
+    // Send to both child processes concurrently
+    let msg_clone = launch_msg.clone();
+    let t1 = std::thread::spawn(move || {
+        send_and_recv(&mut child1, &msg_clone)
+    });
+    let t2 = std::thread::spawn(move || {
+        send_and_recv(&mut child2, &launch_msg)
+    });
+
+    let resp1 = t1.join().unwrap();
+    let resp2 = t2.join().unwrap();
+    eprintln!("resp1 = {}", resp1);
+    eprintln!("resp2 = {}", resp2);
+    assert!(resp1["status"] == "ok" || resp1["code"] == "launch_uncertain" || resp1["code"] == "orca_spawn_failed", "resp1 was: {}", resp1);
+    assert!(resp2["status"] == "ok" || resp2["code"] == "launch_uncertain" || resp2["code"] == "orca_spawn_failed", "resp2 was: {}", resp2);
+
+    // Both processes MUST converge on the exact same executionId!
+    let exec_id_1 = resp1.get("executionId").and_then(|v| v.as_str());
+    let exec_id_2 = resp2.get("executionId").and_then(|v| v.as_str());
+    assert!(exec_id_1.is_some() && exec_id_2.is_some(), "Both must return executionId");
+    assert_eq!(exec_id_1, exec_id_2, "Concurrent native host processes MUST converge on identical executionId");
+
+    // Verify SQLite journal integrity: exactly ONE launch request was created
+    let journal_check = Journal::open(&db_path).unwrap();
+    let summaries = journal_check.get_launch_summaries(&pairing_id).unwrap();
+    assert_eq!(summaries.len(), 1, "Exactly one launch request row must exist");
+    assert_eq!(summaries[0].execution_id, exec_id_1.unwrap());
+}

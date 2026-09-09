@@ -40,8 +40,11 @@ impl std::fmt::Display for LauncherError {
 
 impl std::error::Error for LauncherError {}
 
+/// Pinned companion adapter revision identifier
+pub const COMPANION_ADAPTER_REVISION: &str = "v1";
+
 /// The embedded TypeScript adapter loaded explicitly via `-e` for owned OMP turns
-pub const ADAPTER_TS_CONTENT: &str = r#"// Return Bridge companion OMP adapter
+pub const ADAPTER_TS_CONTENT: &str = r#"// Return Bridge companion OMP adapter (revision: v1)
 export default function (pi) {
   // Scoped initialization for owned execution
   if (process.env.HANDS_RETURN_BRIDGE_EXECUTION_ID) {
@@ -51,8 +54,15 @@ export default function (pi) {
 "#;
 
 pub fn ensure_adapter_file(state_dir: &Path) -> Result<PathBuf, LauncherError> {
+    std::fs::create_dir_all(state_dir)?;
     let adapter_path = state_dir.join("adapter.ts");
     std::fs::write(&adapter_path, ADAPTER_TS_CONTENT)?;
+    let content = std::fs::read_to_string(&adapter_path)?;
+    if content != ADAPTER_TS_CONTENT {
+        return Err(LauncherError::UnsupportedPolicy(
+            "Adapter content on disk failed integrity check".to_string(),
+        ));
+    }
     Ok(adapter_path)
 }
 

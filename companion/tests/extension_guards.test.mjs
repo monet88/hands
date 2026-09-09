@@ -4,7 +4,9 @@ import vm from "node:vm";
 import assert from "node:assert/strict";
 
 const BACKGROUND_JS_PATH = path.resolve("companion/extension/background.js");
+const CONTENT_SCRIPT_JS_PATH = path.resolve("companion/extension/content_script.js");
 const backgroundCode = fs.readFileSync(BACKGROUND_JS_PATH, "utf8");
+const contentScriptCode = fs.readFileSync(CONTENT_SCRIPT_JS_PATH, "utf8");
 
 function createTestHarness({
   extensionId = "mkkajdpmlmliildflmnnmfndboldnnfa",
@@ -12,7 +14,10 @@ function createTestHarness({
   missingSetAccessLevel = false,
   failStorageSet = false,
   nativeResponse = { status: "ok", pairingId: "pair_123", pairingSecret: "rb_sec_456" },
-  initialStorage = {}
+  nativeError = null,
+  initialStorage = {},
+  mockTabs = {},
+  mockTabMessages = {}
 } = {}) {
   const storageStore = { ...initialStorage };
   let capturedListener = null;
@@ -21,6 +26,7 @@ function createTestHarness({
   const mockChrome = {
     runtime: {
       id: extensionId,
+      lastError: null,
       onInstalled: {
         addListener() {}
       },
@@ -31,7 +37,37 @@ function createTestHarness({
       },
       sendNativeMessage(host, msg, cb) {
         nativeMessagesSent.push({ host, msg });
+        if (nativeError) {
+          mockChrome.runtime.lastError = new Error(nativeError);
+          cb(null);
+          mockChrome.runtime.lastError = null;
+          return;
+        }
         cb(nativeResponse);
+      }
+    },
+    tabs: {
+      async get(tabId) {
+        if (mockTabs && mockTabs[tabId]) {
+          return mockTabs[tabId];
+        }
+        throw new Error("Tab not found: " + tabId);
+      },
+      sendMessage(tabId, message, cb) {
+        if (mockTabMessages && mockTabMessages[tabId]) {
+          const resp = mockTabMessages[tabId](message);
+          if (cb) cb(resp);
+          return Promise.resolve(resp);
+        }
+        const resp = {
+          ok: true,
+          originConversationId: "c_test_123",
+          originConversationUrl: "https://chatgpt.com/c/c_test_123",
+          transcriptText: "Turn 1: hello world\nTurn 2: how are you",
+          accountText: "Personal Workspace (user@example.com)"
+        };
+        if (cb) cb(resp);
+        return Promise.resolve(resp);
       }
     },
     storage: {
@@ -266,10 +302,7 @@ async function runTests() {
     };
     const res = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
+      tabId: 101,
       targetId: "target_test",
       promptText: "Do something"
     }, contentScriptSender);
@@ -281,7 +314,7 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------------
-  // Test 6: Launch rejects missing or placeholder evidence hashes
+  // Test 6: Launch requires explicit tabId; fails closed without focused-tab fallback
   // ---------------------------------------------------------------------------
   {
     const harness = createTestHarness({
@@ -292,80 +325,162 @@ async function runTests() {
       url: `chrome-extension://${harness.extensionId}/popup.html`
     };
 
-    // Placeholder transcript hash
-    const resPlaceholder = await harness.sendMessage({
-      action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_transcript_empty",
-      accountEvidenceHash: "hash_a_real",
-      targetId: "target_test",
-      promptText: "Do something"
-    }, trustedSender);
-    assert.equal(resPlaceholder.status, "error");
-    assert.equal(resPlaceholder.code, "missing_evidence");
-    assert.equal(harness.nativeMessagesSent.length, 0);
-
-    // Missing account hash
+    // Missing tabId
     const resMissing = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
       targetId: "target_test",
       promptText: "Do something"
     }, trustedSender);
+
     assert.equal(resMissing.status, "error");
-    assert.equal(resMissing.code, "missing_evidence");
+    assert.equal(resMissing.code, "missing_tab_binding");
     assert.equal(harness.nativeMessagesSent.length, 0);
-    console.log("  [PASS] Launch rejects empty placeholder or missing evidence hashes");
+
+    // Non-number tabId
+    const resBadType = await harness.sendMessage({
+      action: "launch",
+      tabId: "active",
+      targetId: "target_test",
+      promptText: "Do something"
+    }, trustedSender);
+    assert.equal(resBadType.status, "error");
+    assert.equal(resBadType.code, "missing_tab_binding");
+
+    console.log("  [PASS] Launch requires explicit tabId (no focused-tab fallback)");
   }
 
   // ---------------------------------------------------------------------------
-  // Test 7: Launch rejects non-canonical conversation URL / ID mismatch
+  // Test 7: Launch rejects non-ChatGPT tab URL and non-canonical conversation URL
   // ---------------------------------------------------------------------------
   {
     const harness = createTestHarness({
-      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" }
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: {
+        101: { id: 101, url: "https://example.com/not-chatgpt" },
+        102: { id: 102, url: "https://chatgpt.com/" },
+        103: { id: 103, url: "https://chatgpt.com/chat" },
+        104: { id: 104, url: "https://chatgpt.com/c/new_chat" },
+      }
     });
     const trustedSender = {
       id: harness.extensionId,
       url: `chrome-extension://${harness.extensionId}/popup.html`
     };
 
-    // Home / non-canonical URL
-    const resHome = await harness.sendMessage({
+    // Tab on non-ChatGPT URL
+    const resNonChat = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
+      tabId: 101,
       targetId: "target_test",
       promptText: "Do something"
     }, trustedSender);
-    assert.equal(resHome.status, "error");
-    assert.equal(resHome.code, "invalid_conversation_boundary");
+    assert.equal(resNonChat.status, "error");
+    assert.equal(resNonChat.code, "invalid_tab_url");
 
-    // Mismatched ID
-    const resMismatch = await harness.sendMessage({
+    // Tab on root ChatGPT page (no canonical conversation)
+    const resRoot = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_other_999",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
+      tabId: 102,
       targetId: "target_test",
       promptText: "Do something"
     }, trustedSender);
-    assert.equal(resMismatch.status, "error");
-    assert.equal(resMismatch.code, "invalid_conversation_boundary");
+    assert.equal(resRoot.status, "error");
+    assert.equal(resRoot.code, "invalid_conversation_boundary");
+
+    // Tab on /chat
+    const resChat = await harness.sendMessage({
+      action: "launch",
+      tabId: 103,
+      targetId: "target_test",
+      promptText: "Do something"
+    }, trustedSender);
+    assert.equal(resChat.status, "error");
+    assert.equal(resChat.code, "invalid_conversation_boundary");
+
     assert.equal(harness.nativeMessagesSent.length, 0);
-    console.log("  [PASS] Launch rejects non-canonical URL and ID mismatches");
+    console.log("  [PASS] Launch rejects non-ChatGPT URLs and non-canonical conversation boundaries");
   }
 
+  // ---------------------------------------------------------------------------
+  // Test 8: Content script evidence errors and conversation ID/URL mismatches
+  // ---------------------------------------------------------------------------
+  {
+    const trustedSender = {
+      id: "mkkajdpmlmliildflmnnmfndboldnnfa",
+      url: "chrome-extension://mkkajdpmlmliildflmnnmfndboldnnfa/popup.html"
+    };
+
+    // Subtest A: Missing rendered transcript
+    const harnessA = createTestHarness({
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } },
+      mockTabMessages: {
+        101: () => ({ ok: false, error: "missing_rendered_transcript", message: "No rendered conversation transcript turns found in page" })
+      }
+    });
+    const resA = await harnessA.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Do something"
+    }, trustedSender);
+    assert.equal(resA.status, "error");
+    assert.equal(resA.code, "missing_rendered_transcript");
+    assert.equal(harnessA.nativeMessagesSent.length, 0);
+
+    // Subtest B: Missing account context
+    const harnessB = createTestHarness({
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } },
+      mockTabMessages: {
+        101: () => ({ ok: false, error: "missing_account_context", message: "No account or workspace context evidence found in page" })
+      }
+    });
+    const resB = await harnessB.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Do something"
+    }, trustedSender);
+    assert.equal(resB.status, "error");
+    assert.equal(resB.code, "missing_account_context");
+    assert.equal(harnessB.nativeMessagesSent.length, 0);
+
+    // Subtest C: Conversation ID / URL mismatch between tab and content script
+    const harnessC = createTestHarness({
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } },
+      mockTabMessages: {
+        101: () => ({
+          ok: true,
+          originConversationId: "c_other_999",
+          originConversationUrl: "https://chatgpt.com/c/c_other_999",
+          transcriptText: "real transcript",
+          accountText: "real user"
+        })
+      }
+    });
+    const resC = await harnessC.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Do something"
+    }, trustedSender);
+    assert.equal(resC.status, "error");
+    assert.equal(resC.code, "conversation_binding_mismatch");
+    assert.equal(harnessC.nativeMessagesSent.length, 0);
+
+    console.log("  [PASS] Content script evidence errors and conversation binding mismatches fail closed");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 9: Browser storage failure aborts native messaging call
+  // ---------------------------------------------------------------------------
   {
     const harness = createTestHarness({
       failStorageSet: true,
-      initialStorage: { profileId: "prof_launch", isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" }
+      initialStorage: { profileId: "prof_launch", isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
     });
     const trustedSender = {
       id: harness.extensionId,
@@ -374,10 +489,7 @@ async function runTests() {
 
     const res = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
+      tabId: 101,
       targetId: "target_test",
       promptText: "Do something"
     }, trustedSender);
@@ -389,74 +501,371 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------------
-  // Test 9: First-request durability, idempotency, and local conflict
+  // Test 10: Full valid launch collects evidence, hashes inside background, and sends only hashes
   // ---------------------------------------------------------------------------
   {
     const harness = createTestHarness({
-      nativeResponse: { status: "ok", executionId: "exec_123", returnToken: "ret_456", state: "started" },
-      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" }
+      nativeResponse: { status: "ok", executionId: "exec_full_1", returnToken: "ret_full_1", state: "started" },
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } },
+      mockTabMessages: {
+        101: () => ({
+          ok: true,
+          originConversationId: "c_test_123",
+          originConversationUrl: "https://chatgpt.com/c/c_test_123",
+          transcriptText: "Line 1: implement review remediation\nLine 2: done",
+          accountText: "OpenCode Workspace (user@example.com)"
+        })
+      }
     });
     const trustedSender = {
       id: harness.extensionId,
       url: `chrome-extension://${harness.extensionId}/popup.html`
     };
 
-    // A. Initial launch without launchRequestId derives deterministic durable ID
-    const res1 = await harness.sendMessage({
+    const res = await harness.sendMessage({
       action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
-      targetId: "target_test",
+      tabId: 101,
+      targetId: "target_hands",
       promptText: "Fix bug in parser"
     }, trustedSender);
 
-    assert.equal(res1.status, "ok");
+    assert.equal(res.status, "ok");
     assert.equal(harness.nativeMessagesSent.length, 1);
-    const firstSent = harness.nativeMessagesSent[0].msg;
-    assert.ok(firstSent.launchRequestId.startsWith("req_"));
 
-    // Check stored durable record
-    const storedKey = "launch_" + firstSent.launchRequestId;
-    assert.ok(harness.storageStore[storedKey]);
-    assert.equal(harness.storageStore[storedKey].status, "started");
-    assert.equal(harness.storageStore[storedKey].executionId, "exec_123");
+    const sent = harness.nativeMessagesSent[0].msg;
+    assert.equal(sent.op, "launch");
+    assert.equal(sent.originConversationId, "c_test_123");
+    assert.equal(sent.originConversationUrl, "https://chatgpt.com/c/c_test_123");
+    // Must contain computed SHA-256 hashes (64 hex characters)
+    assert.match(sent.transcriptEvidenceHash, /^[a-f0-9]{64}$/);
+    assert.match(sent.accountEvidenceHash, /^[a-f0-9]{64}$/);
+    assert.equal(sent.targetId, "target_hands");
+    assert.equal(sent.promptText, "Fix bug in parser");
 
-    // B. Re-invoking launch for same conversation & target reuses identical durable request ID
-    const res2 = await harness.sendMessage({
-      action: "launch",
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
-      targetId: "target_test",
-      promptText: "Fix bug in parser"
-    }, trustedSender);
+    // Stored launch record must be persisted with status started
+    const storedRecord = harness.storageStore["launch_" + sent.launchRequestId];
+    assert.ok(storedRecord);
+    assert.equal(storedRecord.status, "started");
+    assert.equal(storedRecord.executionId, "exec_full_1");
+    assert.equal(storedRecord.transcriptEvidenceHash, sent.transcriptEvidenceHash);
 
-    assert.equal(res2.status, "ok");
-    assert.equal(harness.nativeMessagesSent.length, 2);
-    assert.equal(harness.nativeMessagesSent[1].msg.launchRequestId, firstSent.launchRequestId, "Must reuse same durable launchRequestId");
-
-    // C. Re-invoking same request ID with CHANGED payload yields local conflict before native call
-    const resConflict = await harness.sendMessage({
-      action: "launch",
-      launchRequestId: firstSent.launchRequestId,
-      originConversationId: "c_test_123",
-      originConversationUrl: "https://chatgpt.com/c/c_test_123",
-      transcriptEvidenceHash: "hash_t_real",
-      accountEvidenceHash: "hash_a_real",
-      targetId: "target_test",
-      promptText: "DIFFERENT PROMPT TEXT!"
-    }, trustedSender);
-
-    assert.equal(resConflict.status, "error");
-    assert.equal(resConflict.code, "payload_conflict");
-    assert.equal(harness.nativeMessagesSent.length, 2, "Conflicting payload must NOT generate new native message");
-    console.log("  [PASS] First-request durability, idempotency, and local conflict prevention verified");
+    console.log("  [PASS] Full launch collects evidence from content script, hashes in background, and persists before native call");
   }
 
-  console.log("ALL real background.js harness tests PASSED CLEANLY!");
+  // ---------------------------------------------------------------------------
+  // Test 11: Lost native response boundary sets local native-response-uncertain
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness({
+      nativeError: "Native messaging host disconnected unexpectedly (exit code 1)",
+      initialStorage: { isPaired: true, pairingId: "pair_launch", pairingSecret: "rb_sec_launch", policyRevision: "v1" },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_hands",
+      promptText: "Crash probe"
+    }, trustedSender);
+
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "native_response_uncertain");
+    assert.equal(res.state, "native-response-uncertain");
+    assert.ok(res.launchRequestId);
+
+    // Storage record must be marked 'native-response-uncertain', NOT 'pending_native'
+    const storedRecord = harness.storageStore["launch_" + res.launchRequestId];
+    assert.ok(storedRecord);
+    assert.equal(storedRecord.status, "native-response-uncertain");
+    assert.ok(storedRecord.lastError.includes("Native messaging host disconnected"));
+
+    console.log("  [PASS] Lost native response boundary caught explicitly as native-response-uncertain");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 12: Recovery updates native-response-uncertain record from native summary
+  // ---------------------------------------------------------------------------
+  {
+    const launchReqId = "req_recovering_1";
+    const harness = createTestHarness({
+      nativeResponse: {
+        status: "ok",
+        summaries: [
+          {
+            launch_request_id: launchReqId,
+            execution_id: "exec_rec_1",
+            state: "started",
+            orca_terminal_handle: "term_rec_1"
+          }
+        ]
+      },
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_launch",
+        pairingSecret: "rb_sec_launch",
+        policyRevision: "v1",
+        lastLaunchRequestId: launchReqId,
+        ["launch_" + launchReqId]: {
+          launchRequestId: launchReqId,
+          status: "native-response-uncertain"
+        }
+      }
+    });
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "recover" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.summaries.length, 1);
+
+    // Stored record must now be updated from native-response-uncertain to started!
+    const updated = harness.storageStore["launch_" + launchReqId];
+    assert.equal(updated.status, "started");
+    assert.equal(updated.executionId, "exec_rec_1");
+    assert.equal(updated.terminalEvidence.orcaTerminalHandle, "term_rec_1");
+
+    console.log("  [PASS] Recovery reconciles native-response-uncertain records against native summary");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 13: Stale activeKey handling: resolved prior task does not trap new task
+  // ---------------------------------------------------------------------------
+  {
+    const priorReqId = "req_prior_resolved";
+    const activeKey = "active_launch_pair_launch_c_test_123_target_hands_v1";
+    const harness = createTestHarness({
+      nativeResponse: { status: "ok", executionId: "exec_new_task", returnToken: "ret_new", state: "started" },
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_launch",
+        pairingSecret: "rb_sec_launch",
+        policyRevision: "v1",
+        [activeKey]: priorReqId,
+        ["launch_" + priorReqId]: {
+          launchRequestId: priorReqId,
+          originConversationId: "c_test_123",
+          targetId: "target_hands",
+          requestedPolicyRevision: "v1",
+          promptText: "Old prior prompt",
+          status: "started" // Resolved!
+        }
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // Send new prompt for same conversation/target: must NOT be trapped by stale activeKey!
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_hands",
+      promptText: "Brand new second task"
+    }, trustedSender);
+
+    assert.equal(res.status, "ok");
+    assert.equal(harness.nativeMessagesSent.length, 1);
+    const newSent = harness.nativeMessagesSent[0].msg;
+    assert.notEqual(newSent.launchRequestId, priorReqId, "Must allocate a fresh request ID for subsequent task");
+    assert.equal(newSent.promptText, "Brand new second task");
+
+    console.log("  [PASS] Stale activeKey from resolved task does not trap subsequent new task");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 14: Uncertain/unresolved task blocks new launch (does not silently mint ID)
+  // ---------------------------------------------------------------------------
+  {
+    const uncertainReqId = "req_prior_uncertain";
+    const activeKey = "active_launch_pair_launch_c_test_123_target_hands_v1";
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_launch",
+        pairingSecret: "rb_sec_launch",
+        policyRevision: "v1",
+        [activeKey]: uncertainReqId,
+        ["launch_" + uncertainReqId]: {
+          launchRequestId: uncertainReqId,
+          executionId: "exec_uncertain_1",
+          originConversationId: "c_test_123",
+          originConversationUrl: "https://chatgpt.com/c/c_test_123",
+          transcriptEvidenceHash: "hash_t_old",
+          accountEvidenceHash: "hash_a_old",
+          targetId: "target_hands",
+          requestedPolicyRevision: "v1",
+          promptText: "Prior in-flight prompt",
+          status: "unknown" // Unresolved!
+        }
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // Attempt to start a different task while prior task is unresolved
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_hands",
+      promptText: "Different task while prior task is uncertain"
+    }, trustedSender);
+
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "active_launch_unresolved");
+    assert.equal(res.launchRequestId, uncertainReqId);
+    assert.equal(harness.nativeMessagesSent.length, 0, "Must not dispatch native call while prior task unresolved");
+
+    console.log("  [PASS] Unresolved task blocks new task and prevents silent ID minting");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 15: Replaying same request ID with conflicting payload returns payload_conflict
+  // ---------------------------------------------------------------------------
+  {
+    const explicitReqId = "req_explicit_1";
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_launch",
+        pairingSecret: "rb_sec_launch",
+        policyRevision: "v1",
+        ["launch_" + explicitReqId]: {
+          launchRequestId: explicitReqId,
+          originConversationId: "c_test_123",
+          originConversationUrl: "https://chatgpt.com/c/c_test_123",
+          targetId: "target_hands",
+          requestedPolicyRevision: "v1",
+          promptText: "Original prompt",
+          status: "started"
+        }
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({
+      action: "launch",
+      launchRequestId: explicitReqId,
+      tabId: 101,
+      targetId: "target_hands",
+      promptText: "Changed conflicting prompt"
+    }, trustedSender);
+
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "payload_conflict");
+    assert.equal(harness.nativeMessagesSent.length, 0);
+
+    console.log("  [PASS] Replay with changed payload fails closed with payload_conflict");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 16: Content script direct unit tests (Removal of fake fallbacks)
+  // ---------------------------------------------------------------------------
+  {
+    function runContentScriptInVm({ pathname = "/c/c_123", turns = [], userMenu = null } = {}) {
+      let capturedListener = null;
+      const mockChrome = {
+        runtime: {
+          onMessage: {
+            addListener(fn) {
+              capturedListener = fn;
+            }
+          }
+        }
+      };
+      const mockDocument = {
+        querySelectorAll(selector) {
+          if (selector.includes("article")) {
+            return turns.map(t => ({ innerText: t }));
+          }
+          return [];
+        },
+        querySelector(selector) {
+          if (selector.includes("user-menu") || selector.includes("user-profile")) {
+            return userMenu ? { innerText: userMenu } : null;
+          }
+          return null;
+        }
+      };
+      const mockWindow = {
+        location: {
+          href: "https://chatgpt.com" + pathname,
+          pathname
+        }
+      };
+
+      const ctx = vm.createContext({
+        chrome: mockChrome,
+        document: mockDocument,
+        window: mockWindow,
+        console: { log() {}, error() {} }
+      });
+      vm.runInContext(contentScriptCode, ctx);
+
+      let response = null;
+      capturedListener({ action: "collect_page_evidence" }, {}, (r) => { response = r; });
+      return response;
+    }
+
+    // Case A: Full valid page
+    const validRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: ["Turn 1 text", "Turn 2 text"],
+      userMenu: "Workspace Personal"
+    });
+    assert.equal(validRes.ok, true);
+    assert.equal(validRes.originConversationId, "c_123");
+    assert.equal(validRes.originConversationUrl, "https://chatgpt.com/c/c_123");
+    assert.ok(validRes.transcriptText.includes("Turn 1 text"));
+    assert.equal(validRes.accountText, "Workspace Personal");
+
+    // Case B: No turns rendered -> MUST fail closed with missing_rendered_transcript (NO fake fallback!)
+    const noTurnsRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: [],
+      userMenu: "Workspace Personal"
+    });
+    assert.equal(noTurnsRes.ok, false);
+    assert.equal(noTurnsRes.error, "missing_rendered_transcript");
+
+    // Case C: No account/workspace context -> MUST fail closed with missing_account_context (NO fake fallback!)
+    const noAccountRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: ["Turn 1 text"],
+      userMenu: null
+    });
+    assert.equal(noAccountRes.ok, false);
+    assert.equal(noAccountRes.error, "missing_account_context");
+
+    // Case D: Non-canonical conversation pathname (/c/new_chat or /)
+    const badPathRes = runContentScriptInVm({
+      pathname: "/c/new_chat",
+      turns: ["Turn 1"],
+      userMenu: "User"
+    });
+    assert.equal(badPathRes.ok, false);
+    assert.equal(badPathRes.error, "invalid_conversation_boundary");
+
+    console.log("  [PASS] Content script direct tests verify zero fake fallbacks and strict fail-closed errors");
+  }
+
+  console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");
 }
 
 runTests().catch((err) => {

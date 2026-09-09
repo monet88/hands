@@ -266,33 +266,110 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return;
           }
 
-          const transcriptEvidenceHash = request.transcriptEvidenceHash?.trim();
-          const accountEvidenceHash = request.accountEvidenceHash?.trim();
-          if (!transcriptEvidenceHash || transcriptEvidenceHash === "hash_transcript_empty") {
-            sendResponse({ status: "error", code: "missing_evidence", message: "Real transcript evidence hash is required; empty placeholder rejected" });
-            return;
-          }
-          if (!accountEvidenceHash || accountEvidenceHash === "hash_account_empty") {
-            sendResponse({ status: "error", code: "missing_evidence", message: "Real account evidence hash is required; empty placeholder rejected" });
-            return;
-          }
-
-          const originConversationId = request.originConversationId?.trim();
-          const originConversationUrl = request.originConversationUrl?.trim();
-          if (!originConversationId || !originConversationUrl) {
-            sendResponse({ status: "error", code: "missing_conversation_binding", message: "Origin conversation ID and URL are required" });
-            return;
-          }
-
-          const parsedConvId = parseCanonicalConversationId(originConversationUrl);
-          if (!parsedConvId || parsedConvId !== originConversationId) {
+          // Tab binding (Finding 1 & 6): explicit tabId selector is REQUIRED (no focused-tab fallback)
+          const tabId = request.tabId;
+          if (typeof tabId !== "number") {
             sendResponse({
               status: "error",
-              code: "invalid_conversation_boundary",
-              message: "Origin conversation URL must be a canonical existing ChatGPT conversation matching the conversation ID"
+              code: "missing_tab_binding",
+              message: "Explicit ChatGPT tab binding (tabId) is required; focused-tab fallback is disabled"
             });
             return;
           }
+
+          let targetTab;
+          try {
+            targetTab = await chrome.tabs.get(tabId);
+          } catch (tabErr) {
+            sendResponse({
+              status: "error",
+              code: "tab_not_found",
+              message: "Bound ChatGPT tab not found: " + tabErr.message
+            });
+            return;
+          }
+
+          const tabUrl = targetTab?.url || targetTab?.pendingUrl;
+          if (!tabUrl || typeof tabUrl !== "string" || !tabUrl.startsWith("https://chatgpt.com/")) {
+            sendResponse({
+              status: "error",
+              code: "invalid_tab_url",
+              message: "Bound tab URL must be an exact ChatGPT page (https://chatgpt.com/*); was: " + tabUrl
+            });
+            return;
+          }
+
+          const originConversationId = parseCanonicalConversationId(tabUrl);
+          if (!originConversationId) {
+            sendResponse({
+              status: "error",
+              code: "invalid_conversation_boundary",
+              message: "Bound tab is not on a canonical existing ChatGPT conversation (e.g. https://chatgpt.com/c/<id>)"
+            });
+            return;
+          }
+          const originConversationUrl = tabUrl.split("#")[0].split("?")[0];
+
+          // Obtain evidence directly from content script on bound top-level tab
+          let evidenceRes;
+          try {
+            evidenceRes = await new Promise((resolve, reject) => {
+              chrome.tabs.sendMessage(tabId, { action: "collect_page_evidence" }, (res) => {
+                if (chrome.runtime.lastError) {
+                  return reject(new Error(chrome.runtime.lastError.message));
+                }
+                resolve(res);
+              });
+            });
+          } catch (contentErr) {
+            sendResponse({
+              status: "error",
+              code: "evidence_collection_failed",
+              message: "Failed to communicate with content script on bound tab: " + contentErr.message
+            });
+            return;
+          }
+
+          if (!evidenceRes || !evidenceRes.ok) {
+            sendResponse({
+              status: "error",
+              code: evidenceRes?.error || "evidence_collection_failed",
+              message: evidenceRes?.message || "Content script failed to collect page evidence"
+            });
+            return;
+          }
+
+          if (evidenceRes.originConversationId !== originConversationId || evidenceRes.originConversationUrl !== originConversationUrl) {
+            sendResponse({
+              status: "error",
+              code: "conversation_binding_mismatch",
+              message: "Content script conversation ID or URL does not match bound top-level tab"
+            });
+            return;
+          }
+
+          const transcriptText = evidenceRes.transcriptText?.trim();
+          const accountText = evidenceRes.accountText?.trim();
+          if (!transcriptText) {
+            sendResponse({
+              status: "error",
+              code: "missing_rendered_transcript",
+              message: "Rendered transcript text is empty or unavailable"
+            });
+            return;
+          }
+          if (!accountText) {
+            sendResponse({
+              status: "error",
+              code: "missing_account_context",
+              message: "Account/workspace context evidence is empty or unavailable"
+            });
+            return;
+          }
+
+          // Compute evidence hashes inside trusted background
+          const transcriptEvidenceHash = await sha256Hex(evidenceRes.transcriptText);
+          const accountEvidenceHash = await sha256Hex(evidenceRes.accountText);
 
           const targetId = request.targetId?.trim();
           if (!targetId) {
@@ -305,11 +382,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             sendResponse({ status: "error", code: "missing_prompt_text", message: "Prompt text is required" });
             return;
           }
+          if (promptText.length > 128 * 1024) {
+            sendResponse({ status: "error", code: "prompt_too_large", message: "Prompt exceeds bounded size limit (128 KB)" });
+            return;
+          }
 
           const requestedPolicyRevision = request.requestedPolicyRevision?.trim() || stored.policyRevision || "v1";
 
-          // Durable request identity: reuse unresolved matching request; reject duplicate with changed payload locally
-          const activeKey = `active_launch_${originConversationId}_${targetId}`;
+          // Durable request identity (Finding 5):
+          // Installation-local request identity matches exact immutable payload.
+          const activeKey = `active_launch_${stored.pairingId}_${originConversationId}_${targetId}_${requestedPolicyRevision}`;
           const activeStored = await chrome.storage.local.get([activeKey]);
           const existingActiveReqId = activeStored[activeKey];
 
@@ -317,9 +399,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (request.launchRequestId && request.launchRequestId.trim()) {
             launchRequestId = request.launchRequestId.trim();
           } else if (existingActiveReqId) {
-            launchRequestId = existingActiveReqId;
+            const storedLaunch = await chrome.storage.local.get(["launch_" + existingActiveReqId]);
+            const existingRecord = storedLaunch["launch_" + existingActiveReqId];
+            const isUnresolved = existingRecord && ["pending_native", "attempting", "unknown", "native-response-uncertain"].includes(existingRecord.status);
+            if (isUnresolved) {
+              const isSamePayload =
+                existingRecord.originConversationId === originConversationId &&
+                existingRecord.originConversationUrl === originConversationUrl &&
+                existingRecord.transcriptEvidenceHash === transcriptEvidenceHash &&
+                existingRecord.accountEvidenceHash === accountEvidenceHash &&
+                existingRecord.targetId === targetId &&
+                existingRecord.requestedPolicyRevision === requestedPolicyRevision &&
+                existingRecord.promptText === promptText;
+
+              if (isSamePayload) {
+                launchRequestId = existingActiveReqId;
+              } else {
+                sendResponse({
+                  status: "error",
+                  code: "active_launch_unresolved",
+                  message: `An unresolved launch request (${existingActiveReqId}) with state '${existingRecord.status}' is active for this conversation/target. Resolve or recover it before initiating a new task.`,
+                  launchRequestId: existingActiveReqId,
+                  executionId: existingRecord.executionId,
+                  state: existingRecord.status
+                });
+                return;
+              }
+            } else {
+              // Prior task was resolved (started, failed, revoked). Allocate fresh deterministic ID.
+              const digest = await sha256Hex(
+                `${stored.pairingId}:${originConversationId}:${originConversationUrl}:${transcriptEvidenceHash}:${accountEvidenceHash}:${targetId}:${requestedPolicyRevision}:${promptText}`
+              );
+              launchRequestId = "req_" + digest.slice(0, 16);
+            }
           } else {
-            const digest = await sha256Hex(`${stored.pairingId}:${originConversationId}:${targetId}:${promptText}`);
+            const digest = await sha256Hex(
+              `${stored.pairingId}:${originConversationId}:${originConversationUrl}:${transcriptEvidenceHash}:${accountEvidenceHash}:${targetId}:${requestedPolicyRevision}:${promptText}`
+            );
             launchRequestId = "req_" + digest.slice(0, 16);
           }
 
@@ -334,6 +450,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               existingRecord.transcriptEvidenceHash !== transcriptEvidenceHash ||
               existingRecord.accountEvidenceHash !== accountEvidenceHash ||
               existingRecord.targetId !== targetId ||
+              existingRecord.requestedPolicyRevision !== requestedPolicyRevision ||
               existingRecord.promptText !== promptText
             ) {
               sendResponse({
@@ -374,21 +491,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return;
           }
 
-          // Invoke native host
-          const response = await sendNative({
-            op: "launch",
-            pairingId: stored.pairingId,
-            pairingSecret: stored.pairingSecret,
-            profileId,
-            launchRequestId,
-            originConversationId,
-            originConversationUrl,
-            transcriptEvidenceHash,
-            accountEvidenceHash,
-            targetId,
-            requestedPolicyRevision,
-            promptText
-          });
+          // Invoke native host with explicit lost-native-response boundary handling (Finding 4)
+          let response;
+          try {
+            response = await sendNative({
+              op: "launch",
+              pairingId: stored.pairingId,
+              pairingSecret: stored.pairingSecret,
+              profileId,
+              launchRequestId,
+              originConversationId,
+              originConversationUrl,
+              transcriptEvidenceHash,
+              accountEvidenceHash,
+              targetId,
+              requestedPolicyRevision,
+              promptText
+            });
+          } catch (nativeErr) {
+            launchRecord.status = "native-response-uncertain";
+            launchRecord.lastError = nativeErr.message;
+            await chrome.storage.local.set({
+              [pendingLaunchKey]: launchRecord
+            });
+            sendResponse({
+              status: "error",
+              code: "native_response_uncertain",
+              launchRequestId,
+              state: "native-response-uncertain",
+              message: "Native messaging host response was lost or rejected: " + nativeErr.message,
+              trustNotice: TRUST_NOTICE
+            });
+            return;
+          }
 
           if (response && response.status === "ok") {
             launchRecord.status = response.state || "started";
@@ -411,7 +546,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           sendResponse(response);
           break;
         }
-
         case "recover": {
           const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
           if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
@@ -425,11 +559,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             pairingSecret: stored.pairingSecret,
             profileId
           };
-          if (request.launchRequestId) {
-            payload.launchRequestId = request.launchRequestId;
+          if (request.launchRequestId && request.launchRequestId.trim()) {
+            payload.launchRequestId = request.launchRequestId.trim();
           }
 
           const response = await sendNative(payload);
+          if (response && response.status === "ok") {
+            const list = Array.isArray(response.summaries)
+              ? response.summaries
+              : (response.summary ? [response.summary] : []);
+
+            for (const summary of list) {
+              if (summary.launch_request_id) {
+                const recordKey = "launch_" + summary.launch_request_id;
+                const cur = (await chrome.storage.local.get([recordKey]))[recordKey];
+                if (cur && cur.status === "native-response-uncertain") {
+                  cur.status = summary.state || "unknown";
+                  cur.executionId = summary.execution_id;
+                  cur.terminalEvidence = summary.orca_terminal_handle ? { orcaTerminalHandle: summary.orca_terminal_handle } : null;
+                  await chrome.storage.local.set({ [recordKey]: cur });
+                }
+              }
+            }
+          }
           sendResponse(response);
           break;
         }
