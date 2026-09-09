@@ -33,7 +33,6 @@ fn test_closed_operation_set_and_security_guards() {
 
     let pairing_id = "pair_closed_test";
     let bootstrap_token = "boot_closed_token";
-    let pairing_secret = "secret_closed_xyz";
     let browser = "chrome";
     let profile_id = "prof_a";
     let targets = vec![TargetRecord {

@@ -396,7 +396,6 @@ fn test_setup_a_remains_authoritative_after_competing_setup_b_fails() {
     );
 
     // Origin validation continues to authorize ONLY extension A
-    let origin_a = format!("chrome-extension://{}/", ext_a);
     let origin_b = format!("chrome-extension://{}/", ext_b);
 
     // Origin B must be rejected
