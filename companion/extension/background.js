@@ -155,7 +155,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             profileId
           });
 
-          await chrome.storage.local.remove(["isPaired", "pairingId", "pairingSecret", "targets", "policyRevision"]);
+          if (response && (response.status === "ok" || response.code === "pairing_retired")) {
+            await chrome.storage.local.remove(["isPaired", "pairingId", "pairingSecret", "targets", "policyRevision"]);
+          }
           sendResponse(response);
           break;
         }

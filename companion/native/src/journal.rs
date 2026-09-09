@@ -145,7 +145,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS pairings (
                 pairing_id TEXT PRIMARY KEY,
                 bootstrap_token TEXT UNIQUE,
-                pairing_secret TEXT NOT NULL,
+                pairing_secret TEXT,
                 pairing_secret_hash TEXT NOT NULL,
                 browser TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
@@ -301,6 +301,7 @@ impl Journal {
                 r#"
                 UPDATE pairings
                 SET bootstrap_token = NULL,
+                    pairing_secret = NULL,
                     profile_id = ?1,
                     status = ?2,
                     updated_at = ?3

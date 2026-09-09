@@ -133,6 +133,7 @@ dependencies = [
 name = "hands-return-bridge"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "rusqlite",
  "serde",
  "serde_json",

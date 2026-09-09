@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use tempfile::tempdir;
 
-use hands_return_bridge::host::{HostConfig, SetupOptions, execute_setup, resolve_state_dir};
+use hands_return_bridge::host::{SetupOptions, execute_setup, resolve_state_dir};
 use hands_return_bridge::journal::{Journal, PairingStatus};
 use hands_return_bridge::protocol::TRUST_NOTICE;
 

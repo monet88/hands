@@ -55,11 +55,6 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
-pub struct HostConfig {
-    pub state_dir: PathBuf,
-    pub db_path: PathBuf,
-}
-
 pub fn resolve_state_dir(override_opt: Option<&Path>) -> PathBuf {
     if let Some(p) = override_opt {
         return p.to_path_buf();
@@ -98,23 +93,21 @@ pub fn resolve_state_dir(override_opt: Option<&Path>) -> PathBuf {
 }
 
 fn generate_random_id(prefix: &str, num_bytes: usize) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let mut hasher = Sha256::new();
-    hasher.update(now.to_le_bytes());
-    hasher.update(pid.to_le_bytes());
-    hasher.update(prefix.as_bytes());
-    // Mix in environment or memory addresses for extra entropy
-    let env_str = format!("{:?}", std::env::vars().count());
-    hasher.update(env_str.as_bytes());
-    let digest = hasher.finalize();
-    let hex_part: String = digest[..num_bytes]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
+    let mut bytes = vec![0u8; num_bytes];
+    if getrandom::fill(&mut bytes).is_err() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let mut hasher = Sha256::new();
+        hasher.update(now.to_le_bytes());
+        hasher.update(pid.to_le_bytes());
+        hasher.update(prefix.as_bytes());
+        let digest = hasher.finalize();
+        bytes.copy_from_slice(&digest[..num_bytes]);
+    }
+    let hex_part: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
     format!("{}_{}", prefix, hex_part)
 }
 
