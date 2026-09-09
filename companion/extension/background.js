@@ -314,7 +314,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           let evidenceRes;
           try {
             evidenceRes = await new Promise((resolve, reject) => {
-              chrome.tabs.sendMessage(tabId, { action: "collect_page_evidence" }, (res) => {
+              chrome.tabs.sendMessage(tabId, { action: "collect_page_evidence" }, { frameId: 0 }, (res) => {
                 if (chrome.runtime.lastError) {
                   return reject(new Error(chrome.runtime.lastError.message));
                 }
@@ -426,17 +426,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 return;
               }
             } else {
-              // Prior task was resolved (started, failed, revoked). Allocate fresh deterministic ID.
-              const digest = await sha256Hex(
-                `${stored.pairingId}:${originConversationId}:${originConversationUrl}:${transcriptEvidenceHash}:${accountEvidenceHash}:${targetId}:${requestedPolicyRevision}:${promptText}`
-              );
-              launchRequestId = "req_" + digest.slice(0, 16);
+              // Prior task was resolved (started, failed, rejected, revoked).
+              // A new task without explicit launchRequestId receives a fresh installation-local request ID.
+              const rnd = Math.random().toString(36).slice(2, 10);
+              launchRequestId = "req_" + Date.now() + "_" + rnd;
             }
           } else {
-            const digest = await sha256Hex(
-              `${stored.pairingId}:${originConversationId}:${originConversationUrl}:${transcriptEvidenceHash}:${accountEvidenceHash}:${targetId}:${requestedPolicyRevision}:${promptText}`
-            );
-            launchRequestId = "req_" + digest.slice(0, 16);
+            // No active task. Fresh installation-local request ID.
+            const rnd = Math.random().toString(36).slice(2, 10);
+            launchRequestId = "req_" + Date.now() + "_" + rnd;
           }
 
           const pendingLaunchKey = "launch_" + launchRequestId;
@@ -541,6 +539,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             await chrome.storage.local.set({
               [pendingLaunchKey]: launchRecord
             });
+          } else if (response && response.status === "error") {
+            // Definitive rejection (target_not_found, policy_mismatch, payload_conflict, etc.)
+            launchRecord.status = "rejected";
+            launchRecord.rejectCode = response.code;
+            launchRecord.rejectMessage = response.message;
+            await chrome.storage.local.set({
+              [pendingLaunchKey]: launchRecord
+            });
+            // Clear activeKey so subsequent tasks are not trapped
+            await chrome.storage.local.remove([activeKey]);
           }
 
           sendResponse(response);

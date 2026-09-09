@@ -8,7 +8,7 @@ use crate::journal::{
 };
 use crate::launcher::{
     build_omp_startup_command, ensure_adapter_file, launch_orca_terminal,
-    send_orca_terminal_prompt, wait_orca_terminal_idle, LauncherError,
+    send_orca_terminal_prompt, verify_launch_preflight, wait_orca_terminal_idle, LauncherError,
 };
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
 pub const TRUST_NOTICE: &str = "Notice: A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.";
@@ -431,13 +431,20 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                     return json!({ "status": "error", "code": "launcher_error", "message": e.to_string() });
                 }
             };
+            // 4b. Explicit compatibility preflight check BEFORE marking attempt
+            if let Err(e) = verify_launch_preflight(None) {
+                return json!({
+                    "status": "error",
+                    "code": "preflight_failed",
+                    "message": e.to_string()
+                });
+            }
 
             // 5. Mark single launch attempt atomically BEFORE invoking Orca CLI
             let can_attempt = match journal.mark_launch_attempt(&claim.execution_id, pairing_id) {
                 Ok(can) => can,
                 Err(e) => return map_pairing_error(e),
             };
-
             if !can_attempt {
                 return json!({
                     "status": "error",

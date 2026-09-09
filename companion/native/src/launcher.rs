@@ -12,6 +12,7 @@ pub enum LauncherError {
     OrcaSpawnFailed(String),
     OrcaExecutionUncertain(String),
     UnsupportedPolicy(String),
+    PreflightFailed(String),
 }
 
 impl From<std::io::Error> for LauncherError {
@@ -34,6 +35,7 @@ impl std::fmt::Display for LauncherError {
             LauncherError::OrcaSpawnFailed(e) => write!(f, "Orca spawn failed (pre-spawn): {}", e),
             LauncherError::OrcaExecutionUncertain(e) => write!(f, "Orca execution outcome uncertain: {}", e),
             LauncherError::UnsupportedPolicy(e) => write!(f, "Unsupported policy: {}", e),
+            LauncherError::PreflightFailed(e) => write!(f, "Preflight check failed: {}", e),
         }
     }
 }
@@ -66,6 +68,98 @@ pub fn ensure_adapter_file(state_dir: &Path) -> Result<PathBuf, LauncherError> {
     Ok(adapter_path)
 }
 
+/// Resolves the native OMP binary token or path based on local authority
+pub fn resolve_omp_binary() -> String {
+    if let Ok(bin) = std::env::var("HANDS_RETURN_BRIDGE_OMP_BIN") {
+        let trimmed = bin.trim();
+        if !trimmed.is_empty() {
+            if trimmed.contains(' ') && !trimmed.starts_with('"') {
+                return format!("\"{}\"", trimmed.replace('\\', "/"));
+            } else {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "omp".to_string()
+}
+
+/// Explicit compatibility preflight verifying Orca and OMP CLI capabilities before marking attempt
+pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), LauncherError> {
+    // 1. Verify orca terminal subcommands
+    let orca_help = Command::new("orca")
+        .args(["terminal", "--help"])
+        .output()
+        .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute 'orca terminal --help': {}", e)))?;
+    if !orca_help.status.success() {
+        return Err(LauncherError::PreflightFailed(format!(
+            "'orca terminal --help' failed with exit code: {:?}",
+            orca_help.status.code()
+        )));
+    }
+    let orca_text = String::from_utf8_lossy(&orca_help.stdout);
+    if !orca_text.contains("create") || !orca_text.contains("wait") || !orca_text.contains("send") {
+        return Err(LauncherError::PreflightFailed(
+            "Orca CLI missing required terminal subcommands (create, wait, send)".to_string(),
+        ));
+    }
+
+    // 2. Verify orca terminal wait --for tui-idle
+    let orca_wait_help = Command::new("orca")
+        .args(["terminal", "wait", "--help"])
+        .output()
+        .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute 'orca terminal wait --help': {}", e)))?;
+    let wait_text = String::from_utf8_lossy(&orca_wait_help.stdout);
+    if !wait_text.contains("--for") || !wait_text.contains("tui-idle") {
+        return Err(LauncherError::PreflightFailed(
+            "Orca terminal wait missing required '--for tui-idle' capability".to_string(),
+        ));
+    }
+
+    // 3. Verify orca terminal send --text and --enter
+    let orca_send_help = Command::new("orca")
+        .args(["terminal", "send", "--help"])
+        .output()
+        .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute 'orca terminal send --help': {}", e)))?;
+    let send_text = String::from_utf8_lossy(&orca_send_help.stdout);
+    if !send_text.contains("--text") || !send_text.contains("--enter") {
+        return Err(LauncherError::PreflightFailed(
+            "Orca terminal send missing required '--text' or '--enter' capability".to_string(),
+        ));
+    }
+
+    // 4. Verify OMP security and policy flags
+    let raw_bin = omp_bin_override
+        .map(str::to_string)
+        .unwrap_or_else(resolve_omp_binary);
+    let clean_bin = raw_bin.trim_matches('"');
+    let omp_help = Command::new(clean_bin)
+        .arg("--help")
+        .output()
+        .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute '{} --help': {}", clean_bin, e)))?;
+    if !omp_help.status.success() {
+        return Err(LauncherError::PreflightFailed(format!(
+            "OMP CLI '{} --help' failed with exit code: {:?}",
+            clean_bin,
+            omp_help.status.code()
+        )));
+    }
+    let omp_text = String::from_utf8_lossy(&omp_help.stdout);
+    if !omp_text.contains("--no-extensions")
+        || !omp_text.contains("--approval-mode")
+        || !omp_text.contains("--tools")
+        || !omp_text.contains("--no-skills")
+        || !omp_text.contains("--no-rules")
+        || !omp_text.contains("--no-prewalk")
+    {
+        return Err(LauncherError::PreflightFailed(format!(
+            "OMP CLI '{}' missing required flags (--no-extensions, --approval-mode, --tools, --no-skills, --no-rules, --no-prewalk)",
+            clean_bin
+        )));
+    }
+
+    Ok(())
+}
+
 /// Fixed companion launcher building native-owned OMP startup command (NO user prompt)
 pub fn build_omp_startup_command(
     adapter_path: &Path,
@@ -88,12 +182,15 @@ pub fn build_omp_startup_command(
         other => return Err(LauncherError::UnsupportedPolicy(format!("Unknown approval policy: {}", other))),
     };
 
+    let omp_bin = resolve_omp_binary();
     let mut parts = Vec::new();
-    parts.push("omp".to_string());
+    parts.push(omp_bin);
     parts.push("--no-extensions".to_string());
     parts.push("-e".to_string());
     parts.push(format!("\"{}\"", adapter_path.to_string_lossy().replace('\\', "/")));
     parts.push("--no-prewalk".to_string());
+    parts.push("--no-skills".to_string());
+    parts.push("--no-rules".to_string());
     parts.push(tool_flag.to_string());
     parts.push(approval_flag.to_string());
 

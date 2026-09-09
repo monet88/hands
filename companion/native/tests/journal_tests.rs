@@ -724,3 +724,127 @@ fn test_zero_side_effects_on_rejected_journal_launches() {
     let summaries = journal.get_launch_summaries(pairing_id).unwrap();
     assert_eq!(summaries.len(), 0, "Zero launch requests must exist after rejected launch claims");
 }
+
+#[test]
+fn test_get_launch_summaries_bounded_to_32() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_bounded_test";
+    let bootstrap_token = "boot_bounded_test";
+    let profile_id = "profile_bounded";
+
+    let targets = vec![TargetRecord {
+        target_id: "hands".to_string(),
+        canonical_path: "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string(),
+        name: "hands".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            "chrome",
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    // Insert 40 launch requests
+    for i in 0..40 {
+        let params = LaunchRequestParams {
+            pairing_id: pairing_id.to_string(),
+            launch_request_id: format!("req_bounded_{}", i),
+            origin_conversation_id: "c_bound".to_string(),
+            origin_conversation_url: "https://chatgpt.com/c/c_bound".to_string(),
+            transcript_evidence_hash: format!("hash_t_{}", i),
+            account_evidence_hash: "hash_a".to_string(),
+            target_id: "hands".to_string(),
+            policy_revision: "v1".to_string(),
+            prompt_text: format!("prompt {}", i),
+        };
+        let claim = journal.reserve_or_claim_launch(&params).unwrap();
+        assert!(!claim.is_replayed);
+    }
+
+    // Verify bounded to exactly 32 summaries
+    let summaries = journal.get_launch_summaries(pairing_id).unwrap();
+    assert_eq!(summaries.len(), 32, "Summaries must be bounded to 32 recent entries");
+}
+
+#[test]
+fn test_replay_preserves_execution_even_if_registered_policy_changes_later() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_replay_policy_test";
+    let bootstrap_token = "boot_replay_policy_test";
+    let profile_id = "profile_replay";
+
+    let targets = vec![TargetRecord {
+        target_id: "hands".to_string(),
+        canonical_path: "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string(),
+        name: "hands".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+    journal
+        .create_bootstrap(
+            pairing_id,
+            bootstrap_token,
+            "chrome",
+            profile_id,
+            &targets,
+            &policy,
+        )
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_replay_1".to_string(),
+        origin_conversation_id: "c_replay".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/c_replay".to_string(),
+        transcript_evidence_hash: "hash_t".to_string(),
+        account_evidence_hash: "hash_a".to_string(),
+        target_id: "hands".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "do task".to_string(),
+    };
+    let claim1 = journal.reserve_or_claim_launch(&params).unwrap();
+    assert!(!claim1.is_replayed);
+    let original_exec_id = claim1.execution_id;
+
+    // Modify target's registered policy in SQLite to v2
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE policies SET policy_revision = 'v2' WHERE pairing_id = ?1",
+            rusqlite::params![pairing_id],
+        ).unwrap();
+    }
+
+    // Replaying original request (same launch_request_id + payload) MUST return the existing execution
+    // (recovery/idempotency across process restarts or policy changes)
+    let claim_replay = journal.reserve_or_claim_launch(&params).unwrap();
+    assert!(claim_replay.is_replayed);
+    assert_eq!(claim_replay.execution_id, original_exec_id);
+
+    // A NEW request with v1 policy now fails policy revalidation because registered target is now v2
+    let mut new_params = params.clone();
+    new_params.launch_request_id = "req_new_different".to_string();
+    new_params.prompt_text = "new task".to_string();
+    let new_res = journal.reserve_or_claim_launch(&new_params);
+    assert_eq!(new_res.unwrap_err(), PairingError::PolicyMismatch);
+}

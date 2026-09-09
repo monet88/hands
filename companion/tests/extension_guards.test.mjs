@@ -53,9 +53,13 @@ function createTestHarness({
         }
         throw new Error("Tab not found: " + tabId);
       },
-      sendMessage(tabId, message, cb) {
+      lastSendMessageOptions: null,
+      sendMessage(tabId, message, optionsOrCb, maybeCb) {
+        const options = typeof optionsOrCb === "object" ? optionsOrCb : null;
+        const cb = typeof optionsOrCb === "function" ? optionsOrCb : maybeCb;
+        mockChrome.tabs.lastSendMessageOptions = options;
         if (mockTabMessages && mockTabMessages[tabId]) {
-          const resp = mockTabMessages[tabId](message);
+          const resp = mockTabMessages[tabId](message, options);
           if (cb) cb(resp);
           return Promise.resolve(resp);
         }
@@ -147,7 +151,8 @@ function createTestHarness({
     extensionId,
     sendMessage,
     storageStore,
-    nativeMessagesSent
+    nativeMessagesSent,
+    mockChrome
   };
 }
 
@@ -863,6 +868,119 @@ async function runTests() {
     assert.equal(badPathRes.error, "invalid_conversation_boundary");
 
     console.log("  [PASS] Content script direct tests verify zero fake fallbacks and strict fail-closed errors");
+  }
+
+  // Test 17: Verify frameId: 0 explicit targeting during evidence collection
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_123",
+        pairingSecret: "rb_sec_456",
+        policyRevision: "v1"
+      },
+      mockTabs: {
+        101: { id: 101, url: "https://chatgpt.com/c/c_test_123" }
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Do frame test",
+      launchRequestId: "req_frame_test"
+    }, trustedSender);
+    assert.equal(harness.mockChrome.tabs.lastSendMessageOptions?.frameId, 0);
+    console.log("  [PASS] Top-frame evidence collection targets frameId 0 explicitly");
+  }
+
+  // Test 18: Native definitive rejection transitions record to rejected and clears activeKey
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_123",
+        pairingSecret: "rb_sec_456",
+        policyRevision: "v1"
+      },
+      mockTabs: {
+        101: { id: 101, url: "https://chatgpt.com/c/c_test_123" }
+      },
+      nativeResponse: {
+        status: "error",
+        code: "target_not_found",
+        message: "Target workspace not found"
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_nonexistent",
+      promptText: "Test definitive rejection",
+      launchRequestId: "req_rej_test"
+    }, trustedSender);
+
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "target_not_found");
+
+    // Verify record in storage has status = "rejected"
+    const stored = harness.storageStore["launch_req_rej_test"];
+    assert.ok(stored, "Record should exist in storage for audit");
+    assert.equal(stored.status, "rejected");
+    assert.equal(stored.rejectCode, "target_not_found");
+    assert.equal(stored.rejectMessage, "Target workspace not found");
+
+    // Verify activeKey was removed
+    const activeKey = "active_launch_pair_123_c_test_123_target_nonexistent_v1";
+    assert.equal(harness.storageStore[activeKey], undefined, "activeKey must be cleared after definitive rejection");
+    console.log("  [PASS] Native definitive rejection transitions record to rejected and clears activeKey");
+  }
+
+  // Test 19: Deliberate new task receives fresh launchRequestId even with identical payload after resolution
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_123",
+        pairingSecret: "rb_sec_456",
+        policyRevision: "v1"
+      },
+      mockTabs: {
+        101: { id: 101, url: "https://chatgpt.com/c/c_test_123" }
+      },
+      nativeResponse: {
+        status: "ok",
+        executionId: "exec_1",
+        returnToken: "tok_1",
+        state: "started"
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    // First task without explicit launchRequestId
+    const res1 = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Identical prompt text"
+    }, trustedSender);
+    assert.equal(res1.status, "ok");
+    const firstReqId = harness.nativeMessagesSent[0].msg.launchRequestId;
+    assert.ok(firstReqId.startsWith("req_"));
+
+    // Subsequent task without explicit launchRequestId with the SAME prompt text
+    const res2 = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_test",
+      promptText: "Identical prompt text"
+    }, trustedSender);
+    assert.equal(res2.status, "ok");
+    const secondReqId = harness.nativeMessagesSent[1].msg.launchRequestId;
+    assert.ok(secondReqId.startsWith("req_"));
+    assert.notEqual(firstReqId, secondReqId, "Subsequent deliberate new task must receive fresh unique launchRequestId");
+    console.log("  [PASS] Resolved prior task does not trap new task with identical payload");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

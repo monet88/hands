@@ -174,7 +174,7 @@ window.startTest = async function(config = {}) {
       results.steps.push({ step: "launch_owned_execution", pass: launchOk });
       results.executionId = internalLaunchResp ? internalLaunchResp.executionId : null;
       results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
-
+      results.promptSent = launchPayload.promptText;
       // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
       await ensureMockChatGptDom();
       const replayResp = await chrome.runtime.sendMessage(launchPayload);

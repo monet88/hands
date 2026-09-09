@@ -284,6 +284,48 @@ async function main() {
 
     if (alphaResult?.results?.terminalHandle) {
       const termHandle = alphaResult.results.terminalHandle;
+      const expectedPrompt = alphaResult.results.promptSent;
+
+      // 1. Literal prompt evidence inspection via public Orca CLI
+      console.log(`      Inspecting Orca terminal output for literal prompt: ${termHandle}`);
+      try {
+        const termOut = execSync(`orca terminal read --terminal "${termHandle}" --limit 50 --json`).toString("utf8");
+        const termData = JSON.parse(termOut);
+        console.log(`      Orca terminal read status: ${termData.result?.terminal?.status}, returned lines: ${termData.result?.terminal?.tail?.length}`);
+      } catch (termErr) {
+        console.warn("      Failed to read terminal:", termErr.message);
+      }
+
+      // 2. Exact literal prompt verification in real OMP session transcript
+      const sessionDir = path.join(os.homedir(), ".omp", "agent", "sessions", "--F--CodeBase-hands-issue-66-return-bridge-pairing--");
+      let promptVerified = false;
+      if (fs.existsSync(sessionDir)) {
+        const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+        files.sort((a, b) => fs.statSync(path.join(sessionDir, b)).mtimeMs - fs.statSync(path.join(sessionDir, a)).mtimeMs);
+        for (const file of files.slice(0, 3)) {
+          const content = fs.readFileSync(path.join(sessionDir, file), "utf8");
+          const lines = content.trim().split("\n");
+          for (const line of lines) {
+            try {
+              const obj = JSON.parse(line);
+              if (obj.type === "message" && obj.message?.role === "user" && !obj.message?.steering) {
+                const text = obj.message.content?.[0]?.text;
+                if (text === expectedPrompt) {
+                  promptVerified = true;
+                  console.log(`      [PASS] Verified exact literal prompt delivered into OMP session unchanged:`);
+                  console.log(`             --flag, @some_file, "quotes", semicolon, pipe, Unicode, and newline preserved verbatim.`);
+                  break;
+                }
+              }
+            } catch {}
+          }
+          if (promptVerified) break;
+        }
+      }
+      if (!promptVerified) {
+        throw new Error(`Literal prompt was not found verbatim in OMP session transcript: expected ${JSON.stringify(expectedPrompt)}`);
+      }
+
       console.log(`      Cleaning up test-owned Orca terminal: ${termHandle}`);
       try {
         execSync(`orca terminal close --terminal "${termHandle}" --json`, { stdio: "ignore" });

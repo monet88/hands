@@ -846,3 +846,70 @@ fn test_multi_process_native_host_convergence() {
     assert_eq!(summaries.len(), 1, "Exactly one launch request row must exist");
     assert_eq!(summaries[0].execution_id, exec_id_1.unwrap());
 }
+
+#[test]
+fn test_launch_preflight_check() {
+    use hands_return_bridge::launcher::verify_launch_preflight;
+
+    // Default preflight against system CLI
+    let res = verify_launch_preflight(None);
+    assert!(res.is_ok(), "Preflight should succeed on system with orca and omp installed: {:?}", res);
+
+    // Invalid OMP binary should fail closed with PreflightFailed
+    let bad_res = verify_launch_preflight(Some("nonexistent_omp_binary_xyz_123"));
+    assert!(bad_res.is_err(), "Preflight must fail closed for invalid OMP binary");
+    let err_str = bad_res.unwrap_err().to_string();
+    assert!(err_str.contains("Preflight"), "Error message must indicate preflight failure: {}", err_str);
+}
+
+#[test]
+fn test_resolve_omp_binary_shapes() {
+    use hands_return_bridge::launcher::{build_omp_startup_command, resolve_omp_binary};
+    use std::path::Path;
+
+    // 1. Default token shape
+    std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
+    assert_eq!(resolve_omp_binary(), "omp");
+
+    // 2. Direct executable path shape
+    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", "C:\\Users\\monet\\.bun\\bin\\omp.exe");
+    assert_eq!(resolve_omp_binary(), "C:\\Users\\monet\\.bun\\bin\\omp.exe");
+
+    // 3. Executable path with spaces (must be safely quoted)
+    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", "C:\\Program Files\\OMP Tools\\omp.exe");
+    assert_eq!(resolve_omp_binary(), "\"C:/Program Files/OMP Tools/omp.exe\"");
+
+    // 4. Verify startup command with quoted binary
+    let dummy_adapter = Path::new("C:/temp/adapter.ts");
+    let cmd = build_omp_startup_command(dummy_adapter, "standard", "prompt").unwrap();
+    assert!(cmd.starts_with("\"C:/Program Files/OMP Tools/omp.exe\""));
+
+    // Clean up env
+    std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
+}
+
+#[test]
+fn test_conflicting_inherited_policy_hardening() {
+    use hands_return_bridge::launcher::build_omp_startup_command;
+    use std::path::Path;
+
+    let dummy_adapter = Path::new("C:/temp/adapter.ts");
+
+    // Case A: Read-only policy with prompt approval
+    let cmd_ro = build_omp_startup_command(dummy_adapter, "read_only", "prompt").unwrap();
+    assert!(cmd_ro.contains("--no-extensions"), "Must disable unapproved extension discovery");
+    assert!(cmd_ro.contains("--no-prewalk"), "Must disable prewalk broadening");
+    assert!(cmd_ro.contains("--no-skills"), "Must disable inherited skills discovery");
+    assert!(cmd_ro.contains("--no-rules"), "Must disable inherited rules discovery");
+    assert!(cmd_ro.contains("--tools=read,grep,glob,lsp"), "Must restrict to read_only tools");
+    assert!(cmd_ro.contains("--approval-mode=always-ask"), "Must enforce prompt approval");
+
+    // Case B: No tools policy with auto approval
+    let cmd_none = build_omp_startup_command(dummy_adapter, "none", "auto").unwrap();
+    assert!(cmd_none.contains("--no-tools"), "Must disable all tools");
+    assert!(cmd_none.contains("--approval-mode=yolo"), "Must map auto approval");
+    assert!(cmd_none.contains("--no-skills"), "Must disable skills");
+    assert!(cmd_none.contains("--no-rules"), "Must disable rules");
+    assert!(cmd_none.contains("--no-extensions"), "Must disable extensions");
+    assert!(cmd_none.contains("--no-prewalk"), "Must disable prewalk");
+}

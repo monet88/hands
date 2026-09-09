@@ -1235,6 +1235,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 LEFT JOIN launch_attempts la ON lr.execution_id = la.execution_id
                 WHERE lr.pairing_id = ?1
                 ORDER BY lr.created_at DESC
+                LIMIT 32
                 "#,
             )
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
