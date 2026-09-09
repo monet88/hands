@@ -19,7 +19,7 @@ function logResult(step, pass, details) {
     el.textContent += line + "\n";
   }
   if (!pass) {
-    throw new Error(`Test failed at step: ${step}`);
+    throw new Error(`Test failed at step: ${step} details: ${JSON.stringify(details)}`);
   }
 }
 
@@ -52,7 +52,7 @@ window.startTest = async function(config = {}) {
       const activePairingId = setupResp.pairingId;
       const activePairingSecret = setupResp.pairingSecret;
       // Pairing credential isolation: verify chrome.storage.local retains secret in trusted context
-      await chrome.storage.local.set({ pairingSecret: activePairingSecret });
+      await chrome.storage.local.set({ profileId, isPaired: true, pairingId: activePairingId, pairingSecret: activePairingSecret, targets: setupResp.targets || [], policyRevision: setupResp.policyRevision || "v1" });
       const stored = await chrome.storage.local.get(["pairingSecret"]);
       const storageOk = stored.pairingSecret === activePairingSecret;
       logResult("storage_credential_retention", storageOk, { retained: storageOk });
@@ -77,7 +77,7 @@ window.startTest = async function(config = {}) {
         pairingSecret: activePairingSecret,
         profileId
       });
-      const statusOk = statusResp && statusResp.status === "ok" && statusResp.taskExecutionAvailable === false;
+      const statusOk = statusResp && statusResp.status === "ok" && statusResp.taskExecutionAvailable === true;
       logResult("status_check", statusOk, statusResp);
       results.steps.push({ step: "status_check", pass: statusOk });
 
@@ -117,18 +117,60 @@ window.startTest = async function(config = {}) {
       logResult("reject_executable_override", execOverrideRejected, overrideExecResp);
       results.steps.push({ step: "reject_executable_override", pass: execOverrideRejected });
 
-      // Step 7: Security: Attempt launch (task execution unavailable until #67)
-      const launchResp = await sendNative({
+      // Step 7: Security A1: Attempt launch with unauthorized field (fails closed with unexpected_field)
+      const launchBadResp = await sendNative({
         op: "launch",
         pairingId: activePairingId,
         pairingSecret: activePairingSecret,
         profileId,
         targetId: "hands",
-        prompt: "echo malicious"
+        prompt: "echo malicious" // unauthorized field (expected promptText)
       });
-      const launchUnavailable = launchResp && launchResp.status === "error" && launchResp.code === "task_execution_unavailable";
-      logResult("reject_launch_unavailable", launchUnavailable, launchResp);
-      results.steps.push({ step: "reject_launch_unavailable", pass: launchUnavailable });
+      const launchBadRejected = launchBadResp && launchBadResp.status === "error" && launchBadResp.code === "unexpected_field";
+      logResult("reject_launch_unauthorized_field", launchBadRejected, launchBadResp);
+      results.steps.push({ step: "reject_launch_unauthorized_field", pass: launchBadRejected });
+
+      // Step 7b: Valid launch request through extension internal messaging with first-request durability & replay
+      const targetList = setupResp.targets || [];
+      const validTargetId = targetList.length > 0 ? targetList[0].target_id : "hands";
+      const launchReqId = "e2e_req_" + Date.now();
+      const launchPayload = {
+        action: "launch",
+        launchRequestId: launchReqId,
+        originConversationId: "conv_e2e_123",
+        originConversationUrl: "https://chatgpt.com/c/conv_e2e_123",
+        transcriptEvidenceHash: "hash_transcript_e2e",
+        accountEvidenceHash: "hash_account_e2e",
+        targetId: validTargetId,
+        requestedPolicyRevision: "v1",
+        promptText: 'Test literal task prompt: --flag @some_file "quotes"'
+      };
+
+      const internalLaunchResp = await chrome.runtime.sendMessage(launchPayload);
+      const launchOk = internalLaunchResp && internalLaunchResp.status === "ok" && internalLaunchResp.executionId && internalLaunchResp.state === "started";
+      logResult("launch_owned_execution", launchOk, internalLaunchResp);
+      results.steps.push({ step: "launch_owned_execution", pass: launchOk });
+      results.executionId = internalLaunchResp ? internalLaunchResp.executionId : null;
+      results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
+
+      // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
+      const replayResp = await chrome.runtime.sendMessage(launchPayload);
+      const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
+      logResult("launch_idempotent_replay", replayOk, replayResp);
+      results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
+
+      // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
+      const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
+      const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
+      const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";
+      logResult("launch_payload_conflict", conflictOk, conflictResp);
+      results.steps.push({ step: "launch_payload_conflict", pass: conflictOk });
+
+      // Step 7e: Recover summaries verification
+      const recoverResp = await chrome.runtime.sendMessage({ action: "recover" });
+      const recoverOk = recoverResp && recoverResp.status === "ok" && Array.isArray(recoverResp.summaries) && recoverResp.summaries.length >= 1;
+      logResult("recover_launch_summaries", recoverOk, recoverResp);
+      results.steps.push({ step: "recover_launch_summaries", pass: recoverOk });
 
       // Step 8: Security: Unsupported operations fail closed
       const unknownOpResp = await sendNative({

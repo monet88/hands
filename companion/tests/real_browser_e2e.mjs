@@ -283,6 +283,17 @@ async function main() {
     }
     console.log("      Profile Alpha assertions PASSED:\n", alphaResult.results.steps.map(s => `        [PASS] ${s.step}`).join("\n"));
 
+
+    if (alphaResult?.results?.terminalHandle) {
+      const termHandle = alphaResult.results.terminalHandle;
+      console.log(`      Cleaning up test-owned Orca terminal: ${termHandle}`);
+      try {
+        execSync(`orca terminal close --terminal "${termHandle}" --json`, { stdio: "ignore" });
+        console.log(`      Closed test terminal: ${termHandle}`);
+      } catch (err) {
+        console.warn(`      Warning: failed to close test terminal ${termHandle}`);
+      }
+    }
     pairingSecret = alphaResult.results.pairingSecret;
     if (!pairingSecret || !pairingSecret.startsWith("rb_sec_")) {
       throw new Error("Failed to receive active pairingSecret from bootstrap setup response");

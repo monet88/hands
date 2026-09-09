@@ -3,8 +3,17 @@ use std::thread;
 use tempfile::tempdir;
 
 use hands_return_bridge::journal::{
+    AttemptEvidence, LaunchRequestParams,
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
 };
+
+fn init_git_repo(path: &std::path::Path) {
+    let output = std::process::Command::new("git")
+        .args(["init", &path.to_string_lossy()])
+        .output()
+        .expect("git init must succeed");
+    assert!(output.status.success(), "git init failed");
+}
 
 #[test]
 fn test_journal_bootstrap_activate_and_authenticate() {
@@ -365,4 +374,219 @@ fn test_empty_stored_profile_id_fails_closed_on_auth_and_revoke() {
         PairingError::ProfileMismatch,
         "Revoke against corrupt empty profile must fail closed"
     );
+}
+
+
+#[test]
+fn test_launch_reserve_idempotent_claim_and_conflict() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_launch_test";
+    let bootstrap_token = "boot_launch_token";
+    let profile_id = "profile_launch";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let targets = vec![TargetRecord {
+        target_id: "target_1".to_string(),
+        canonical_path: canonical_path.clone(),
+        name: "target_1".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_100".to_string(),
+        origin_conversation_id: "conv_abc".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_abc".to_string(),
+        transcript_evidence_hash: "hash_transcript_1".to_string(),
+        account_evidence_hash: "hash_account_1".to_string(),
+        target_id: "target_1".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Inspect codebase and fix bug".to_string(),
+    };
+
+    // 1. Initial claim allocates opaque IDs
+    let claim1 = journal.reserve_or_claim_launch(&params).expect("Claim failed");
+    assert!(!claim1.is_replayed);
+    assert_eq!(claim1.canonical_target_path, canonical_path);
+    assert_eq!(claim1.state, "claimed");
+    assert!(claim1.execution_id.starts_with("exec_"));
+    assert!(claim1.return_token.starts_with("ret_"));
+
+    // 2. Idempotent retry returns identical execution without side effect
+    let claim2 = journal.reserve_or_claim_launch(&params).expect("Retry claim failed");
+    assert!(claim2.is_replayed);
+    assert_eq!(claim2.execution_id, claim1.execution_id);
+    assert_eq!(claim2.return_token, claim1.return_token);
+    assert_eq!(claim2.prompt_text, claim1.prompt_text);
+
+    // 3. Changed payload under the same request key yields explicit conflict
+    let mut conflict_params = params.clone();
+    conflict_params.prompt_text = "Different prompt text!".to_string();
+    let err_conflict = journal.reserve_or_claim_launch(&conflict_params);
+    assert_eq!(err_conflict.unwrap_err(), PairingError::PayloadConflict);
+
+    // 4. Mark launch attempt: first call succeeds, second fails closed
+    let attempt1 = journal.mark_launch_attempt(&claim1.execution_id, pairing_id).unwrap();
+    assert!(attempt1, "First launch attempt mark must succeed");
+
+    let attempt2 = journal.mark_launch_attempt(&claim1.execution_id, pairing_id).unwrap();
+    assert!(!attempt2, "Second attempt mark must return false");
+
+    // 5. Record start evidence
+    let evidence = AttemptEvidence {
+        orca_terminal_handle: Some("term_12345".to_string()),
+        orca_tab_id: Some("tab_abc".to_string()),
+        orca_pane_key: Some("pane_xyz".to_string()),
+        orca_pty_id: Some("pty_999".to_string()),
+    };
+    journal.record_launch_start_evidence(&claim1.execution_id, &evidence).unwrap();
+    journal.record_launch_started(&claim1.execution_id, &evidence).unwrap();
+
+    // 6. Inspect launch summaries
+    let summaries = journal.get_launch_summaries(pairing_id).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].launch_request_id, "req_100");
+    assert_eq!(summaries[0].execution_id, claim1.execution_id);
+    assert_eq!(summaries[0].state, "started");
+    assert_eq!(summaries[0].orca_terminal_handle.as_deref(), Some("term_12345"));
+
+    // 7. Pruning detailed launch_request row activates tombstone guard:
+    // Same payload on tombstoned key returns ReplayTombstoned; changed payload returns PayloadConflict
+    {
+        // Open raw connection to simulate retention pruning of launch_requests
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM launch_requests WHERE launch_request_id = 'req_100'", []).unwrap();
+    }
+    let err_tombstoned = journal.reserve_or_claim_launch(&params);
+    assert_eq!(err_tombstoned.unwrap_err(), PairingError::ReplayTombstoned);
+
+    let mut conflict_after_prune = params.clone();
+    conflict_after_prune.prompt_text = "Completely different after prune".to_string();
+    let err_conflict_pruned = journal.reserve_or_claim_launch(&conflict_after_prune);
+    assert_eq!(err_conflict_pruned.unwrap_err(), PairingError::PayloadConflict);
+}
+#[test]
+fn test_concurrent_launch_claims_converge_on_same_execution() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Arc::new(Journal::open(&db_path).expect("Failed to open journal"));
+
+    let pairing_id = "pair_launch_race";
+    let bootstrap_token = "boot_launch_race";
+    let profile_id = "profile_race";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let targets = vec![TargetRecord {
+        target_id: "target_race".to_string(),
+        canonical_path: canonical_path.clone(),
+        name: "target_race".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_race_1".to_string(),
+        origin_conversation_id: "conv_race".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_race".to_string(),
+        transcript_evidence_hash: "hash_race".to_string(),
+        account_evidence_hash: "hash_acc".to_string(),
+        target_id: "target_race".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Concurrent launch test".to_string(),
+    };
+
+    let num_threads = 8;
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        let j = Arc::clone(&journal);
+        let p = params.clone();
+        handles.push(thread::spawn(move || {
+            j.reserve_or_claim_launch(&p)
+        }));
+    }
+
+    let mut execution_ids = Vec::new();
+    for handle in handles {
+        let claim = handle.join().unwrap().expect("Claim should succeed");
+        execution_ids.push(claim.execution_id);
+    }
+
+    // All threads must converge on the exact same executionId!
+    let first_id = &execution_ids[0];
+    for id in &execution_ids {
+        assert_eq!(id, first_id, "All concurrent threads must converge on identical executionId");
+    }
+}
+
+#[test]
+fn test_workspace_path_with_spaces_and_unicode() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_unicode_space";
+    let bootstrap_token = "boot_unicode_space";
+    let profile_id = "profile_unicode";
+
+    // Create workspace directory with spaces and non-ASCII characters
+    let target_parent = dir.path().join("space and unicode test đặng 123");
+    std::fs::create_dir_all(&target_parent).unwrap();
+    init_git_repo(&target_parent);
+    let canonical_path = target_parent.canonicalize().unwrap().to_string_lossy().to_string();
+
+    let targets = vec![TargetRecord {
+        target_id: "target_unicode".to_string(),
+        canonical_path: canonical_path.clone(),
+        name: "target_unicode".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: "req_unicode_1".to_string(),
+        origin_conversation_id: "conv_unicode".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_unicode".to_string(),
+        transcript_evidence_hash: "hash_t_u".to_string(),
+        account_evidence_hash: "hash_a_u".to_string(),
+        target_id: "target_unicode".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Test prompt for workspace with spaces & unicode".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&params).expect("Claim with spaces and unicode target must succeed");
+    assert_eq!(claim.canonical_target_path, canonical_path);
+    assert_eq!(claim.state, "claimed");
 }

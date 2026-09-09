@@ -42,6 +42,31 @@ function isTrustedExtensionSender(sender) {
   return true;
 }
 
+async function sha256Hex(str) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(str);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function parseCanonicalConversationId(urlStr) {
+  if (!urlStr || typeof urlStr !== "string" || !urlStr.startsWith("https://chatgpt.com/")) return null;
+  if (urlStr.includes("#") || urlStr.includes("?")) return null;
+  const path = urlStr.slice("https://chatgpt.com/".length);
+  const segments = path.split("/").filter(Boolean);
+  let id = null;
+  if (segments.length === 2 && segments[0] === "c") {
+    id = segments[1];
+  } else if (segments.length === 4 && segments[0] === "g" && segments[2] === "c" && segments[1]) {
+    id = segments[3];
+  }
+  if (!id || id === "new" || id === "chat" || id.includes("new_chat") || id.includes("provisional")) {
+    return null;
+  }
+  return id;
+}
+
 async function getOrCreateProfileId() {
   const data = await chrome.storage.local.get(["profileId"]);
   if (data.profileId) {
@@ -76,7 +101,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const profileId = await getOrCreateProfileId();
 
       // Gate: Secret-bearing actions must fail-closed if storage isolation is not established
-      if (["setup", "status", "connect", "revoke"].includes(request.action)) {
+      if (["setup", "status", "connect", "revoke", "launch", "recover"].includes(request.action)) {
         const isTrustedStorage = await ensureStorageAccessLevel();
         if (!isTrustedStorage) {
           sendResponse({
@@ -230,6 +255,181 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (response && (response.status === "ok" || response.code === "pairing_retired")) {
             await chrome.storage.local.remove(["isPaired", "pairingId", "pairingSecret", "targets", "policyRevision"]);
           }
+          sendResponse(response);
+          break;
+        }
+
+        case "launch": {
+          const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired", "policyRevision", "targets"]);
+          if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
+            sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
+            return;
+          }
+
+          const transcriptEvidenceHash = request.transcriptEvidenceHash?.trim();
+          const accountEvidenceHash = request.accountEvidenceHash?.trim();
+          if (!transcriptEvidenceHash || transcriptEvidenceHash === "hash_transcript_empty") {
+            sendResponse({ status: "error", code: "missing_evidence", message: "Real transcript evidence hash is required; empty placeholder rejected" });
+            return;
+          }
+          if (!accountEvidenceHash || accountEvidenceHash === "hash_account_empty") {
+            sendResponse({ status: "error", code: "missing_evidence", message: "Real account evidence hash is required; empty placeholder rejected" });
+            return;
+          }
+
+          const originConversationId = request.originConversationId?.trim();
+          const originConversationUrl = request.originConversationUrl?.trim();
+          if (!originConversationId || !originConversationUrl) {
+            sendResponse({ status: "error", code: "missing_conversation_binding", message: "Origin conversation ID and URL are required" });
+            return;
+          }
+
+          const parsedConvId = parseCanonicalConversationId(originConversationUrl);
+          if (!parsedConvId || parsedConvId !== originConversationId) {
+            sendResponse({
+              status: "error",
+              code: "invalid_conversation_boundary",
+              message: "Origin conversation URL must be a canonical existing ChatGPT conversation matching the conversation ID"
+            });
+            return;
+          }
+
+          const targetId = request.targetId?.trim();
+          if (!targetId) {
+            sendResponse({ status: "error", code: "missing_target_id", message: "Target ID is required" });
+            return;
+          }
+
+          const promptText = request.promptText;
+          if (!promptText || typeof promptText !== "string" || !promptText.trim()) {
+            sendResponse({ status: "error", code: "missing_prompt_text", message: "Prompt text is required" });
+            return;
+          }
+
+          const requestedPolicyRevision = request.requestedPolicyRevision?.trim() || stored.policyRevision || "v1";
+
+          // Durable request identity: reuse unresolved matching request; reject duplicate with changed payload locally
+          const activeKey = `active_launch_${originConversationId}_${targetId}`;
+          const activeStored = await chrome.storage.local.get([activeKey]);
+          const existingActiveReqId = activeStored[activeKey];
+
+          let launchRequestId;
+          if (request.launchRequestId && request.launchRequestId.trim()) {
+            launchRequestId = request.launchRequestId.trim();
+          } else if (existingActiveReqId) {
+            launchRequestId = existingActiveReqId;
+          } else {
+            const digest = await sha256Hex(`${stored.pairingId}:${originConversationId}:${targetId}:${promptText}`);
+            launchRequestId = "req_" + digest.slice(0, 16);
+          }
+
+          const pendingLaunchKey = "launch_" + launchRequestId;
+          const storedLaunch = await chrome.storage.local.get([pendingLaunchKey]);
+          const existingRecord = storedLaunch[pendingLaunchKey];
+
+          if (existingRecord) {
+            if (
+              existingRecord.originConversationId !== originConversationId ||
+              existingRecord.originConversationUrl !== originConversationUrl ||
+              existingRecord.transcriptEvidenceHash !== transcriptEvidenceHash ||
+              existingRecord.accountEvidenceHash !== accountEvidenceHash ||
+              existingRecord.targetId !== targetId ||
+              existingRecord.promptText !== promptText
+            ) {
+              sendResponse({
+                status: "error",
+                code: "payload_conflict",
+                message: "A launch request with this ID already exists with a different payload"
+              });
+              return;
+            }
+          }
+
+          const launchRecord = {
+            launchRequestId,
+            pairingId: stored.pairingId,
+            originConversationId,
+            originConversationUrl,
+            transcriptEvidenceHash,
+            accountEvidenceHash,
+            targetId,
+            requestedPolicyRevision,
+            promptText,
+            createdAt: existingRecord ? existingRecord.createdAt : Date.now(),
+            status: existingRecord ? existingRecord.status : "pending_native"
+          };
+
+          try {
+            await chrome.storage.local.set({
+              [pendingLaunchKey]: launchRecord,
+              [activeKey]: launchRequestId,
+              lastLaunchRequestId: launchRequestId
+            });
+          } catch (storageErr) {
+            sendResponse({
+              status: "error",
+              code: "browser_persistence_failure",
+              message: "Failed to persist launch request in browser storage; native request aborted"
+            });
+            return;
+          }
+
+          // Invoke native host
+          const response = await sendNative({
+            op: "launch",
+            pairingId: stored.pairingId,
+            pairingSecret: stored.pairingSecret,
+            profileId,
+            launchRequestId,
+            originConversationId,
+            originConversationUrl,
+            transcriptEvidenceHash,
+            accountEvidenceHash,
+            targetId,
+            requestedPolicyRevision,
+            promptText
+          });
+
+          if (response && response.status === "ok") {
+            launchRecord.status = response.state || "started";
+            launchRecord.executionId = response.executionId;
+            launchRecord.returnToken = response.returnToken;
+            launchRecord.terminalEvidence = response.terminalEvidence;
+            await chrome.storage.local.set({
+              [pendingLaunchKey]: launchRecord,
+              activeExecutionId: response.executionId
+            });
+          } else if (response && response.code === "launch_uncertain") {
+            launchRecord.status = "unknown";
+            launchRecord.executionId = response.executionId;
+            launchRecord.terminalEvidence = response.terminalEvidence;
+            await chrome.storage.local.set({
+              [pendingLaunchKey]: launchRecord
+            });
+          }
+
+          sendResponse(response);
+          break;
+        }
+
+        case "recover": {
+          const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
+          if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
+            sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
+            return;
+          }
+
+          const payload = {
+            op: "recover",
+            pairingId: stored.pairingId,
+            pairingSecret: stored.pairingSecret,
+            profileId
+          };
+          if (request.launchRequestId) {
+            payload.launchRequestId = request.launchRequestId;
+          }
+
+          const response = await sendNative(payload);
           sendResponse(response);
           break;
         }
