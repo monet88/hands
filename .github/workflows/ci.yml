@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'extension/**'
+      - 'bridge/**'
+      - '.github/workflows/return-bridge.yml'
   pull_request:
+    paths-ignore:
+      - 'extension/**'
+      - 'bridge/**'
+      - '.github/workflows/return-bridge.yml'
 
 jobs:
   build:

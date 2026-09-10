@@ -1,0 +1,46 @@
+name: Return Bridge
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'extension/**'
+      - 'bridge/**'
+      - '.github/workflows/return-bridge.yml'
+  pull_request:
+    paths:
+      - 'extension/**'
+      - 'bridge/**'
+      - '.github/workflows/return-bridge.yml'
+
+jobs:
+  bridge-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check bridge/native
+        run: cargo check --manifest-path bridge/native/Cargo.toml
+
+      - name: Run native deterministic tests
+        run: cargo test --manifest-path bridge/native/Cargo.toml
+
+  extension-guards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Run extension guard tests
+        run: bun extension/tests/extension_guards.test.mjs
+
+      - name: Run deterministic completion lifecycle probes
+        run: bun bridge/tests/lifecycle_probes.test.mjs
