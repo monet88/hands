@@ -3,7 +3,7 @@ use std::thread;
 use tempfile::tempdir;
 
 use hands_return_bridge::journal::{
-    AttemptEvidence, LaunchRequestParams,
+    compute_payload_digest, AttemptEvidence, LaunchRequestParams,
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
 };
 
@@ -28,7 +28,7 @@ fn test_journal_bootstrap_activate_and_authenticate() {
     let profile_id = "profile_alpha";
     let targets = vec![TargetRecord {
         target_id: "target_canonical".to_string(),
-        canonical_path: "F:\\CodeBase\\hands".to_string(),
+        canonical_path: "test_target_canonical".to_string(),
         name: "hands".to_string(),
     }];
     let policy = PolicyRecord {
@@ -734,10 +734,13 @@ fn test_get_launch_summaries_bounded_to_32() {
     let pairing_id = "pair_bounded_test";
     let bootstrap_token = "boot_bounded_test";
     let profile_id = "profile_bounded";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
 
     let targets = vec![TargetRecord {
         target_id: "hands".to_string(),
-        canonical_path: "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string(),
+        canonical_path: canonical_path.clone(),
         name: "hands".to_string(),
     }];
     let policy = PolicyRecord {
@@ -788,10 +791,13 @@ fn test_replay_preserves_execution_even_if_registered_policy_changes_later() {
     let pairing_id = "pair_replay_policy_test";
     let bootstrap_token = "boot_replay_policy_test";
     let profile_id = "profile_replay";
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
 
     let targets = vec![TargetRecord {
         target_id: "hands".to_string(),
-        canonical_path: "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string(),
+        canonical_path: canonical_path.clone(),
         name: "hands".to_string(),
     }];
     let policy = PolicyRecord {
@@ -857,7 +863,9 @@ fn test_unsupported_registered_policy_fails_closed_without_allocating_claim_or_t
     let pairing_id = "pair_unsupported_pol";
     let bootstrap_token = "bt_unsupp";
     let profile_id = "prof_unsupp";
-    let target_canonical = "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_canonical = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
     let targets = vec![TargetRecord {
         target_id: "hands".to_string(),
         canonical_path: target_canonical,
@@ -1139,4 +1147,60 @@ fn test_execution_adapter_claims_one_time_uniqueness() {
         |r| r.get(0),
     ).unwrap();
     assert_eq!(owner, "adp_owner_1");
+}
+
+#[test]
+fn test_payload_digest_preserves_field_boundaries() {
+    let digest_a = compute_payload_digest(
+        "a:b", "c", "hash_t", "hash_a", "target", "v1", "prompt",
+    );
+    let digest_b = compute_payload_digest(
+        "a", "b:c", "hash_t", "hash_a", "target", "v1", "prompt",
+    );
+    assert_ne!(digest_a, digest_b, "Field boundaries must be unambiguous in the payload digest");
+}
+
+#[test]
+fn test_revoked_pairing_cannot_claim_or_replay_launch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let pairing_id = "pair_revoke_claim";
+    let bootstrap_token = "boot_revoke_claim";
+    let profile_id = "profile_revoke_claim";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_revoke".into(), canonical_path, name: "target_revoke".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_revoke_claim".into(),
+        origin_conversation_id: "conv_revoke".into(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_revoke".into(),
+        transcript_evidence_hash: "hash_t_revoke".into(),
+        account_evidence_hash: "hash_a_revoke".into(),
+        target_id: "target_revoke".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "revoke race".into(),
+    };
+
+    let first = journal.reserve_or_claim_launch(&params).unwrap();
+    assert!(!first.is_replayed);
+    journal.revoke_pairing_admin(pairing_id).unwrap();
+
+    let replay_err = journal.reserve_or_claim_launch(&params).unwrap_err();
+    assert_eq!(replay_err, PairingError::Retired);
+
+    let mut fresh = params.clone();
+    fresh.launch_request_id = "req_after_revoke".into();
+    let fresh_err = journal.reserve_or_claim_launch(&fresh).unwrap_err();
+    assert_eq!(fresh_err, PairingError::Retired);
 }

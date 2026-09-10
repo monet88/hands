@@ -29,9 +29,19 @@
         }
 
         // Collect rendered transcript text from conversation turns
-        const turnNodes = document.querySelectorAll(
-          'article, [data-message-author-role], main div[data-testid^="conversation-turn"]'
-        );
+        const turnSelectors = [
+          'main div[data-testid^="conversation-turn"]',
+          'article',
+          '[data-message-author-role]'
+        ];
+        let turnNodes = [];
+        for (const selector of turnSelectors) {
+          const candidates = Array.from(document.querySelectorAll(selector));
+          if (candidates.length > 0) {
+            turnNodes = candidates;
+            break;
+          }
+        }
         let transcriptText = "";
         for (const node of turnNodes) {
           const text = (node.innerText || "").trim();
@@ -53,10 +63,17 @@
         }
 
         // Collect account / workspace evidence if available
-        const accountNode = document.querySelector(
+        const accountNodes = document.querySelectorAll(
           '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]'
         );
-        const accountText = (accountNode?.innerText || "").trim();
+        let accountText = "";
+        for (const node of accountNodes) {
+          const candidate = (node?.innerText || "").trim();
+          if (candidate) {
+            accountText = candidate;
+            break;
+          }
+        }
         if (!accountText) {
           sendResponse({
             ok: false,

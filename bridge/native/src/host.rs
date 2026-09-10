@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -57,28 +58,24 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
-pub fn resolve_state_dir(override_opt: Option<&Path>) -> Result<PathBuf, HostError> {
-    if let Some(p) = override_opt {
-        return Ok(p.to_path_buf());
+fn absolutize(path: PathBuf) -> Result<PathBuf, HostError> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
     }
-    if let Ok(val) = std::env::var("HANDS_RETURN_BRIDGE_STATE_DIR") {
-        if !val.trim().is_empty() {
-            return Ok(PathBuf::from(val.trim()));
-        }
-    }
-    if let Ok(val) = std::env::var("RETURN_BRIDGE_STATE_DIR") {
-        if !val.trim().is_empty() {
-            return Ok(PathBuf::from(val.trim()));
-        }
-    }
+}
 
+fn resolve_default_state_dir() -> Result<PathBuf, HostError> {
     #[cfg(windows)]
     {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             if !local_app_data.trim().is_empty() {
-                return Ok(PathBuf::from(local_app_data)
-                    .join("Hands")
-                    .join("return-bridge"));
+                return absolutize(
+                    PathBuf::from(local_app_data.trim())
+                        .join("Hands")
+                        .join("return-bridge"),
+                );
             }
         }
         Err(HostError::Storage(
@@ -89,17 +86,98 @@ pub fn resolve_state_dir(override_opt: Option<&Path>) -> Result<PathBuf, HostErr
     {
         if let Ok(home) = std::env::var("HOME") {
             if !home.trim().is_empty() {
-                return Ok(PathBuf::from(home)
-                    .join(".local")
-                    .join("share")
-                    .join("hands")
-                    .join("return-bridge"));
+                return absolutize(
+                    PathBuf::from(home.trim())
+                        .join(".local")
+                        .join("share")
+                        .join("hands")
+                        .join("return-bridge"),
+                );
             }
         }
         Err(HostError::Storage(
             "Cannot resolve per-user state directory: HOME environment variable is missing or empty".to_string(),
         ))
     }
+}
+
+pub fn resolve_state_dir(override_opt: Option<&Path>) -> Result<PathBuf, HostError> {
+    if let Some(p) = override_opt {
+        return absolutize(p.to_path_buf());
+    }
+    if let Ok(val) = std::env::var("HANDS_RETURN_BRIDGE_STATE_DIR") {
+        if !val.trim().is_empty() {
+            return absolutize(PathBuf::from(val.trim()));
+        }
+    }
+    if let Ok(val) = std::env::var("RETURN_BRIDGE_STATE_DIR") {
+        if !val.trim().is_empty() {
+            return absolutize(PathBuf::from(val.trim()));
+        }
+    }
+    resolve_default_state_dir()
+}
+
+fn atomic_replace_file(temp_path: &Path, destination: &Path) -> Result<(), HostError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+        unsafe extern "system" {
+            fn MoveFileExW(
+                lp_existing_file_name: *const u16,
+                lp_new_file_name: *const u16,
+                dw_flags: u32,
+            ) -> i32;
+        }
+
+        let from: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(HostError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, destination)?;
+        Ok(())
+    }
+}
+
+fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> Result<(), HostError> {
+    let parent = path.parent().ok_or_else(|| {
+        HostError::Storage(format!("Manifest path has no parent: {}", path.display()))
+    })?;
+    let temp_name = format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or(DEFAULT_HOST_NAME),
+        generate_random_id("write", 6)?
+    );
+    let temp_path = parent.join(temp_name);
+    let result = (|| -> Result<(), HostError> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        atomic_replace_file(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn generate_random_id(prefix: &str, num_bytes: usize) -> Result<String, HostError> {
@@ -187,6 +265,12 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
                 "Native messaging host automatic registration is only supported on Windows in this issue. Use --skip-registry for manual host manifest setup on non-Windows platforms.".to_string(),
             ));
         }
+        #[cfg(windows)]
+        if opts.state_dir.is_some() {
+            return Err(HostError::Storage(
+                "--state-dir is only supported with --skip-registry; registered browser launches use the fixed per-user state directory".to_string(),
+            ));
+        }
     }
 
     // Validate browser: reject invalid browsers rather than defaulting
@@ -219,8 +303,13 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         )));
     }
 
-    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    let state_dir = if opts.skip_registry {
+        resolve_state_dir(opts.state_dir.as_deref())?
+    } else {
+        resolve_default_state_dir()?
+    };
     std::fs::create_dir_all(&state_dir)?;
+    let state_dir = state_dir.canonicalize()?;
 
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
@@ -230,13 +319,17 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     let canonical = verify_and_canonicalize_git_target(raw_target)?;
     let canonical_path_str = canonical.to_string_lossy().to_string();
 
-    let target_id = opts.target_id.clone().unwrap_or_else(|| {
-        canonical
+    let target_id = match opts.target_id.as_deref() {
+        Some(id) if id.trim().is_empty() => {
+            return Err(HostError::Storage("--target-id must not be empty or whitespace".to_string()));
+        }
+        Some(id) => id.trim().to_string(),
+        None => canonical
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("target_workspace")
-            .to_string()
-    });
+            .to_string(),
+    };
 
     let pairing_id = generate_random_id("pair", 8)?;
     let bootstrap_token = generate_random_id("rb_boot", 12)?;
@@ -293,9 +386,18 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         "allowed_origins": allowed_origins
     });
 
-    if let Err(e) = std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json)?) {
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json)?;
+    let previous_manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            let _ = journal.delete_pairing(&pairing_id);
+            return Err(HostError::Io(e));
+        }
+    };
+    if let Err(e) = write_manifest_atomic(&manifest_path, &manifest_bytes) {
         let _ = journal.delete_pairing(&pairing_id);
-        return Err(HostError::Io(e));
+        return Err(e);
     }
 
     // Register in Windows Registry if requested
@@ -303,9 +405,22 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
         #[cfg(windows)]
         {
             if let Err(e) = register_manifest_registry(&browser_norm, &manifest_path) {
-                // Cleanup orphan manifest and database row on registration failure
-                let _ = std::fs::remove_file(&manifest_path);
+                // Restore the exact prior manifest instead of deleting a pre-existing valid setup.
+                let restore_result = match previous_manifest.as_deref() {
+                    Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+                    None => match std::fs::remove_file(&manifest_path) {
+                        Ok(()) => Ok(()),
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(remove_err) => Err(HostError::Io(remove_err)),
+                    },
+                };
                 let _ = journal.delete_pairing(&pairing_id);
+                if let Err(restore_err) = restore_result {
+                    return Err(HostError::Registry(format!(
+                        "{}; additionally failed to restore the previous manifest: {}",
+                        e, restore_err
+                    )));
+                }
                 return Err(e);
             }
         }
@@ -370,8 +485,12 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 }
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
-    let state_dir = resolve_state_dir(state_dir_opt)?;
+    let state_dir = match state_dir_opt {
+        Some(path) => resolve_state_dir(Some(path))?,
+        None => resolve_default_state_dir()?,
+    };
     std::fs::create_dir_all(&state_dir)?;
+    let state_dir = state_dir.canonicalize()?;
     std::env::set_var("HANDS_RETURN_BRIDGE_STATE_DIR", &state_dir);
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;

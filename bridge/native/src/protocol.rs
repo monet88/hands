@@ -108,6 +108,66 @@ pub fn write_native_message<W: Write>(writer: &mut W, value: &Value) -> Result<(
     Ok(())
 }
 
+fn pre_spawn_failure_response(
+    journal: &Journal,
+    execution_id: &str,
+    code: &str,
+    message: String,
+) -> Value {
+    match journal.record_launch_pre_spawn_failure(execution_id, &message) {
+        Ok(()) => json!({
+            "status": "error",
+            "code": code,
+            "executionId": execution_id,
+            "state": "failed",
+            "message": message,
+            "trustNotice": TRUST_NOTICE
+        }),
+        Err(persist_err) => json!({
+            "status": "error",
+            "code": "storage_error",
+            "executionId": execution_id,
+            "state": "unknown",
+            "message": format!(
+                "{}; additionally failed to persist pre-spawn failure state: {}",
+                message, persist_err
+            ),
+            "trustNotice": TRUST_NOTICE
+        }),
+    }
+}
+
+fn launch_uncertain_response(
+    journal: &Journal,
+    execution_id: &str,
+    evidence: Option<&crate::journal::AttemptEvidence>,
+    message: String,
+) -> Value {
+    let persistence_error = journal
+        .record_launch_uncertain(execution_id, evidence, &message)
+        .err()
+        .map(|e| e.to_string());
+    let final_message = match persistence_error {
+        Some(e) => format!("{}; failed to persist uncertain state: {}", message, e),
+        None => message,
+    };
+    let terminal_evidence = evidence.map(|ev| json!({
+        "orcaTerminalHandle": ev.orca_terminal_handle,
+        "orcaTabId": ev.orca_tab_id,
+        "orcaPaneKey": ev.orca_pane_key,
+        "orcaPtyId": ev.orca_pty_id,
+    }));
+    json!({
+        "status": "error",
+        "code": "launch_uncertain",
+        "executionId": execution_id,
+        "state": "unknown",
+        "message": final_message,
+        "terminalEvidence": terminal_evidence,
+        "trustNotice": TRUST_NOTICE
+    })
+}
+
 pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
     let obj = match msg.as_object() {
         Some(o) => o,
@@ -392,10 +452,27 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             };
 
             if claim.is_replayed {
-                // Return existing execution details without re-running launch attempt!
-                let summary_opt = journal.get_launch_request_by_id(pairing_id, launch_request_id).unwrap_or(None);
+                // Preserve execution identity without converting unresolved durable
+                // state into a successful browser response.
+                let summary_opt = match journal.get_launch_request_by_id(pairing_id, launch_request_id) {
+                    Ok(summary) => summary,
+                    Err(e) => return map_pairing_error(e),
+                };
+                if matches!(claim.state.as_str(), "started" | "completed") {
+                    return json!({
+                        "status": "ok",
+                        "executionId": claim.execution_id,
+                        "returnToken": claim.return_token,
+                        "state": claim.state,
+                        "isReplayed": true,
+                        "summary": summary_opt,
+                        "trustNotice": TRUST_NOTICE
+                    });
+                }
                 return json!({
-                    "status": "ok",
+                    "status": "error",
+                    "code": "launch_unresolved",
+                    "message": format!("Existing launch request is not proven started; durable state is '{}'. Recover before retrying.", claim.state),
                     "executionId": claim.execution_id,
                     "returnToken": claim.return_token,
                     "state": claim.state,
@@ -409,14 +486,24 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             let state_dir = match resolve_state_dir(None) {
                 Ok(sd) => sd,
                 Err(e) => {
-                    return json!({ "status": "error", "code": "storage_error", "message": e.to_string() });
+                    return pre_spawn_failure_response(
+                        journal,
+                        &claim.execution_id,
+                        "storage_error",
+                        e.to_string(),
+                    );
                 }
             };
 
             let adapter_path = match ensure_adapter_file(&state_dir) {
                 Ok(p) => p,
                 Err(e) => {
-                    return json!({ "status": "error", "code": "adapter_error", "message": e.to_string() });
+                    return pre_spawn_failure_response(
+                        journal,
+                        &claim.execution_id,
+                        "adapter_error",
+                        e.to_string(),
+                    );
                 }
             };
 
@@ -424,16 +511,22 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             let startup_cmd = match build_omp_startup_command_with_env(&adapter_path, Some(&claim.execution_id), Some(&state_dir)) {
                 Ok(cmd) => cmd,
                 Err(e) => {
-                    return json!({ "status": "error", "code": "launcher_error", "message": e.to_string() });
+                    return pre_spawn_failure_response(
+                        journal,
+                        &claim.execution_id,
+                        "launcher_error",
+                        e.to_string(),
+                    );
                 }
             };
             // 4b. Explicit compatibility preflight check BEFORE marking attempt
             if let Err(e) = verify_launch_preflight(None) {
-                return json!({
-                    "status": "error",
-                    "code": "preflight_failed",
-                    "message": e.to_string()
-                });
+                return pre_spawn_failure_response(
+                    journal,
+                    &claim.execution_id,
+                    "preflight_failed",
+                    e.to_string(),
+                );
             }
 
             // 5. Mark single launch attempt atomically BEFORE invoking Orca CLI
@@ -452,41 +545,41 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             // 6. Create terminal with native-owned startup command
             let evidence = match launch_orca_terminal(&claim.canonical_target_path, &startup_cmd, &claim.execution_id) {
                 Ok(ev) => {
-                    let _ = journal.record_launch_start_evidence(&claim.execution_id, &ev);
+                    if let Err(e) = journal.record_launch_start_evidence(&claim.execution_id, &ev) {
+                        return launch_uncertain_response(
+                            journal,
+                            &claim.execution_id,
+                            Some(&ev),
+                            format!("Orca terminal was created but start evidence persistence failed: {}", e),
+                        );
+                    }
                     ev
                 }
                 Err(LauncherError::OrcaSpawnFailed(e)) => {
                     // Provably no process started (binary missing or spawn failed)
-                    let _ = journal.record_launch_pre_spawn_failure(&claim.execution_id, &e);
-                    return json!({
-                        "status": "error",
-                        "code": "orca_spawn_failed",
-                        "executionId": claim.execution_id,
-                        "message": e
-                    });
+                    return pre_spawn_failure_response(
+                        journal,
+                        &claim.execution_id,
+                        "orca_spawn_failed",
+                        e,
+                    );
                 }
                 Err(LauncherError::OrcaExecutionUncertain(e)) => {
                     // Orca process was spawned; outcome uncertain: side effect may have occurred
-                    let _ = journal.record_launch_uncertain(&claim.execution_id, None, &e);
-                    return json!({
-                        "status": "error",
-                        "code": "launch_uncertain",
-                        "executionId": claim.execution_id,
-                        "state": "unknown",
-                        "message": format!("Orca invocation returned uncertain outcome; terminal state unknown: {}", e),
-                        "trustNotice": TRUST_NOTICE
-                    });
+                    return launch_uncertain_response(
+                        journal,
+                        &claim.execution_id,
+                        None,
+                        format!("Orca invocation returned uncertain outcome; terminal state unknown: {}", e),
+                    );
                 }
                 Err(e) => {
-                    let _ = journal.record_launch_uncertain(&claim.execution_id, None, &e.to_string());
-                    return json!({
-                        "status": "error",
-                        "code": "launch_uncertain",
-                        "executionId": claim.execution_id,
-                        "state": "unknown",
-                        "message": e.to_string(),
-                        "trustNotice": TRUST_NOTICE
-                    });
+                    return launch_uncertain_response(
+                        journal,
+                        &claim.execution_id,
+                        None,
+                        e.to_string(),
+                    );
                 }
             };
 
@@ -494,44 +587,33 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             let terminal_handle = evidence.orca_terminal_handle.as_ref().unwrap();
             if let Err(e) = wait_orca_terminal_idle(terminal_handle, 10000) {
                 let err_str = format!("Orca terminal wait tui-idle failed: {}", e);
-                let _ = journal.record_launch_uncertain(&claim.execution_id, Some(&evidence), &err_str);
-                return json!({
-                    "status": "error",
-                    "code": "launch_uncertain",
-                    "executionId": claim.execution_id,
-                    "state": "unknown",
-                    "message": err_str,
-                    "terminalEvidence": {
-                        "orcaTerminalHandle": evidence.orca_terminal_handle,
-                        "orcaTabId": evidence.orca_tab_id,
-                        "orcaPaneKey": evidence.orca_pane_key,
-                        "orcaPtyId": evidence.orca_pty_id,
-                    },
-                    "trustNotice": TRUST_NOTICE
-                });
+                return launch_uncertain_response(
+                    journal,
+                    &claim.execution_id,
+                    Some(&evidence),
+                    err_str,
+                );
             }
 
             if let Err(e) = send_orca_terminal_prompt(terminal_handle, &claim.prompt_text) {
                 let err_str = format!("Orca terminal send prompt failed: {}", e);
-                let _ = journal.record_launch_uncertain(&claim.execution_id, Some(&evidence), &err_str);
-                return json!({
-                    "status": "error",
-                    "code": "launch_uncertain",
-                    "executionId": claim.execution_id,
-                    "state": "unknown",
-                    "message": err_str,
-                    "terminalEvidence": {
-                        "orcaTerminalHandle": evidence.orca_terminal_handle,
-                        "orcaTabId": evidence.orca_tab_id,
-                        "orcaPaneKey": evidence.orca_pane_key,
-                        "orcaPtyId": evidence.orca_pty_id,
-                    },
-                    "trustNotice": TRUST_NOTICE
-                });
+                return launch_uncertain_response(
+                    journal,
+                    &claim.execution_id,
+                    Some(&evidence),
+                    err_str,
+                );
             }
 
             // 8. Success! Record started state
-            let _ = journal.record_launch_started(&claim.execution_id, &evidence);
+            if let Err(e) = journal.record_launch_started(&claim.execution_id, &evidence) {
+                return launch_uncertain_response(
+                    journal,
+                    &claim.execution_id,
+                    Some(&evidence),
+                    format!("Prompt was sent but durable started-state persistence failed: {}", e),
+                );
+            }
 
             json!({
                 "status": "ok",

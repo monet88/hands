@@ -26,7 +26,7 @@ Setup Options:
   --tool-policy <policy>        Tool policy (required, e.g. standard)
   --approval-policy <policy>    Approval policy (required, e.g. prompt)
   --target-id <id>              Target ID identifier (default: dir name)
-  --state-dir <dir>             Override per-user companion state directory
+  --state-dir <dir>             Override state directory (requires --skip-registry for setup)
   --skip-registry               Skip Windows Registry NativeMessagingHosts registration
 "#
     );
@@ -261,23 +261,43 @@ fn main() {
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--pairing-id" if i + 1 < args.len() => {
+                    "--pairing-id" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Error: --pairing-id requires a value");
+                            std::process::exit(1);
+                        }
                         pairing_id = Some(args[i + 1].clone());
                         i += 1;
                     }
-                    "--state-dir" if i + 1 < args.len() => {
+                    "--state-dir" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Error: --state-dir requires a value");
+                            std::process::exit(1);
+                        }
                         state_dir = Some(PathBuf::from(&args[i + 1]));
                         i += 1;
                     }
-                    _ => {}
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
+                    }
+                    other => {
+                        eprintln!("Unknown option for revoke: {}", other);
+                        print_help();
+                        std::process::exit(1);
+                    }
                 }
                 i += 1;
             }
 
             let pid = match pairing_id {
-                Some(id) => id,
+                Some(id) if !id.trim().is_empty() => id.trim().to_string(),
                 None => {
                     eprintln!("Error: --pairing-id <id> is required");
+                    std::process::exit(1);
+                }
+                Some(_) => {
+                    eprintln!("Error: --pairing-id <id> must not be empty or whitespace");
                     std::process::exit(1);
                 }
             };

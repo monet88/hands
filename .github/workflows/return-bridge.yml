@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04]
+        os: [windows-latest, macos-14, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -27,8 +27,8 @@ jobs:
       - name: Check bridge/native
         run: cargo check --manifest-path bridge/native/Cargo.toml
 
-      - name: Run deterministic host tests
-        run: cargo test --manifest-path bridge/native/Cargo.toml --test host_tests
+      - name: Run native deterministic tests
+        run: cargo test --manifest-path bridge/native/Cargo.toml
 
   extension-guards:
     runs-on: ubuntu-24.04
@@ -41,3 +41,6 @@ jobs:
 
       - name: Run extension guard tests
         run: bun extension/tests/extension_guards.test.mjs
+
+      - name: Run deterministic completion lifecycle probes
+        run: bun bridge/tests/lifecycle_probes.test.mjs

@@ -1,13 +1,108 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const HOST_NAME = "com.hands.return_bridge";
-const REPO_ROOT = "F:\\CodeBase\\hands\\issue-66-return-bridge-pairing";
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(SCRIPT_DIR, "..", "..");
 const EXTENSION_DIR = path.join(REPO_ROOT, "extension");
 const FIXTURES_DIR = path.join(EXTENSION_DIR, "tests", "fixtures");
+
+function resolveChromePath() {
+  const candidates = [
+    process.env.HANDS_RETURN_BRIDGE_CHROME_PATH,
+    process.env.CHROME_PATH,
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+    process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+  ].filter(Boolean);
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) {
+    throw new Error(
+      "Chrome not found. Set HANDS_RETURN_BRIDGE_CHROME_PATH or CHROME_PATH to chrome.exe."
+    );
+  }
+  return found;
+}
+
+async function waitForDevToolsPort(userDataDir, timeoutMs = 15000) {
+  const activePortFile = path.join(userDataDir, "DevToolsActivePort");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const firstLine = fs.readFileSync(activePortFile, "utf8").split(/\r?\n/, 1)[0];
+      const port = Number(firstLine);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) {
+        return port;
+      }
+    } catch {
+      // Chrome has not written DevToolsActivePort yet.
+    }
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for ${activePortFile}`);
+}
+
+function spawnChrome(chromePath, userDataDir, stateDir) {
+  try {
+    fs.rmSync(path.join(userDataDir, "DevToolsActivePort"), { force: true });
+  } catch {
+    // Ignore a stale-file cleanup miss; the subsequent wait still fails closed.
+  }
+  return spawn(chromePath, [
+    "--headless=new",
+    `--user-data-dir=${userDataDir}`,
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check"
+  ], {
+    stdio: "ignore",
+    env: stateDir ? { ...process.env, HANDS_RETURN_BRIDGE_STATE_DIR: stateDir } : process.env
+  });
+}
+
+function backupRegistryKey(regKey, backupPath) {
+  const psRegistryPath = `Registry::HKEY_CURRENT_USER\\${regKey.replace(/^HKCU\\/i, "")}`;
+  const check = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$p=${JSON.stringify(psRegistryPath)}; try { if (Test-Path -LiteralPath $p -ErrorAction Stop) { exit 0 } else { exit 2 } } catch { exit 1 }`
+    ],
+    { stdio: "ignore" }
+  );
+  if (check.status === 2) {
+    return false;
+  }
+  if (check.status !== 0) {
+    throw new Error(`Cannot determine whether native-host registry key exists safely: ${regKey}`);
+  }
+  execFileSync("reg.exe", ["export", regKey, backupPath, "/y"], { stdio: "ignore" });
+  return true;
+}
+
+function registerTestManifest(regKey, manifestPath) {
+  execFileSync(
+    "reg.exe",
+    ["add", regKey, "/ve", "/t", "REG_SZ", "/d", manifestPath, "/f"],
+    { stdio: "ignore" }
+  );
+}
+
+function restoreRegistryKey(regKey, backupPath, hadPriorKey) {
+  try {
+    execFileSync("reg.exe", ["delete", regKey, "/f"], { stdio: "ignore" });
+  } catch {
+    // Key may already be absent.
+  }
+  if (hadPriorKey) {
+    execFileSync("reg.exe", ["import", backupPath], { stdio: "ignore" });
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -152,9 +247,10 @@ async function main() {
   console.log("Real Browser-to-Native Boundary & Profile Isolation E2E Test");
   console.log("===============================================================");
 
-  if (!fs.existsSync(CHROME_PATH)) {
-    throw new Error(`Chrome not found at ${CHROME_PATH}`);
+  if (process.platform !== "win32") {
+    throw new Error("Real browser native-messaging E2E is Windows-only");
   }
+  const chromePath = resolveChromePath();
 
   // 1. Build companion binary
   console.log("[1/6] Building hands-return-bridge.exe...");
@@ -187,19 +283,11 @@ async function main() {
 
   // 3. Discover unpacked extension ID using Chrome CDP
   console.log("[3/6] Discovering unpacked extension ID via Chrome...");
-  const cdpPortDiscovery = 9249;
-  const chromeDiscovery = spawn(CHROME_PATH, [
-    "--headless=new",
-    `--user-data-dir=${profileAlphaDir}`,
-    `--remote-debugging-port=${cdpPortDiscovery}`,
-    "--no-first-run",
-    "--no-default-browser-check"
-  ], {
-    stdio: "ignore"
-  });
+  const chromeDiscovery = spawnChrome(chromePath, profileAlphaDir, null);
 
   let extId;
   try {
+    const cdpPortDiscovery = await waitForDevToolsPort(profileAlphaDir);
     const version = await waitForBrowserVersion(cdpPortDiscovery);
     extId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
     console.log(`      Discovered Extension ID: ${extId}`);
@@ -208,10 +296,22 @@ async function main() {
     await sleep(1000);
   }
 
-  // 4. Run real production native CLI setup with discovered extension-id & real registry registration
-  console.log("[4/6] Running production native CLI setup (with real registry registration)...");
-  const setupCmd = `"${exePath}" setup --browser chrome --profile profile_alpha --target "${REPO_ROOT}" --target-id hands --extension-id "${extId}" --policy-revision v1 --tool-policy standard --approval-policy prompt --state-dir "${stateDir}"`;
-  const setupOut = execSync(setupCmd, { encoding: "utf8" });
+  // 4. Run production setup in isolated state, then temporarily bridge the native-host registry.
+  // Registry state is exported before mutation and restored exactly in finally.
+  console.log("[4/6] Running isolated production setup and temporary registry bridge...");
+  const setupOut = execFileSync(exePath, [
+    "setup",
+    "--browser", "chrome",
+    "--profile", "profile_alpha",
+    "--target", REPO_ROOT,
+    "--target-id", "hands",
+    "--extension-id", extId,
+    "--policy-revision", "v1",
+    "--tool-policy", "standard",
+    "--approval-policy", "prompt",
+    "--state-dir", stateDir,
+    "--skip-registry"
+  ], { encoding: "utf8" });
 
   const tokenMatch = setupOut.match(/Bootstrap Token:\s+(rb_boot_[a-f0-9]+)/);
   const pairMatch = setupOut.match(/Pairing ID:\s+(pair_[a-f0-9]+)/);
@@ -232,28 +332,24 @@ async function main() {
   console.log(`      Bootstrap Token: ${bootstrapToken}`);
 
   const regKey = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${HOST_NAME}`;
+  const manifestPath = path.join(stateDir, `${HOST_NAME}.json`);
+  const registryBackupPath = path.join(testDir, "native-host-registry-backup.reg");
+  const hadPriorRegistryKey = backupRegistryKey(regKey, registryBackupPath);
   let pairingSecret = null;
 
   try {
+    registerTestManifest(regKey, manifestPath);
+
     // -------------------------------------------------------------
     // Phase 1: Real Chrome with Profile Alpha
     // -------------------------------------------------------------
     console.log("[5/6] Phase 1: Launching Chrome (Profile Alpha) for pairing activation & validation...");
-    const cdpPortAlpha = 9250;
-    const chromeAlpha = spawn(CHROME_PATH, [
-      "--headless=new",
-      `--user-data-dir=${profileAlphaDir}`,
-      `--remote-debugging-port=${cdpPortAlpha}`,
-      "--no-first-run",
-      "--no-default-browser-check"
-    ], {
-      stdio: "ignore",
-      env: { ...process.env, HANDS_RETURN_BRIDGE_STATE_DIR: stateDir }
-    });
+    const chromeAlpha = spawnChrome(chromePath, profileAlphaDir, stateDir);
 
     let alphaResult;
     const launchBoundaryTime = Date.now() - 2000;
     try {
+      const cdpPortAlpha = await waitForDevToolsPort(profileAlphaDir);
       const version = await waitForBrowserVersion(cdpPortAlpha);
       const loadedExtId = await loadUnpackedExtension(version.webSocketDebuggerUrl, testExtDir);
       if (loadedExtId !== extId) {
@@ -411,20 +507,11 @@ async function main() {
     // Phase 2: Real Chrome with Profile Beta (Distinct Profile Isolation - N4)
     // -------------------------------------------------------------
     console.log("[6/6] Phase 2: Testing Distinct Profile Isolation (N4) with Profile Beta...");
-    const cdpPortBeta = 9251;
-    const chromeBeta = spawn(CHROME_PATH, [
-      "--headless=new",
-      `--user-data-dir=${profileBetaDir}`,
-      `--remote-debugging-port=${cdpPortBeta}`,
-      "--no-first-run",
-      "--no-default-browser-check"
-    ], {
-      stdio: "ignore",
-      env: { ...process.env, HANDS_RETURN_BRIDGE_STATE_DIR: stateDir }
-    });
+    const chromeBeta = spawnChrome(chromePath, profileBetaDir, stateDir);
 
     let betaResult;
     try {
+      const cdpPortBeta = await waitForDevToolsPort(profileBetaDir);
       const versionBeta = await waitForBrowserVersion(cdpPortBeta);
       const betaExtId = await loadUnpackedExtension(versionBeta.webSocketDebuggerUrl, testExtDir);
 
@@ -457,20 +544,11 @@ async function main() {
     // Phase 3: Host Restart Persistence & Revocation
     // -------------------------------------------------------------
     console.log("      Phase 3: Testing Host Restart Persistence & Pairing Revocation...");
-    const cdpPortRevoke = 9252;
-    const chromeRevoke = spawn(CHROME_PATH, [
-      "--headless=new",
-      `--user-data-dir=${profileAlphaDir}`,
-      `--remote-debugging-port=${cdpPortRevoke}`,
-      "--no-first-run",
-      "--no-default-browser-check"
-    ], {
-      stdio: "ignore",
-      env: { ...process.env, HANDS_RETURN_BRIDGE_STATE_DIR: stateDir }
-    });
+    const chromeRevoke = spawnChrome(chromePath, profileAlphaDir, stateDir);
 
     let revokeResult;
     try {
+      const cdpPortRevoke = await waitForDevToolsPort(profileAlphaDir);
       const versionRevoke = await waitForBrowserVersion(cdpPortRevoke);
       const revokeExtId = await loadUnpackedExtension(versionRevoke.webSocketDebuggerUrl, testExtDir);
 
@@ -509,10 +587,14 @@ async function main() {
     console.log("===============================================================");
   } finally {
     try {
-      execSync(`reg.exe delete "${regKey}" /f`, { stdio: "ignore" });
-      console.log("Cleaned up Windows Registry key.");
-    } catch {
-      // Ignore
+      restoreRegistryKey(regKey, registryBackupPath, hadPriorRegistryKey);
+      console.log(hadPriorRegistryKey
+        ? "Restored pre-test Windows Registry key exactly from backup."
+        : "Removed test-only Windows Registry key (none existed before test)."
+      );
+    } catch (restoreErr) {
+      console.error("CRITICAL: failed to restore pre-test native-host registry state:", restoreErr.message);
+      throw restoreErr;
     }
 
     try {

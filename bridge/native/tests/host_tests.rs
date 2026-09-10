@@ -217,10 +217,16 @@ fn test_run_native_host_exact_origin_authority() {
 }
 
 #[test]
-fn test_resolve_state_dir_fails_closed_when_env_empty() {
+fn test_resolve_state_dir_explicit_override_is_absolute() {
     let dir = tempdir().unwrap();
     let res = resolve_state_dir(Some(dir.path())).unwrap();
+    assert!(res.is_absolute());
     assert_eq!(res, dir.path());
+
+    let relative = std::path::Path::new("bridge/native/relative-state-dir-probe");
+    let relative_res = resolve_state_dir(Some(relative)).unwrap();
+    assert!(relative_res.is_absolute());
+    assert_eq!(relative_res, std::env::current_dir().unwrap().join(relative));
 }
 #[test]
 fn test_setup_rejects_missing_explicit_options() {
@@ -268,6 +274,103 @@ fn test_setup_rejects_missing_explicit_options() {
     let mut opts = valid_opts.clone();
     opts.approval_policy = "".to_string();
     assert!(execute_setup(&opts).is_err(), "Empty approval_policy must be rejected");
+
+    // 6. Explicit target ID must not be empty or whitespace.
+    let mut opts = valid_opts.clone();
+    opts.target_id = Some("   \t".to_string());
+    let err = execute_setup(&opts).expect_err("Whitespace target_id must be rejected");
+    assert!(err.to_string().contains("--target-id"));
+}
+
+#[test]
+#[cfg(windows)]
+fn test_registered_setup_rejects_custom_state_dir_before_side_effects() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("must_not_be_created");
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+
+    let opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "test_profile_registered_state".to_string(),
+        target_path: target_dir.path().to_string_lossy().to_string(),
+        target_id: Some("test_target".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_registered_state".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    };
+
+    let err = execute_setup(&opts).expect_err("Registered setup must reject custom state dir");
+    assert!(err.to_string().contains("--state-dir is only supported with --skip-registry"));
+    assert!(!state_dir.exists(), "Rejected custom state dir must have zero durable side effects");
+}
+
+#[test]
+fn test_manifest_replacement_leaves_no_partial_temp_files() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+
+    let base = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_manifest_a".to_string(),
+        target_path: target_dir.path().to_string_lossy().to_string(),
+        target_id: Some("target_manifest_a".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "same_manifest_extension_id".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+
+    execute_setup(&base).expect("First setup must write manifest");
+    let mut second = base.clone();
+    second.profile_id = "profile_manifest_b".to_string();
+    second.target_id = Some("target_manifest_b".to_string());
+    execute_setup(&second).expect("Second compatible setup must atomically replace manifest");
+
+    let manifest_path = state_dir.join("com.hands.return_bridge.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["allowed_origins"][0], "chrome-extension://same_manifest_extension_id/");
+
+    let leftovers: Vec<_> = std::fs::read_dir(&state_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "Atomic manifest writes must not leave temp files: {leftovers:?}");
+}
+
+#[test]
+fn test_revoke_cli_rejects_unknown_and_missing_option_values() {
+    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+
+    let unknown = Command::new(bin)
+        .args(["revoke", "--pairing-id", "pair_x", "--bogus"])
+        .output()
+        .expect("revoke CLI must run");
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("Unknown option for revoke: --bogus"));
+
+    let missing = Command::new(bin)
+        .args(["revoke", "--state-dir"])
+        .output()
+        .expect("revoke CLI must run");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--state-dir requires a value"));
+
+    let whitespace = Command::new(bin)
+        .args(["revoke", "--pairing-id", "   "])
+        .output()
+        .expect("revoke CLI must run");
+    assert!(!whitespace.status.success());
+    assert!(String::from_utf8_lossy(&whitespace.stderr).contains("must not be empty or whitespace"));
 }
 #[test]
 fn test_setup_skip_registry_semantics() {

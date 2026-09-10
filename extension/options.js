@@ -16,32 +16,43 @@ document.addEventListener("DOMContentLoaded", async () => {
   const btnRevoke = document.getElementById("btnRevoke");
   const revokeMsg = document.getElementById("revokeMsg");
 
+  function showPairedDetails(state) {
+    pairingIdSpan.textContent = state.pairingId || "-";
+    policyRevSpan.textContent = state.policyRevision || "-";
+    targetsListSpan.textContent = state.targets?.map(t => `${t.name} (${t.canonical_path})`).join(", ") || "None";
+    pairFormCard.style.display = "none";
+    pairedInfoCard.style.display = "block";
+  }
+
   async function refreshUI() {
     pairMsg.textContent = "";
     revokeMsg.textContent = "";
 
+    let state = null;
     try {
-      const state = await chrome.runtime.sendMessage({ action: "getState" });
+      state = await chrome.runtime.sendMessage({ action: "getState" });
       const profileId = state?.profileId || "Unknown";
       profileIdSpan.textContent = profileId;
       if (extensionIdSpan) {
         extensionIdSpan.textContent = chrome.runtime.id;
       }
       if (setupCmdBlock) {
-        setupCmdBlock.textContent = `hands-return-bridge setup --target <path> --profile ${profileId} --extension-id ${chrome.runtime.id} --policy-revision v1 --tool-policy standard --approval-policy prompt`;
+        const platformInfo = await chrome.runtime.getPlatformInfo();
+        const registryArg = platformInfo?.os === "win" ? "" : " --skip-registry";
+        setupCmdBlock.textContent = `hands-return-bridge setup --target "<path>" --profile ${profileId} --extension-id ${chrome.runtime.id} --policy-revision v1 --tool-policy standard --approval-policy prompt${registryArg}`;
       }
       if (state && state.isPaired) {
         const status = await chrome.runtime.sendMessage({ action: "status" });
         if (status && status.status === "ok" && status.pairingStatus === "active") {
           statusSpan.textContent = "Paired & Active (Local Native Host Connected)";
           statusSpan.style.color = "#28a745";
-
-          pairingIdSpan.textContent = state.pairingId || "-";
-          policyRevSpan.textContent = state.policyRevision || "-";
-          targetsListSpan.textContent = state.targets?.map(t => `${t.name} (${t.canonical_path})`).join(", ") || "None";
-
-          pairFormCard.style.display = "none";
-          pairedInfoCard.style.display = "block";
+          showPairedDetails(state);
+          return;
+        }
+        if (!status || status.code !== "pairing_retired") {
+          statusSpan.textContent = "Paired — Native Host Unavailable: " + (status?.message || status?.code || "No status response");
+          statusSpan.style.color = "#dc3545";
+          showPairedDetails(state);
           return;
         }
       }
@@ -51,8 +62,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       pairFormCard.style.display = "block";
       pairedInfoCard.style.display = "none";
     } catch (err) {
-      statusSpan.textContent = "Error communicating with extension: " + err.message;
+      statusSpan.textContent = state?.isPaired
+        ? "Paired — Native Host Unavailable: " + err.message
+        : "Error communicating with extension: " + err.message;
       statusSpan.style.color = "#dc3545";
+      if (state?.isPaired) {
+        showPairedDetails(state);
+      }
     }
   }
 

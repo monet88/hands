@@ -43,11 +43,13 @@ impl std::fmt::Display for LauncherError {
 impl std::error::Error for LauncherError {}
 
 /// Pinned supported OMP CLI revision
-pub const SUPPORTED_OMP_REVISION: &str = "18.1.15";
+pub const SUPPORTED_OMP_REVISION: &str = "18.1.16";
 /// Exact verified OMP CLI version output shape
-pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/18.1.15";
+pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/18.1.16";
+/// Keep each Windows CreateProcess argv payload comfortably below the ~32K command-line ceiling.
+pub const ORCA_PROMPT_CHUNK_MAX_BYTES: usize = 8 * 1024;
 
-/// Validates exact verified OMP CLI version output shape ("omp/18.1.15")
+/// Validates exact verified OMP CLI version output shape ("omp/18.1.16")
 pub fn is_exact_supported_omp_version(output: &str) -> bool {
     output.trim() == SUPPORTED_OMP_CLI_SHAPE
 }
@@ -131,7 +133,6 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
   const adapterInstanceId = "adp_" + generateRandomHex(16);
   let initialSessionId: string | null = null;
   let isOwner: boolean | null = null;
-  let receiptCommitted = false;
   let completionCandidate: {
     turnId: number;
     text: string;
@@ -245,7 +246,7 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
       completionCandidate = null;
       return;
     }
-    // Fail closed if stop_hook_active is missing or not strictly boolean false (OMP 18.1.15 guarantees stop_hook_active: boolean)
+    // Fail closed if stop_hook_active is missing or not strictly boolean false (OMP 18.1.16 guarantees stop_hook_active: boolean)
     if (typeof event?.stop_hook_active !== "boolean" || event.stop_hook_active !== false) {
       completionCandidate = null;
       return;
@@ -307,7 +308,7 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
 
     const event = eventRaw as AgentEndEventLike | undefined;
     // Explicit terminal check: willContinue must be strictly boolean false,
-    // OR under verified OMP 18.1.15 provider lifecycle contract where agent-session.ts:3604
+    // OR under verified OMP 18.1.16 provider lifecycle contract where terminal agent_end
     // emits options?: { willContinue?: boolean } as undefined on terminal completion,
     // undefined is accepted ONLY when paired with a completionCandidate whose session_stop
     // event verified stop_hook_active === false and all required authority fields.
@@ -334,15 +335,16 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
       }
 
       const db = new Database(dbPath);
-      db.run("PRAGMA foreign_keys = ON;");
-      const timeoutMs = parseInt(process.env.HANDS_RETURN_BRIDGE_BUSY_TIMEOUT_MS || "5000", 10) || 5000;
-      db.run(`PRAGMA busy_timeout = ${timeoutMs};`);
+      try {
+        db.run("PRAGMA foreign_keys = ON;");
+        const timeoutMs = parseInt(process.env.HANDS_RETURN_BRIDGE_BUSY_TIMEOUT_MS || "5000", 10) || 5000;
+        db.run(`PRAGMA busy_timeout = ${timeoutMs};`);
 
-      // Test-only fault hook simulating SQLite SQLITE_FULL without filling physical disk
-      if (process.env.HANDS_RETURN_BRIDGE_FAULT_INJECT === "disk_full") {
-        db.run("PRAGMA max_page_count = 1;");
-      }
-      const tx = db.transaction(() => {
+        // Test-only fault hook simulating SQLite SQLITE_FULL without filling physical disk
+        if (process.env.HANDS_RETURN_BRIDGE_FAULT_INJECT === "disk_full") {
+          db.run("PRAGMA max_page_count = 1;");
+        }
+        const tx = db.transaction(() => {
         // Verify durable ownership claim in SQLite matches this adapter instance
         const claim = db
           .query(
@@ -388,11 +390,9 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
 
         if (existing) {
           if (existing.content_digest === digest) {
-            receiptCommitted = true;
             return;
           } else {
             // Conflict: different digest for same execution -> reject explicitly and never overwrite
-            receiptCommitted = false;
             console.error(
               `[ReturnBridge] Conflict: execution ${executionId} already has receipt ${existing.receipt_id} with conflicting digest ${existing.content_digest} vs ${digest}`
             );
@@ -435,12 +435,12 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
           "UPDATE launch_attempts SET state = 'completed' WHERE execution_id = ?",
           [executionId]
         );
+        });
 
-        receiptCommitted = true;
-      });
-
-      tx.immediate();
-      db.close();
+        tx.immediate();
+      } finally {
+        db.close();
+      }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith("payload_conflict")) {
         throw err;
@@ -468,11 +468,7 @@ pub fn resolve_omp_binary() -> String {
     if let Ok(bin) = std::env::var("HANDS_RETURN_BRIDGE_OMP_BIN") {
         let trimmed = bin.trim();
         if !trimmed.is_empty() {
-            if trimmed.contains(' ') && !trimmed.starts_with('"') {
-                return format!("\"{}\"", trimmed.replace('\\', "/"));
-            } else {
-                return trimmed.to_string();
-            }
+            return trimmed.trim_matches('"').trim_matches('\'').to_string();
         }
     }
     "omp".to_string()
@@ -503,6 +499,12 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
         .args(["terminal", "wait", "--help"])
         .output()
         .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute 'orca terminal wait --help': {}", e)))?;
+    if !orca_wait_help.status.success() {
+        return Err(LauncherError::PreflightFailed(format!(
+            "'orca terminal wait --help' failed with exit code: {:?}",
+            orca_wait_help.status.code()
+        )));
+    }
     let wait_text = String::from_utf8_lossy(&orca_wait_help.stdout);
     if !wait_text.contains("--for") || !wait_text.contains("tui-idle") {
         return Err(LauncherError::PreflightFailed(
@@ -515,6 +517,12 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
         .args(["terminal", "send", "--help"])
         .output()
         .map_err(|e| LauncherError::PreflightFailed(format!("Failed to execute 'orca terminal send --help': {}", e)))?;
+    if !orca_send_help.status.success() {
+        return Err(LauncherError::PreflightFailed(format!(
+            "'orca terminal send --help' failed with exit code: {:?}",
+            orca_send_help.status.code()
+        )));
+    }
     let send_text = String::from_utf8_lossy(&orca_send_help.stdout);
     if !send_text.contains("--text") || !send_text.contains("--enter") {
         return Err(LauncherError::PreflightFailed(
@@ -576,29 +584,45 @@ pub fn build_omp_startup_command_with_env(
     execution_id: Option<&str>,
     state_dir: Option<&Path>,
 ) -> Result<String, LauncherError> {
-    let omp_bin = resolve_omp_binary();
+    build_omp_startup_command_with_env_and_bin(adapter_path, execution_id, state_dir, None)
+}
+
+/// Pure builder variant used by tests and callers that already resolved an OMP binary.
+pub fn build_omp_startup_command_with_env_and_bin(
+    adapter_path: &Path,
+    execution_id: Option<&str>,
+    state_dir: Option<&Path>,
+    omp_bin_override: Option<&str>,
+) -> Result<String, LauncherError> {
+    let omp_bin = omp_bin_override
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .unwrap_or_else(resolve_omp_binary);
     let mut parts = Vec::new();
 
     if let Some(dir) = state_dir {
         parts.push(format!(
-            "$env:HANDS_RETURN_BRIDGE_STATE_DIR=\"{}\";",
-            dir.to_string_lossy().replace('\\', "/")
+            "$env:HANDS_RETURN_BRIDGE_STATE_DIR={};",
+            powershell_single_quoted(&dir.to_string_lossy().replace('\\', "/"))
         ));
     }
     if let Some(exec_id) = execution_id {
         parts.push(format!(
-            "$env:HANDS_RETURN_BRIDGE_EXECUTION_ID=\"{}\";",
-            exec_id
+            "$env:HANDS_RETURN_BRIDGE_EXECUTION_ID={};",
+            powershell_single_quoted(exec_id)
         ));
     }
 
     // PowerShell call operator '&' ensures executable paths (whether quoted with spaces or plain tokens) execute properly
     parts.push("&".to_string());
-    parts.push(omp_bin);
+    parts.push(powershell_single_quoted(&omp_bin.replace('\\', "/")));
     parts.push("-e".to_string());
-    parts.push(format!("\"{}\"", adapter_path.to_string_lossy().replace('\\', "/")));
+    parts.push(powershell_single_quoted(&adapter_path.to_string_lossy().replace('\\', "/")));
 
     Ok(parts.join(" "))
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Invokes public Orca CLI to create terminal in canonical target workspace
@@ -714,22 +738,26 @@ pub fn wait_orca_terminal_idle(terminal_handle: &str, timeout_ms: u64) -> Result
     Ok(())
 }
 
-/// Sends exact bounded task prompt as literal text data to terminal via Command argv
-pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) -> Result<(), LauncherError> {
-    let text_arg = format!("--text={}", literal_prompt);
-    let output = Command::new("orca")
-        .args([
-            "terminal",
-            "send",
-            "--terminal",
-            terminal_handle,
-            &text_arg,
-            "--enter",
-            "--json",
-        ])
-        .output()
-        .map_err(|e| LauncherError::OrcaExecutionUncertain(format!("Failed to spawn orca terminal send: {}", e)))?;
+pub fn split_prompt_for_orca(literal_prompt: &str) -> Vec<&str> {
+    if literal_prompt.is_empty() {
+        return Vec::new();
+    }
 
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < literal_prompt.len() {
+        let mut end = std::cmp::min(start + ORCA_PROMPT_CHUNK_MAX_BYTES, literal_prompt.len());
+        while end > start && !literal_prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        debug_assert!(end > start, "chunk bound is larger than any UTF-8 scalar");
+        chunks.push(&literal_prompt[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn verify_orca_send_output(output: std::process::Output, operation: &str) -> Result<(), LauncherError> {
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
         let out_msg = String::from_utf8_lossy(&output.stdout);
@@ -739,7 +767,7 @@ pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) ->
             out_msg.trim()
         };
         return Err(LauncherError::OrcaExecutionUncertain(format!(
-            "Orca terminal send returned exit code {:?}: {}",
+            "Orca terminal send ({operation}) returned exit code {:?}: {}",
             output.status.code(),
             detail
         )));
@@ -747,12 +775,34 @@ pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) ->
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let val: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-        LauncherError::OrcaExecutionUncertain(format!("Failed to parse Orca terminal send JSON: {}. Output was: {}", e, stdout_str))
+        LauncherError::OrcaExecutionUncertain(format!(
+            "Failed to parse Orca terminal send ({operation}) JSON: {}. Output was: {}",
+            e, stdout_str
+        ))
     })?;
-
     if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        return Err(LauncherError::OrcaExecutionUncertain(format!("Orca terminal send response not ok: {}", stdout_str)));
+        return Err(LauncherError::OrcaExecutionUncertain(format!(
+            "Orca terminal send ({operation}) response not ok: {}",
+            stdout_str
+        )));
+    }
+    Ok(())
+}
+
+/// Sends exact bounded task prompt as small literal argv chunks, then submits one Enter.
+pub fn send_orca_terminal_prompt(terminal_handle: &str, literal_prompt: &str) -> Result<(), LauncherError> {
+    for chunk in split_prompt_for_orca(literal_prompt) {
+        let text_arg = format!("--text={chunk}");
+        let output = Command::new("orca")
+            .args(["terminal", "send", "--terminal", terminal_handle, &text_arg, "--json"])
+            .output()
+            .map_err(|e| LauncherError::OrcaExecutionUncertain(format!("Failed to spawn orca terminal text send: {}", e)))?;
+        verify_orca_send_output(output, "text chunk")?;
     }
 
-    Ok(())
+    let output = Command::new("orca")
+        .args(["terminal", "send", "--terminal", terminal_handle, "--enter", "--json"])
+        .output()
+        .map_err(|e| LauncherError::OrcaExecutionUncertain(format!("Failed to spawn orca terminal Enter send: {}", e)))?;
+    verify_orca_send_output(output, "final Enter")
 }

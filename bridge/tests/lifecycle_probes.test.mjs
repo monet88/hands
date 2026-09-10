@@ -125,14 +125,14 @@ function createTempTestEnvironment() {
     `INSERT INTO pairings VALUES ('pair_1', 'boot_hash', 'sec_hash', 'chrome', 'prof_1', 'active', 'v1', ?, ?)`,
     [now, now]
   );
-  db.run(`INSERT INTO targets VALUES ('pair_1', 't_1', 'F:/CodeBase/test', 'test')`);
+  db.run(`INSERT INTO targets VALUES ('pair_1', 't_1', 'test_target_path', 'test')`);
   db.run(`INSERT INTO policies VALUES ('pair_1', 'v1', 'standard', 'prompt')`);
 
   function seedLaunchRequest(execId, reqId, retToken) {
     db.run(
       `INSERT INTO launch_requests VALUES (
         'pair_1', ?, ?, ?, 'conv_123', 'https://chatgpt.com/c/conv_123',
-        'thash', 'ahash', 't_1', 'F:/CodeBase/test',
+        'thash', 'ahash', 't_1', 'test_target_path',
         'v1', 'standard', 'prompt', 'Do task', 'pdigest', 'claimed', ?, ?
       )`,
       [reqId, execId, retToken, now, now]
@@ -407,11 +407,13 @@ async function runLifecycleTests() {
       "willContinue: true must NOT commit completion receipt"
     );
 
-    // 4b: Ambiguous willContinue: undefined must fail closed (0 receipts)
+    // 4b: OMP 18.1.16 terminal agent_end uses willContinue: undefined.
+    // It is accepted only when paired with session_stop.stop_hook_active === false.
     await pi.emit("session_stop", {
       turn_id: 1,
       last_assistant_message: normalMsg,
       messages: [normalMsg],
+      stop_hook_active: false,
     }, ctx);
     await pi.emit("agent_end", {
       messages: [normalMsg],
@@ -419,28 +421,40 @@ async function runLifecycleTests() {
     }, ctx);
     assert.equal(
       env.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execId).length,
-      0,
-      "willContinue: undefined must NOT commit completion receipt"
+      1,
+      "OMP 18.1.16 terminal undefined + stop_hook_active:false must commit exactly one receipt"
     );
 
     // 4c: Ambiguous willContinue: string "false" (non-boolean) must fail closed (0 receipts)
-    await pi.emit("session_stop", {
-      turn_id: 2,
+    const envString = createTempTestEnvironment();
+    const execString = "exec_l4_string_false";
+    envString.seedLaunchRequest(execString, "req_l4_string", "ret_l4_string");
+    const adapterString = await loadAdapter(envString.adapterPath, {
+      HANDS_RETURN_BRIDGE_EXECUTION_ID: execString,
+      HANDS_RETURN_BRIDGE_STATE_DIR: envString.tempDir,
+    });
+    const piString = createMockPi();
+    adapterString(piString);
+    const ctxString = createMockCtx("sess_l4_string");
+    await piString.emit("agent_start", {}, ctxString);
+    await piString.emit("turn_start", { turnIndex: 0 }, ctxString);
+    await piString.emit("session_stop", {
+      turn_id: 0,
       last_assistant_message: normalMsg,
       messages: [normalMsg],
       stop_hook_active: false,
-    }, ctx);
-    await pi.emit("agent_end", {
+    }, ctxString);
+    await piString.emit("agent_end", {
       messages: [normalMsg],
       willContinue: "false",
-    }, ctx);
+    }, ctxString);
     assert.equal(
-      env.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execId).length,
+      envString.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execString).length,
       0,
       "willContinue: 'false' (string) must NOT commit completion receipt"
     );
 
-    console.log("  [PASS] L4: willContinue: true correctly defers, ambiguous values fail closed");
+    console.log("  [PASS] L4: continuation defers, exact OMP terminal undefined commits, malformed values fail closed");
   }
 
   // -------------------------------------------------------------
@@ -1066,7 +1080,7 @@ process.kill(process.pid, 9);
   // -------------------------------------------------------------
   // Real OMP Process Probe: multiple tool rounds -> exactly one receipt
   // -------------------------------------------------------------
-  {
+  if (process.env.HANDS_RETURN_BRIDGE_RUN_REAL_OMP === "1") {
     console.log("-> Testing Real OMP process execution with multiple tool rounds...");
     const env = createTempTestEnvironment();
     const execId = "exec_real_omp_" + Date.now();
@@ -1105,6 +1119,8 @@ process.kill(process.pid, 9);
     assert.equal(reqRow.state, "completed");
 
     console.log("  [PASS] Real OMP process execution produced exactly one Completion Receipt!");
+  } else {
+    console.log("  [SKIP] Real OMP process probe (set HANDS_RETURN_BRIDGE_RUN_REAL_OMP=1 to run)");
   }
 
   console.log("\n=== ALL L1-L6, W3, S1-S3 Lifecycle Probes PASSED CLEANLY! ===");

@@ -1,10 +1,16 @@
 use std::io::Cursor;
 use tempfile::tempdir;
 
-use hands_return_bridge::journal::{Journal, PolicyRecord, TargetRecord};
+fn live_launcher_tests_enabled() -> bool {
+    std::env::var("HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS").as_deref() == Ok("1")
+}
+
+use hands_return_bridge::journal::{Journal, LaunchRequestParams, PolicyRecord, TargetRecord};
 use hands_return_bridge::launcher::{
-    build_omp_startup_command_with_env, ensure_adapter_file, is_exact_supported_omp_version,
-    COMPANION_ADAPTER_REVISION, SUPPORTED_OMP_CLI_SHAPE, SUPPORTED_OMP_REVISION,
+    build_omp_startup_command_with_env, build_omp_startup_command_with_env_and_bin,
+    ensure_adapter_file, is_exact_supported_omp_version, split_prompt_for_orca,
+    COMPANION_ADAPTER_REVISION, ORCA_PROMPT_CHUNK_MAX_BYTES, SUPPORTED_OMP_CLI_SHAPE,
+    SUPPORTED_OMP_REVISION,
 };
 use hands_return_bridge::protocol::{
     handle_native_message, read_native_message, write_native_message,
@@ -49,7 +55,7 @@ fn test_closed_operation_set_and_security_guards() {
     let profile_id = "prof_a";
     let targets = vec![TargetRecord {
         target_id: "target_hands".to_string(),
-        canonical_path: "F:\\CodeBase\\hands".to_string(),
+        canonical_path: "test_target_closed_ops".to_string(),
         name: "hands".to_string(),
     }];
     let policy = PolicyRecord {
@@ -203,7 +209,7 @@ fn test_unapproved_fields_rejected_on_valid_ops() {
     let profile_id = "profile_field";
     let targets = vec![TargetRecord {
         target_id: "target_canonical".to_string(),
-        canonical_path: "F:\\CodeBase\\hands".to_string(),
+        canonical_path: "test_target_field_guard".to_string(),
         name: "hands".to_string(),
     }];
     let policy = PolicyRecord {
@@ -474,13 +480,13 @@ fn test_omp_startup_command_shape() {
     use std::path::Path;
     use hands_return_bridge::launcher::build_omp_startup_command;
 
-    let adapter_path = Path::new("F:/CodeBase/test/adapter.ts");
+    let adapter_path = Path::new("C:/portable test/adapter.ts");
 
     // Normal OMP startup command: call operator '&', binary, -e with adapter path
     // Preserves user's normal OMP configuration (does NOT pass --no-extensions, --no-skills, --no-rules, --no-prewalk, --tools, --approval-mode)
     let cmd = build_omp_startup_command(adapter_path).unwrap();
     assert!(cmd.starts_with("& "), "Command must start with call operator '&': {}", cmd);
-    assert!(cmd.contains("-e \"F:/CodeBase/test/adapter.ts\""), "Command must load companion adapter: {}", cmd);
+    assert!(cmd.contains("-e 'C:/portable test/adapter.ts'"), "Command must load companion adapter: {}", cmd);
     assert!(!cmd.contains("--no-extensions"), "Command must not suppress normal extensions: {}", cmd);
     assert!(!cmd.contains("--no-skills"), "Command must not suppress normal skills: {}", cmd);
     assert!(!cmd.contains("--no-rules"), "Command must not suppress normal rules: {}", cmd);
@@ -549,7 +555,7 @@ fn test_uncertainty_and_recovery_semantics() {
     let second_attempt = journal.mark_launch_attempt(&claim.execution_id, pairing_id).unwrap();
     assert!(!second_attempt, "Second launch attempt must fail closed");
 
-    // 4. Same request replayed returns SAME execution, isReplayed: true, state: unknown
+    // 4. Same unresolved request replayed returns SAME execution but MUST NOT report success.
     let replay_msg = json!({
         "op": "launch",
         "pairingId": pairing_id,
@@ -565,7 +571,8 @@ fn test_uncertainty_and_recovery_semantics() {
         "promptText": "Uncertainty test prompt"
     });
     let replay_resp = handle_native_message(&replay_msg, &journal);
-    assert_eq!(replay_resp["status"], "ok");
+    assert_eq!(replay_resp["status"], "error");
+    assert_eq!(replay_resp["code"], "launch_unresolved");
     assert_eq!(replay_resp["isReplayed"], true);
     assert_eq!(replay_resp["executionId"], claim.execution_id);
     assert_eq!(replay_resp["state"], "unknown");
@@ -614,9 +621,65 @@ fn test_uncertainty_and_recovery_semantics() {
         "promptText": "Uncertainty test 2"
     });
     let replay2_resp = handle_native_message(&replay2_msg, &journal);
-    assert_eq!(replay2_resp["status"], "ok");
+    assert_eq!(replay2_resp["status"], "error");
+    assert_eq!(replay2_resp["code"], "launch_unresolved");
     assert_eq!(replay2_resp["isReplayed"], true);
     assert_eq!(replay2_resp["executionId"], claim2.execution_id);
+}
+
+#[test]
+fn test_claimed_replay_is_not_reported_as_started_or_ok() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let pairing_id = "pair_claimed_replay";
+    let bootstrap_token = "boot_claimed_replay";
+    let profile_id = "prof_claimed_replay";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_claimed".into(), canonical_path, name: "target_claimed".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_claimed_replay".into(),
+        origin_conversation_id: "c_claimed".into(),
+        origin_conversation_url: "https://chatgpt.com/c/c_claimed".into(),
+        transcript_evidence_hash: "hash_t_claimed".into(),
+        account_evidence_hash: "hash_a_claimed".into(),
+        target_id: "target_claimed".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "claimed replay must remain unresolved".into(),
+    };
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+    assert_eq!(claim.state, "claimed");
+
+    let replay = handle_native_message(&json!({
+        "op": "launch",
+        "pairingId": pairing_id,
+        "pairingSecret": activated.pairing_secret,
+        "profileId": profile_id,
+        "launchRequestId": params.launch_request_id,
+        "originConversationId": params.origin_conversation_id,
+        "originConversationUrl": params.origin_conversation_url,
+        "transcriptEvidenceHash": params.transcript_evidence_hash,
+        "accountEvidenceHash": params.account_evidence_hash,
+        "targetId": params.target_id,
+        "requestedPolicyRevision": params.policy_revision,
+        "promptText": params.prompt_text,
+    }), &journal);
+    assert_eq!(replay["status"], "error");
+    assert_eq!(replay["code"], "launch_unresolved");
+    assert_eq!(replay["isReplayed"], true);
+    assert_eq!(replay["state"], "claimed");
+    assert_eq!(replay["executionId"], claim.execution_id);
 }
 
 #[test]
@@ -798,14 +861,14 @@ fn test_multi_process_native_host_convergence() {
         let body = serde_json::to_vec(msg).unwrap();
         let len = body.len() as u32;
         let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(&len.to_ne_bytes()).unwrap();
+        stdin.write_all(&len.to_le_bytes()).unwrap();
         stdin.write_all(&body).unwrap();
         stdin.flush().unwrap();
 
         let stdout = child.stdout.as_mut().unwrap();
         let mut len_buf = [0u8; 4];
         stdout.read_exact(&mut len_buf).unwrap();
-        let resp_len = u32::from_ne_bytes(len_buf) as usize;
+        let resp_len = u32::from_le_bytes(len_buf) as usize;
         let mut resp_buf = vec![0u8; resp_len];
         stdout.read_exact(&mut resp_buf).unwrap();
         serde_json::from_slice(&resp_buf).unwrap()
@@ -824,8 +887,24 @@ fn test_multi_process_native_host_convergence() {
     let resp2 = t2.join().unwrap();
     eprintln!("resp1 = {}", resp1);
     eprintln!("resp2 = {}", resp2);
-    assert!(resp1["status"] == "ok" || resp1["code"] == "launch_uncertain" || resp1["code"] == "orca_spawn_failed", "resp1 was: {}", resp1);
-    assert!(resp2["status"] == "ok" || resp2["code"] == "launch_uncertain" || resp2["code"] == "orca_spawn_failed", "resp2 was: {}", resp2);
+    assert!(
+        resp1["status"] == "ok"
+            || resp1["code"] == "launch_unresolved"
+            || resp1["code"] == "launch_uncertain"
+            || resp1["code"] == "preflight_failed"
+            || resp1["code"] == "orca_spawn_failed",
+        "resp1 was: {}",
+        resp1
+    );
+    assert!(
+        resp2["status"] == "ok"
+            || resp2["code"] == "launch_unresolved"
+            || resp2["code"] == "launch_uncertain"
+            || resp2["code"] == "preflight_failed"
+            || resp2["code"] == "orca_spawn_failed",
+        "resp2 was: {}",
+        resp2
+    );
 
     // Both processes MUST converge on the exact same executionId!
     let exec_id_1 = resp1.get("executionId").and_then(|v| v.as_str());
@@ -844,6 +923,11 @@ fn test_multi_process_native_host_convergence() {
 fn test_launch_preflight_check() {
     use hands_return_bridge::launcher::verify_launch_preflight;
 
+    if !live_launcher_tests_enabled() {
+        eprintln!("SKIP live launcher preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
+        return;
+    }
+
     // Default preflight against system CLI
     let res = verify_launch_preflight(None);
     assert!(res.is_ok(), "Preflight should succeed on system with orca and omp installed: {:?}", res);
@@ -858,8 +942,8 @@ fn test_launch_preflight_check() {
 #[test]
 fn test_resolve_omp_binary_shapes() {
     use hands_return_bridge::launcher::{
-        build_omp_startup_command, ensure_adapter_file, launch_orca_terminal,
-        resolve_omp_binary, verify_launch_preflight, wait_orca_terminal_idle,
+        ensure_adapter_file, launch_orca_terminal,
+        verify_launch_preflight, wait_orca_terminal_idle,
     };
     use std::path::Path;
     use std::process::Command;
@@ -867,93 +951,65 @@ fn test_resolve_omp_binary_shapes() {
 
     let dir = tempdir().unwrap();
     let adapter_path = ensure_adapter_file(dir.path()).unwrap();
-    let target_worktree = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
 
-    // 1. Default token shape ("omp") - verify string shape AND actual compatibility preflight
-    std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
-    assert_eq!(resolve_omp_binary(), "omp");
-    let token_preflight = verify_launch_preflight(Some("omp"));
-    assert!(
-        token_preflight.is_ok(),
-        "Preflight for wrapper token 'omp' must succeed: {:?}",
-        token_preflight
-    );
+    // 1. Wrapper token shape ("omp") is always checked as a pure command builder.
+    let cmd_wrapper = build_omp_startup_command_with_env_and_bin(
+        &adapter_path, None, None, Some("omp")
+    ).unwrap();
+    assert!(cmd_wrapper.contains("& 'omp' -e '"));
 
-    // 1b. Real Orca launch-shape acceptance for wrapper token ("omp") reaching tui-idle without model prompt
-    let cmd_wrapper = build_omp_startup_command(&adapter_path).unwrap();
-    let evidence_wrapper = launch_orca_terminal(&target_worktree, &cmd_wrapper, "test_shape_wrap")
-        .expect("Launch owned OMP terminal for wrapper shape must succeed");
-    let handle_wrapper = evidence_wrapper
-        .orca_terminal_handle
-        .as_deref()
-        .expect("Terminal handle must be present");
-    let wait_wrapper = wait_orca_terminal_idle(handle_wrapper, 15000);
-    // Always clean up test-owned terminal before asserting
-    let _ = Command::new("orca")
-        .args(["terminal", "close", "--terminal", handle_wrapper, "--json"])
-        .output();
-    assert!(
-        wait_wrapper.is_ok(),
-        "Wrapper shape 'omp' must reach real tui-idle session: {:?}",
-        wait_wrapper
-    );
+    // 2. Executable path with spaces is rendered as a PowerShell single-quoted command literal.
+    let dummy_adapter = Path::new("C:/temp/adapter.ts");
+    let cmd = build_omp_startup_command_with_env_and_bin(
+        dummy_adapter,
+        None,
+        None,
+        Some("C:\\Program Files\\OMP Tools\\omp.exe"),
+    ).unwrap();
+    assert!(cmd.starts_with("& 'C:/Program Files/OMP Tools/omp.exe' -e 'C:/temp/adapter.ts'"));
 
-    // 2. Direct executable path shape - verify string shape AND actual compatibility preflight
-    let direct_bin = "C:\\Users\\monet\\.bun\\bin\\omp.exe";
-    std::env::set_var("HANDS_RETURN_BRIDGE_OMP_BIN", direct_bin);
-    assert_eq!(resolve_omp_binary(), direct_bin);
-    if Path::new(direct_bin).exists() {
-        let direct_preflight = verify_launch_preflight(Some(direct_bin));
+    // 3. PowerShell metacharacters remain literal inside single-quoted values.
+    let quoted_cmd = build_omp_startup_command_with_env_and_bin(
+        Path::new("C:/tmp/$adapter/O'Brien/adapter.ts"),
+        Some("exec_$literal'O"),
+        Some(Path::new("C:/state/$literal/O'Brien")),
+        Some("C:/Program Files/OMP $Tools/O'Brien/omp.exe"),
+    ).unwrap();
+    assert!(quoted_cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID='exec_$literal''O';"));
+    assert!(quoted_cmd.contains("$env:HANDS_RETURN_BRIDGE_STATE_DIR='C:/state/$literal/O''Brien';"));
+    assert!(quoted_cmd.contains("& 'C:/Program Files/OMP $Tools/O''Brien/omp.exe'"));
+    assert!(quoted_cmd.contains("-e 'C:/tmp/$adapter/O''Brien/adapter.ts'"));
+
+    if live_launcher_tests_enabled() {
+        let target_worktree = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let token_preflight = verify_launch_preflight(Some("omp"));
         assert!(
-            direct_preflight.is_ok(),
-            "Preflight for direct executable '{}' must succeed: {:?}",
-            direct_bin,
-            direct_preflight
+            token_preflight.is_ok(),
+            "Preflight for wrapper token 'omp' must succeed: {:?}",
+            token_preflight
         );
 
-        // 2b. Real Orca launch-shape acceptance for direct binary reaching tui-idle without model prompt
-        let cmd_direct = build_omp_startup_command(&adapter_path).unwrap();
-        let evidence_direct = launch_orca_terminal(&target_worktree, &cmd_direct, "test_shape_dir")
-            .expect("Launch owned OMP terminal for direct binary shape must succeed");
-        let handle_direct = evidence_direct
+        let evidence_wrapper = launch_orca_terminal(&target_worktree, &cmd_wrapper, "test_shape_wrap")
+            .expect("Launch owned OMP terminal for wrapper shape must succeed");
+        let handle_wrapper = evidence_wrapper
             .orca_terminal_handle
             .as_deref()
             .expect("Terminal handle must be present");
-        let wait_direct = wait_orca_terminal_idle(handle_direct, 15000);
-        // Always clean up test-owned terminal before asserting
+        let wait_wrapper = wait_orca_terminal_idle(handle_wrapper, 15000);
         let _ = Command::new("orca")
-            .args(["terminal", "close", "--terminal", handle_direct, "--json"])
+            .args(["terminal", "close", "--terminal", handle_wrapper, "--json"])
             .output();
         assert!(
-            wait_direct.is_ok(),
-            "Direct binary '{}' must reach real tui-idle session: {:?}",
-            direct_bin,
-            wait_direct
+            wait_wrapper.is_ok(),
+            "Wrapper shape 'omp' must reach real tui-idle session: {:?}",
+            wait_wrapper
         );
     }
-
-    // 3. Executable path with spaces (must be safely quoted)
-    std::env::set_var(
-        "HANDS_RETURN_BRIDGE_OMP_BIN",
-        "C:\\Program Files\\OMP Tools\\omp.exe",
-    );
-    assert_eq!(
-        resolve_omp_binary(),
-        "\"C:/Program Files/OMP Tools/omp.exe\""
-    );
-
-    // 4. Verify startup command with quoted binary
-    let dummy_adapter = Path::new("C:/temp/adapter.ts");
-    let cmd = build_omp_startup_command(dummy_adapter).unwrap();
-    assert!(cmd.starts_with("& \"C:/Program Files/OMP Tools/omp.exe\" -e \"C:/temp/adapter.ts\""));
-
-    // 5. Clean up env
-    std::env::remove_var("HANDS_RETURN_BRIDGE_OMP_BIN");
 
     // 6. Security guard: browser messages must NEVER be able to provide or override executable/bin
     let db_path = dir.path().join("journal.sqlite");
@@ -977,6 +1033,20 @@ fn test_resolve_omp_binary_shapes() {
     assert_eq!(resp["status"], "error");
     assert_eq!(resp["code"], "unauthorized_override");
 }
+
+#[test]
+fn test_large_prompt_chunking_preserves_utf8_exactly() {
+    let prompt = format!(
+        "{}{}{}",
+        "a".repeat(ORCA_PROMPT_CHUNK_MAX_BYTES - 2),
+        "界".repeat(5000),
+        "tail-$literal-'quote'"
+    );
+    let chunks = split_prompt_for_orca(&prompt);
+    assert!(chunks.len() > 1);
+    assert!(chunks.iter().all(|chunk| chunk.len() <= ORCA_PROMPT_CHUNK_MAX_BYTES));
+    assert_eq!(chunks.concat(), prompt);
+}
 #[test]
 fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     let dir = tempfile::tempdir().unwrap();
@@ -987,7 +1057,9 @@ fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     let bootstrap_token = "boot_unsupp_policy";
     let profile_id = "profile_alpha";
 
-    let target_canonical = "\\\\?\\F:\\CodeBase\\hands\\issue-66-return-bridge-pairing".to_string();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let target_canonical = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
     let targets = vec![hands_return_bridge::journal::TargetRecord {
         target_id: "hands".to_string(),
         canonical_path: target_canonical,
@@ -1096,9 +1168,11 @@ fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
         ).unwrap();
     }
 
-    // Replay MUST return the accepted execution without running preflight/target/policy validation again
+    // Replay preserves the accepted execution identity without revalidating policy,
+    // but an unresolved durable state must not masquerade as a successful launch.
     let replay_resp = handle_native_message(&launch_msg, &journal);
-    assert_eq!(replay_resp["status"], "ok");
+    assert_eq!(replay_resp["status"], "error");
+    assert_eq!(replay_resp["code"], "launch_unresolved");
     assert_eq!(replay_resp["isReplayed"], true);
     assert_eq!(replay_resp["executionId"], accepted_exec_id);
     assert_eq!(replay_resp["returnToken"], accepted_ret_token);
@@ -1212,19 +1286,24 @@ fn test_adapter_v3_generation_and_revision() {
         Some("exec_test_rev3"),
         Some(dir.path()),
     ).unwrap();
-    assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID=\"exec_test_rev3\";"));
+    assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID='exec_test_rev3';"));
     assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_STATE_DIR="));
-    assert!(cmd.contains("-e \""));
-    assert!(cmd.contains("adapter.ts\""));
+    assert!(cmd.contains("-e '"));
+    assert!(cmd.contains("adapter.ts'"));
 }
 
 #[test]
 fn test_launch_preflight_supported_omp_revision_pin() {
     use hands_return_bridge::launcher::verify_launch_preflight;
-    assert_eq!(SUPPORTED_OMP_REVISION, "18.1.15");
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.15");
+    assert_eq!(SUPPORTED_OMP_REVISION, "18.1.16");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
 
-    // Default preflight against system OMP (18.1.15) must succeed
+    if !live_launcher_tests_enabled() {
+        eprintln!("SKIP live OMP revision preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
+        return;
+    }
+
+    // Default preflight against system OMP (18.1.16) must succeed
     let res = verify_launch_preflight(None);
     assert!(res.is_ok(), "Preflight should succeed with exact supported OMP revision: {:?}", res);
 
@@ -1237,44 +1316,49 @@ fn test_launch_preflight_supported_omp_revision_pin() {
     assert!(bad_ver_res.is_err(), "Preflight must fail closed for unsupported OMP revision");
     let err_msg = bad_ver_res.unwrap_err().to_string();
     assert!(err_msg.contains("Unsupported OMP revision"), "Error should report revision mismatch: {}", err_msg);
-    assert!(err_msg.contains("omp/18.1.15"), "Error should name expected revision omp/18.1.15: {}", err_msg);
+    assert!(err_msg.contains("omp/18.1.16"), "Error should name expected revision omp/18.1.16: {}", err_msg);
 }
 
 #[test]
 fn test_exact_supported_omp_version_matching() {
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.15");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
 
     // Exact match must pass
-    assert!(is_exact_supported_omp_version("omp/18.1.15"));
-    assert!(is_exact_supported_omp_version("omp/18.1.15\n"));
-    assert!(is_exact_supported_omp_version("omp/18.1.15\r\n"));
-    assert!(is_exact_supported_omp_version("  omp/18.1.15  \n"));
+    assert!(is_exact_supported_omp_version("omp/18.1.16"));
+    assert!(is_exact_supported_omp_version("omp/18.1.16\n"));
+    assert!(is_exact_supported_omp_version("omp/18.1.16\r\n"));
+    assert!(is_exact_supported_omp_version("  omp/18.1.16  \n"));
 
     // Lookalikes, prefixes, suffixes, and extra wrapper text MUST BE REJECTED
-    assert!(!is_exact_supported_omp_version("omp/118.1.15"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.15-beta"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.15.1"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.15_rc1"));
-    assert!(!is_exact_supported_omp_version("v18.1.15"));
-    assert!(!is_exact_supported_omp_version("18.1.15"));
-    assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.15"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.15 extra text"));
-    assert!(!is_exact_supported_omp_version("node omp/18.1.15"));
+    assert!(!is_exact_supported_omp_version("omp/118.1.16"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.16-beta"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.16.1"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.16_rc1"));
+    assert!(!is_exact_supported_omp_version("v18.1.16"));
+    assert!(!is_exact_supported_omp_version("18.1.16"));
+    assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.16"));
+    assert!(!is_exact_supported_omp_version("omp/18.1.16 extra text"));
+    assert!(!is_exact_supported_omp_version("node omp/18.1.16"));
     assert!(!is_exact_supported_omp_version("omp/19.0.0"));
     assert!(!is_exact_supported_omp_version(""));
 }
 
 #[test]
+#[cfg(windows)]
 fn test_launch_preflight_adversarial_lookalike_rejection() {
     use hands_return_bridge::launcher::verify_launch_preflight;
+    if !live_launcher_tests_enabled() {
+        eprintln!("SKIP live adversarial preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
+        return;
+    }
     let dir = tempdir().unwrap();
 
     let lookalikes = [
-        "omp/118.1.15",
-        "omp/18.1.15-beta",
-        "wrapper: omp/18.1.15",
-        "18.1.15",
-        "omp/18.1.15 extra",
+        "omp/118.1.16",
+        "omp/18.1.16-beta",
+        "wrapper: omp/18.1.16",
+        "18.1.16",
+        "omp/18.1.16 extra",
     ];
 
     for (idx, lookalike) in lookalikes.iter().enumerate() {

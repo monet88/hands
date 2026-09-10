@@ -2,6 +2,15 @@ const NATIVE_HOST = "com.hands.return_bridge";
 const TRUST_NOTICE = "Notice: A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.";
 
 let storageAccessLevelEstablished = false;
+const inFlightLaunches = new Map();
+const UNRESOLVED_LAUNCH_STATES = new Set([
+  "claimed",
+  "pending_native",
+  "attempting",
+  "unknown",
+  "native-response-uncertain"
+]);
+const PROVEN_LAUNCH_STATES = new Set(["started", "completed"]);
 
 async function ensureStorageAccessLevel() {
   if (storageAccessLevelEstablished) {
@@ -86,6 +95,28 @@ function sendNative(msg) {
       resolve(response);
     });
   });
+}
+
+function sameLaunchPayload(record, payload) {
+  return !!record &&
+    record.originConversationId === payload.originConversationId &&
+    record.originConversationUrl === payload.originConversationUrl &&
+    record.transcriptEvidenceHash === payload.transcriptEvidenceHash &&
+    record.accountEvidenceHash === payload.accountEvidenceHash &&
+    record.targetId === payload.targetId &&
+    record.requestedPolicyRevision === payload.requestedPolicyRevision &&
+    record.promptText === payload.promptText;
+}
+
+function unresolvedLaunchResponse(launchRequestId, record, message) {
+  return {
+    status: "error",
+    code: "active_launch_unresolved",
+    message,
+    launchRequestId: launchRequestId || null,
+    executionId: record?.executionId,
+    state: record?.status || "pending_native"
+  };
 }
 
 // Extension internal message router
@@ -208,7 +239,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               pairingStatus: response.pairingStatus,
               targetsCount: response.targetsCount,
               policyRevision: response.policyRevision,
-              taskExecutionAvailable: false,
+              taskExecutionAvailable: response.taskExecutionAvailable,
               trustNotice: TRUST_NOTICE
             });
           } else {
@@ -310,6 +341,52 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           const originConversationUrl = tabUrl.split("#")[0].split("?")[0];
 
+          const targetId = request.targetId?.trim();
+          if (!targetId) {
+            sendResponse({ status: "error", code: "missing_target_id", message: "Target ID is required" });
+            return;
+          }
+
+          const promptText = request.promptText;
+          if (!promptText || typeof promptText !== "string" || !promptText.trim()) {
+            sendResponse({ status: "error", code: "missing_prompt_text", message: "Prompt text is required" });
+            return;
+          }
+          if (new TextEncoder().encode(promptText).byteLength > 128 * 1024) {
+            sendResponse({ status: "error", code: "prompt_too_large", message: "Prompt exceeds bounded size limit (128 KB)" });
+            return;
+          }
+
+          const requestedPolicyRevision = request.requestedPolicyRevision?.trim() || stored.policyRevision || "v1";
+          const activeKey = `active_launch_${stored.pairingId}_${originConversationId}_${targetId}_${requestedPolicyRevision}`;
+          const explicitLaunchRequestId = request.launchRequestId?.trim() || null;
+          const requestSignature = JSON.stringify({
+            tabId,
+            originConversationId,
+            originConversationUrl,
+            targetId,
+            requestedPolicyRevision,
+            promptText,
+            explicitLaunchRequestId
+          });
+
+          const inFlight = inFlightLaunches.get(activeKey);
+          if (inFlight) {
+            if (inFlight.signature !== requestSignature) {
+              sendResponse(unresolvedLaunchResponse(
+                inFlight.launchRequestId,
+                null,
+                "A launch is already in flight for this conversation/target with a different payload or request ID"
+              ));
+              return;
+            }
+            sendResponse(await inFlight.promise);
+            return;
+          }
+
+          const inFlightEntry = { signature: requestSignature, launchRequestId: explicitLaunchRequestId, promise: null };
+          const launchPromise = (async () => {
+
           // Obtain evidence directly from content script on bound top-level tab
           let evidenceRes;
           try {
@@ -322,236 +399,191 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               });
             });
           } catch (contentErr) {
-            sendResponse({
+            return {
               status: "error",
               code: "evidence_collection_failed",
               message: "Failed to communicate with content script on bound tab: " + contentErr.message
-            });
-            return;
+            };
           }
 
           if (!evidenceRes || !evidenceRes.ok) {
-            sendResponse({
+            return {
               status: "error",
               code: evidenceRes?.error || "evidence_collection_failed",
               message: evidenceRes?.message || "Content script failed to collect page evidence"
-            });
-            return;
+            };
           }
 
           if (evidenceRes.originConversationId !== originConversationId || evidenceRes.originConversationUrl !== originConversationUrl) {
-            sendResponse({
+            return {
               status: "error",
               code: "conversation_binding_mismatch",
               message: "Content script conversation ID or URL does not match bound top-level tab"
-            });
-            return;
+            };
           }
 
           const transcriptText = evidenceRes.transcriptText?.trim();
           const accountText = evidenceRes.accountText?.trim();
           if (!transcriptText) {
-            sendResponse({
+            return {
               status: "error",
               code: "missing_rendered_transcript",
               message: "Rendered transcript text is empty or unavailable"
-            });
-            return;
+            };
           }
           if (!accountText) {
-            sendResponse({
+            return {
               status: "error",
               code: "missing_account_context",
               message: "Account/workspace context evidence is empty or unavailable"
-            });
-            return;
+            };
           }
 
           // Compute evidence hashes inside trusted background
           const transcriptEvidenceHash = await sha256Hex(evidenceRes.transcriptText);
           const accountEvidenceHash = await sha256Hex(evidenceRes.accountText);
-
-          const targetId = request.targetId?.trim();
-          if (!targetId) {
-            sendResponse({ status: "error", code: "missing_target_id", message: "Target ID is required" });
-            return;
-          }
-
-          const promptText = request.promptText;
-          if (!promptText || typeof promptText !== "string" || !promptText.trim()) {
-            sendResponse({ status: "error", code: "missing_prompt_text", message: "Prompt text is required" });
-            return;
-          }
-          if (promptText.length > 128 * 1024) {
-            sendResponse({ status: "error", code: "prompt_too_large", message: "Prompt exceeds bounded size limit (128 KB)" });
-            return;
-          }
-
-          const requestedPolicyRevision = request.requestedPolicyRevision?.trim() || stored.policyRevision || "v1";
-
-          // Durable request identity (Finding 5):
-          // Installation-local request identity matches exact immutable payload.
-          const activeKey = `active_launch_${stored.pairingId}_${originConversationId}_${targetId}_${requestedPolicyRevision}`;
-          const activeStored = await chrome.storage.local.get([activeKey]);
-          const existingActiveReqId = activeStored[activeKey];
-
-          let launchRequestId;
-          if (request.launchRequestId && request.launchRequestId.trim()) {
-            launchRequestId = request.launchRequestId.trim();
-          } else if (existingActiveReqId) {
-            const storedLaunch = await chrome.storage.local.get(["launch_" + existingActiveReqId]);
-            const existingRecord = storedLaunch["launch_" + existingActiveReqId];
-            const isUnresolved = existingRecord && ["pending_native", "attempting", "unknown", "native-response-uncertain"].includes(existingRecord.status);
-            if (isUnresolved) {
-              const isSamePayload =
-                existingRecord.originConversationId === originConversationId &&
-                existingRecord.originConversationUrl === originConversationUrl &&
-                existingRecord.transcriptEvidenceHash === transcriptEvidenceHash &&
-                existingRecord.accountEvidenceHash === accountEvidenceHash &&
-                existingRecord.targetId === targetId &&
-                existingRecord.requestedPolicyRevision === requestedPolicyRevision &&
-                existingRecord.promptText === promptText;
-
-              if (isSamePayload) {
-                launchRequestId = existingActiveReqId;
-              } else {
-                sendResponse({
-                  status: "error",
-                  code: "active_launch_unresolved",
-                  message: `An unresolved launch request (${existingActiveReqId}) with state '${existingRecord.status}' is active for this conversation/target. Resolve or recover it before initiating a new task.`,
-                  launchRequestId: existingActiveReqId,
-                  executionId: existingRecord.executionId,
-                  state: existingRecord.status
-                });
-                return;
-              }
-            } else {
-              // Prior task was resolved (started, failed, rejected, revoked).
-              // A new task without explicit launchRequestId receives a fresh installation-local request ID.
-              const rnd = Math.random().toString(36).slice(2, 10);
-              launchRequestId = "req_" + Date.now() + "_" + rnd;
-            }
-          } else {
-            // No active task. Fresh installation-local request ID.
-            const rnd = Math.random().toString(36).slice(2, 10);
-            launchRequestId = "req_" + Date.now() + "_" + rnd;
-          }
-
-          const pendingLaunchKey = "launch_" + launchRequestId;
-          const storedLaunch = await chrome.storage.local.get([pendingLaunchKey]);
-          const existingRecord = storedLaunch[pendingLaunchKey];
-
-          if (existingRecord) {
-            if (
-              existingRecord.originConversationId !== originConversationId ||
-              existingRecord.originConversationUrl !== originConversationUrl ||
-              existingRecord.transcriptEvidenceHash !== transcriptEvidenceHash ||
-              existingRecord.accountEvidenceHash !== accountEvidenceHash ||
-              existingRecord.targetId !== targetId ||
-              existingRecord.requestedPolicyRevision !== requestedPolicyRevision ||
-              existingRecord.promptText !== promptText
-            ) {
-              sendResponse({
-                status: "error",
-                code: "payload_conflict",
-                message: "A launch request with this ID already exists with a different payload"
-              });
-              return;
-            }
-          }
-
-          const launchRecord = {
-            launchRequestId,
-            pairingId: stored.pairingId,
+          const launchPayload = {
             originConversationId,
             originConversationUrl,
             transcriptEvidenceHash,
             accountEvidenceHash,
             targetId,
             requestedPolicyRevision,
-            promptText,
-            createdAt: existingRecord ? existingRecord.createdAt : Date.now(),
-            status: existingRecord ? existingRecord.status : "pending_native"
+            promptText
           };
+            // Installation-local request identity matches exact immutable payload.
+            const activeStored = await chrome.storage.local.get([activeKey]);
+            const existingActiveReqId = activeStored[activeKey];
+            let launchRequestId;
 
-          try {
-            await chrome.storage.local.set({
-              [pendingLaunchKey]: launchRecord,
-              [activeKey]: launchRequestId,
-              lastLaunchRequestId: launchRequestId
-            });
-          } catch (storageErr) {
-            sendResponse({
-              status: "error",
-              code: "browser_persistence_failure",
-              message: "Failed to persist launch request in browser storage; native request aborted"
-            });
-            return;
-          }
+            if (existingActiveReqId) {
+              const storedActive = await chrome.storage.local.get(["launch_" + existingActiveReqId]);
+              const existingActiveRecord = storedActive["launch_" + existingActiveReqId];
+              const isUnresolved = existingActiveRecord && UNRESOLVED_LAUNCH_STATES.has(existingActiveRecord.status);
+              if (isUnresolved) {
+                if (explicitLaunchRequestId && explicitLaunchRequestId !== existingActiveReqId) {
+                  return unresolvedLaunchResponse(
+                    existingActiveReqId,
+                    existingActiveRecord,
+                    `An unresolved launch request (${existingActiveReqId}) is already active; the supplied launchRequestId does not match it.`
+                  );
+                }
+                if (!sameLaunchPayload(existingActiveRecord, launchPayload)) {
+                  return unresolvedLaunchResponse(
+                    existingActiveReqId,
+                    existingActiveRecord,
+                    `An unresolved launch request (${existingActiveReqId}) with state '${existingActiveRecord.status}' is active for this conversation/target. Resolve or recover it before initiating a new task.`
+                  );
+                }
+                launchRequestId = existingActiveReqId;
+              } else {
+                launchRequestId = explicitLaunchRequestId || ("req_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10));
+              }
+            } else {
+              launchRequestId = explicitLaunchRequestId || ("req_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10));
+            }
+            inFlightEntry.launchRequestId = launchRequestId;
 
-          // Invoke native host with explicit lost-native-response boundary handling (Finding 4)
-          let response;
-          try {
-            response = await sendNative({
-              op: "launch",
+            const pendingLaunchKey = "launch_" + launchRequestId;
+            const storedLaunch = await chrome.storage.local.get([pendingLaunchKey]);
+            const existingRecord = storedLaunch[pendingLaunchKey];
+            if (existingRecord && !sameLaunchPayload(existingRecord, launchPayload)) {
+              return {
+                status: "error",
+                code: "payload_conflict",
+                message: "A launch request with this ID already exists with a different payload"
+              };
+            }
+
+            const launchRecord = {
+              launchRequestId,
               pairingId: stored.pairingId,
-              pairingSecret: stored.pairingSecret,
-              profileId,
-              launchRequestId,
-              originConversationId,
-              originConversationUrl,
-              transcriptEvidenceHash,
-              accountEvidenceHash,
-              targetId,
-              requestedPolicyRevision,
-              promptText
-            });
-          } catch (nativeErr) {
-            launchRecord.status = "native-response-uncertain";
-            launchRecord.lastError = nativeErr.message;
-            await chrome.storage.local.set({
-              [pendingLaunchKey]: launchRecord
-            });
-            sendResponse({
-              status: "error",
-              code: "native_response_uncertain",
-              launchRequestId,
-              state: "native-response-uncertain",
-              message: "Native messaging host response was lost or rejected: " + nativeErr.message,
-              trustNotice: TRUST_NOTICE
-            });
-            return;
-          }
+              ...launchPayload,
+              createdAt: existingRecord ? existingRecord.createdAt : Date.now(),
+              status: existingRecord ? existingRecord.status : "pending_native"
+            };
 
-          if (response && response.status === "ok") {
-            launchRecord.status = response.state || "started";
-            launchRecord.executionId = response.executionId;
-            launchRecord.returnToken = response.returnToken;
-            launchRecord.terminalEvidence = response.terminalEvidence;
-            await chrome.storage.local.set({
-              [pendingLaunchKey]: launchRecord,
-              activeExecutionId: response.executionId
-            });
-          } else if (response && response.code === "launch_uncertain") {
-            launchRecord.status = "unknown";
-            launchRecord.executionId = response.executionId;
-            launchRecord.terminalEvidence = response.terminalEvidence;
-            await chrome.storage.local.set({
-              [pendingLaunchKey]: launchRecord
-            });
-          } else if (response && response.status === "error") {
-            // Definitive rejection (target_not_found, policy_mismatch, payload_conflict, etc.)
-            launchRecord.status = "rejected";
-            launchRecord.rejectCode = response.code;
-            launchRecord.rejectMessage = response.message;
-            await chrome.storage.local.set({
-              [pendingLaunchKey]: launchRecord
-            });
-            // Clear activeKey so subsequent tasks are not trapped
-            await chrome.storage.local.remove([activeKey]);
-          }
+            try {
+              await chrome.storage.local.set({
+                [pendingLaunchKey]: launchRecord,
+                [activeKey]: launchRequestId,
+                lastLaunchRequestId: launchRequestId
+              });
+            } catch (storageErr) {
+              return {
+                status: "error",
+                code: "browser_persistence_failure",
+                message: "Failed to persist launch request in browser storage; native request aborted"
+              };
+            }
 
-          sendResponse(response);
+            let response;
+            try {
+              response = await sendNative({
+                op: "launch",
+                pairingId: stored.pairingId,
+                pairingSecret: stored.pairingSecret,
+                profileId,
+                launchRequestId,
+                ...launchPayload
+              });
+            } catch (nativeErr) {
+              launchRecord.status = "native-response-uncertain";
+              launchRecord.lastError = nativeErr.message;
+              await chrome.storage.local.set({ [pendingLaunchKey]: launchRecord });
+              return {
+                status: "error",
+                code: "native_response_uncertain",
+                launchRequestId,
+                state: "native-response-uncertain",
+                message: "Native messaging host response was lost or rejected: " + nativeErr.message,
+                trustNotice: TRUST_NOTICE
+              };
+            }
+
+            if (response && response.status === "ok") {
+              const nativeState = response.state || "unknown";
+              launchRecord.status = nativeState;
+              launchRecord.executionId = response.executionId;
+              launchRecord.returnToken = response.returnToken;
+              launchRecord.terminalEvidence = response.terminalEvidence;
+              const storageUpdate = { [pendingLaunchKey]: launchRecord };
+              if (PROVEN_LAUNCH_STATES.has(nativeState)) {
+                storageUpdate.activeExecutionId = response.executionId;
+              }
+              await chrome.storage.local.set(storageUpdate);
+              if (!PROVEN_LAUNCH_STATES.has(nativeState)) {
+                return {
+                  ...response,
+                  status: "error",
+                  code: "launch_unresolved",
+                  message: `Native launch is not proven started; durable state is '${nativeState}'. Recover before retrying.`
+                };
+              }
+            } else if (response && response.code === "launch_uncertain") {
+              launchRecord.status = "unknown";
+              launchRecord.executionId = response.executionId;
+              launchRecord.terminalEvidence = response.terminalEvidence;
+              await chrome.storage.local.set({ [pendingLaunchKey]: launchRecord });
+            } else if (response && response.status === "error") {
+              launchRecord.status = "rejected";
+              launchRecord.rejectCode = response.code;
+              launchRecord.rejectMessage = response.message;
+              await chrome.storage.local.set({ [pendingLaunchKey]: launchRecord });
+              await chrome.storage.local.remove([activeKey]);
+            }
+            return response;
+          })();
+
+          inFlightEntry.promise = launchPromise;
+          inFlightLaunches.set(activeKey, inFlightEntry);
+          try {
+            sendResponse(await launchPromise);
+          } finally {
+            if (inFlightLaunches.get(activeKey)?.promise === launchPromise) {
+              inFlightLaunches.delete(activeKey);
+            }
+          }
           break;
         }
         case "recover": {
@@ -581,7 +613,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               if (summary.launch_request_id) {
                 const recordKey = "launch_" + summary.launch_request_id;
                 const cur = (await chrome.storage.local.get([recordKey]))[recordKey];
-                if (cur && cur.status === "native-response-uncertain") {
+                if (cur && UNRESOLVED_LAUNCH_STATES.has(cur.status)) {
                   cur.status = summary.state || "unknown";
                   cur.executionId = summary.execution_id;
                   cur.terminalEvidence = summary.orca_terminal_handle ? { orcaTerminalHandle: summary.orca_terminal_handle } : null;

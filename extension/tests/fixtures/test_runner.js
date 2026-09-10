@@ -143,8 +143,9 @@ window.startTest = async function(config = {}) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
-      // Helper to render conversation turns and user context in the ChatGPT tab
-      async function ensureMockChatGptDom() {
+      // Initialize the mock page once. Re-injecting content_script.js would register
+      // duplicate listeners and make replay assertions timing-dependent.
+      async function initializeMockChatGptPage() {
         await chrome.scripting.executeScript({
           target: { tabId: chatTab.id },
           func: () => {
@@ -157,7 +158,7 @@ window.startTest = async function(config = {}) {
         });
       }
 
-      await ensureMockChatGptDom();
+      await initializeMockChatGptPage();
 
       const runNonce = Date.now().toString(36);
       const testPrompt = `--flag @some_file "quotes" ; echo pipe | unicode: Đại Ca ${runNonce}\nsecond_line_preserved`;
@@ -178,14 +179,12 @@ window.startTest = async function(config = {}) {
       results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
       results.promptSent = launchPayload.promptText;
       // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
-      await ensureMockChatGptDom();
       const replayResp = await chrome.runtime.sendMessage(launchPayload);
       const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
       logResult("launch_idempotent_replay", replayOk, replayResp);
       results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
 
       // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
-      await ensureMockChatGptDom();
       const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
       const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
       const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";

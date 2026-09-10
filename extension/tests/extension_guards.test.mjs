@@ -5,8 +5,10 @@ import assert from "node:assert/strict";
 
 const BACKGROUND_JS_PATH = path.resolve("extension/background.js");
 const CONTENT_SCRIPT_JS_PATH = path.resolve("extension/content_script.js");
+const OPTIONS_JS_PATH = path.resolve("extension/options.js");
 const backgroundCode = fs.readFileSync(BACKGROUND_JS_PATH, "utf8");
 const contentScriptCode = fs.readFileSync(CONTENT_SCRIPT_JS_PATH, "utf8");
+const optionsCode = fs.readFileSync(OPTIONS_JS_PATH, "utf8");
 
 function createTestHarness({
   extensionId = "mkkajdpmlmliildflmnnmfndboldnnfa",
@@ -783,7 +785,14 @@ async function runTests() {
   // Test 16: Content script direct unit tests (Removal of fake fallbacks)
   // ---------------------------------------------------------------------------
   {
-    function runContentScriptInVm({ pathname = "/c/c_123", turns = [], userMenu = null } = {}) {
+    function runContentScriptInVm({
+      pathname = "/c/c_123",
+      turns = [],
+      conversationTurns = null,
+      roleTurns = null,
+      userMenu = null,
+      accountCandidates = null
+    } = {}) {
       let capturedListener = null;
       const mockChrome = {
         runtime: {
@@ -796,17 +805,21 @@ async function runTests() {
       };
       const mockDocument = {
         querySelectorAll(selector) {
-          if (selector.includes("article")) {
+          if (selector.includes('conversation-turn')) {
+            return (conversationTurns || []).map(t => ({ innerText: t }));
+          }
+          if (selector === "article") {
             return turns.map(t => ({ innerText: t }));
+          }
+          if (selector === "[data-message-author-role]") {
+            return (roleTurns || []).map(t => ({ innerText: t }));
+          }
+          if (selector.includes("user-profile") || selector.includes("workspace") || selector.includes("user-menu")) {
+            const candidates = accountCandidates || (userMenu ? [userMenu] : []);
+            return candidates.map(t => ({ innerText: t }));
           }
           return [];
         },
-        querySelector(selector) {
-          if (selector.includes("user-menu") || selector.includes("user-profile")) {
-            return userMenu ? { innerText: userMenu } : null;
-          }
-          return null;
-        }
       };
       const mockWindow = {
         location: {
@@ -867,7 +880,29 @@ async function runTests() {
     assert.equal(badPathRes.ok, false);
     assert.equal(badPathRes.error, "invalid_conversation_boundary");
 
-    console.log("  [PASS] Content script direct tests verify zero fake fallbacks and strict fail-closed errors");
+    // Case E: prefer one turn-node tier so wrapper + nested author nodes are not duplicated.
+    const noDuplicateRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      conversationTurns: ["Canonical turn one", "Canonical turn two"],
+      turns: ["Wrapper duplicate one", "Wrapper duplicate two"],
+      roleTurns: ["Nested duplicate one", "Nested duplicate two"],
+      userMenu: "Workspace Personal"
+    });
+    assert.equal(noDuplicateRes.ok, true);
+    assert.ok(noDuplicateRes.transcriptText.includes("Canonical turn one"));
+    assert.equal(noDuplicateRes.transcriptText.includes("Wrapper duplicate one"), false);
+    assert.equal(noDuplicateRes.transcriptText.includes("Nested duplicate one"), false);
+
+    // Case F: ignore empty account candidates and use a later rendered value.
+    const laterAccountRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: ["Turn 1"],
+      accountCandidates: ["   ", "Workspace Later Candidate"]
+    });
+    assert.equal(laterAccountRes.ok, true);
+    assert.equal(laterAccountRes.accountText, "Workspace Later Candidate");
+
+    console.log("  [PASS] Content script evidence avoids duplicate turns and scans account candidates fail-closed");
   }
 
   // Test 17: Verify frameId: 0 explicit targeting during evidence collection
@@ -981,6 +1016,198 @@ async function runTests() {
     assert.ok(secondReqId.startsWith("req_"));
     assert.notEqual(firstReqId, secondReqId, "Subsequent deliberate new task must receive fresh unique launchRequestId");
     console.log("  [PASS] Resolved prior task does not trap new task with identical payload");
+  }
+
+  // Test 20: status preserves native taskExecutionAvailable.
+  {
+    const harness = createTestHarness({
+      nativeResponse: {
+        status: "ok",
+        pairingStatus: "active",
+        targetsCount: 1,
+        policyRevision: "v1",
+        taskExecutionAvailable: true
+      },
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_status",
+        pairingSecret: "rb_sec_status"
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "status" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.taskExecutionAvailable, true);
+    console.log("  [PASS] Status preserves native taskExecutionAvailable");
+  }
+
+  // Test 21: prompt bound is UTF-8 bytes, not UTF-16/JS character count.
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_utf8",
+        pairingSecret: "rb_sec_utf8",
+        policyRevision: "v1"
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const multibytePrompt = "界".repeat(Math.floor((128 * 1024) / 3) + 1);
+    assert.ok(multibytePrompt.length < 128 * 1024);
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_utf8",
+      promptText: multibytePrompt
+    }, trustedSender);
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "prompt_too_large");
+    assert.equal(harness.nativeMessagesSent.length, 0);
+    console.log("  [PASS] Prompt limit is enforced in UTF-8 bytes");
+  }
+
+  // Test 22: explicit request ID cannot bypass another unresolved active request.
+  {
+    const activeReqId = "req_active_unresolved";
+    const activeKey = "active_launch_pair_explicit_c_test_123_target_hands_v1";
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_explicit",
+        pairingSecret: "rb_sec_explicit",
+        policyRevision: "v1",
+        [activeKey]: activeReqId,
+        ["launch_" + activeReqId]: {
+          launchRequestId: activeReqId,
+          originConversationId: "c_test_123",
+          originConversationUrl: "https://chatgpt.com/c/c_test_123",
+          transcriptEvidenceHash: "ignored-for-id-mismatch",
+          accountEvidenceHash: "ignored-for-id-mismatch",
+          targetId: "target_hands",
+          requestedPolicyRevision: "v1",
+          promptText: "Prior task",
+          status: "unknown"
+        }
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({
+      action: "launch",
+      launchRequestId: "req_different_explicit",
+      tabId: 101,
+      targetId: "target_hands",
+      promptText: "New task"
+    }, trustedSender);
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "active_launch_unresolved");
+    assert.equal(res.launchRequestId, activeReqId);
+    assert.equal(harness.nativeMessagesSent.length, 0);
+    console.log("  [PASS] Explicit launchRequestId cannot bypass unresolved active request");
+  }
+
+  // Test 23: native replay in claimed state is unresolved, never a successful launch.
+  {
+    const harness = createTestHarness({
+      nativeResponse: {
+        status: "ok",
+        executionId: "exec_claimed",
+        returnToken: "ret_claimed",
+        state: "claimed",
+        isReplayed: true
+      },
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_claimed",
+        pairingSecret: "rb_sec_claimed",
+        policyRevision: "v1"
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({
+      action: "launch",
+      tabId: 101,
+      targetId: "target_claimed",
+      promptText: "Claimed replay"
+    }, trustedSender);
+    assert.equal(res.status, "error");
+    assert.equal(res.code, "launch_unresolved");
+    assert.equal(res.state, "claimed");
+    assert.equal(harness.storageStore.activeExecutionId, undefined);
+    console.log("  [PASS] Claimed replay cannot masquerade as successful started launch");
+  }
+
+  // Test 24: recover reconciles all browser-side uncertain states.
+  for (const browserState of ["pending_native", "unknown", "native-response-uncertain"]) {
+    const reqId = `req_recover_${browserState.replaceAll("-", "_")}`;
+    const harness = createTestHarness({
+      nativeResponse: {
+        status: "ok",
+        summaries: [{
+          launch_request_id: reqId,
+          execution_id: "exec_recovered",
+          state: "started",
+          orca_terminal_handle: "term_recovered"
+        }]
+      },
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_recover_states",
+        pairingSecret: "rb_sec_recover_states",
+        ["launch_" + reqId]: { launchRequestId: reqId, status: browserState }
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "recover" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(harness.storageStore["launch_" + reqId].status, "started");
+    assert.equal(harness.storageStore["launch_" + reqId].executionId, "exec_recovered");
+  }
+  console.log("  [PASS] Recovery reconciles pending_native/unknown/native-response-uncertain states");
+
+  // Setup guidance must quote the workspace placeholder so paths with spaces are safe when pasted.
+  assert.ok(optionsCode.includes('--target "<path>"'));
+  assert.equal(optionsCode.includes("--target <path>"), false);
+  console.log("  [PASS] Options setup command quotes the target path placeholder");
+
+  // Non-Windows setup guidance must skip Windows Registry registration explicitly.
+  assert.ok(optionsCode.includes("chrome.runtime.getPlatformInfo()"));
+  assert.ok(optionsCode.includes('platformInfo?.os === "win"'));
+  assert.ok(optionsCode.includes('" --skip-registry"'));
+  console.log("  [PASS] Options setup command is platform-aware for registry registration");
+
+  // Test 25: concurrent identical launches coalesce to one native request.
+  {
+    const harness = createTestHarness({
+      nativeResponse: { status: "ok", executionId: "exec_coalesced", returnToken: "ret_coalesced", state: "started" },
+      initialStorage: {
+        profileId: "prof_fixed",
+        isPaired: true,
+        pairingId: "pair_coalesced",
+        pairingSecret: "rb_sec_coalesced",
+        policyRevision: "v1"
+      },
+      mockTabs: { 101: { id: 101, url: "https://chatgpt.com/c/c_test_123" } }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const request = {
+      action: "launch",
+      tabId: 101,
+      targetId: "target_coalesced",
+      promptText: "Exactly one native launch"
+    };
+    const [first, second] = await Promise.all([
+      harness.sendMessage({ ...request }, trustedSender),
+      harness.sendMessage({ ...request }, trustedSender)
+    ]);
+    assert.equal(first.status, "ok");
+    assert.equal(second.status, "ok");
+    assert.equal(first.executionId, "exec_coalesced");
+    assert.equal(second.executionId, "exec_coalesced");
+    assert.equal(harness.nativeMessagesSent.filter(x => x.msg.op === "launch").length, 1);
+    console.log("  [PASS] Concurrent identical browser launches coalesce to one native request");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

@@ -232,20 +232,20 @@ pub fn compute_payload_digest(
     prompt_text: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"hands_rb_payload_v1:");
-    hasher.update(origin_conversation_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(origin_conversation_url.as_bytes());
-    hasher.update(b":");
-    hasher.update(transcript_evidence_hash.as_bytes());
-    hasher.update(b":");
-    hasher.update(account_evidence_hash.as_bytes());
-    hasher.update(b":");
-    hasher.update(target_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(policy_revision.as_bytes());
-    hasher.update(b":");
-    hasher.update(prompt_text.as_bytes());
+    hasher.update(b"hands_rb_payload_v2");
+    for field in [
+        origin_conversation_id,
+        origin_conversation_url,
+        transcript_evidence_hash,
+        account_evidence_hash,
+        target_id,
+        policy_revision,
+        prompt_text,
+    ] {
+        let bytes = field.as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -866,6 +866,28 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
+        // Revalidate the pairing while holding the same write transaction that
+        // reserves/replays the launch. This closes authenticate -> revoke -> claim.
+        let pairing_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM pairings WHERE pairing_id = ?1",
+                params![&params.pairing_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        match pairing_status.as_deref() {
+            None => return Err(PairingError::NotFound),
+            Some("active") => {}
+            Some("revoked") | Some("retired") => return Err(PairingError::Retired),
+            Some("pending") => return Err(PairingError::NotActive),
+            Some(other) => {
+                return Err(PairingError::StorageError(format!(
+                    "invalid pairing status: {other}"
+                )))
+            }
+        }
+
         // 1. Check if this (pairing_id, launch_request_id) already exists in retained launch_requests
         let existing: Option<(String, String, String, String, String, String, String, String)> = tx
             .query_row(
@@ -1124,7 +1146,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         let now = now_epoch_secs();
         let conn = self.conn.lock();
 
-        conn.execute(
+        let affected = conn.execute(
             r#"
             UPDATE launch_attempts
             SET invoked_at = ?1,
@@ -1144,6 +1166,11 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             ],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch attempt not found for execution {execution_id}"
+            )));
+        }
 
         Ok(())
     }
@@ -1154,9 +1181,12 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         evidence: &AttemptEvidence,
     ) -> Result<(), PairingError> {
         let now = now_epoch_secs();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        conn.execute(
+        let attempt_affected = tx.execute(
             r#"
             UPDATE launch_attempts
             SET invoked_at = ?1,
@@ -1177,12 +1207,25 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             ],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if attempt_affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch attempt not found for execution {execution_id}"
+            )));
+        }
 
-        conn.execute(
+        let request_affected = tx.execute(
             "UPDATE launch_requests SET state = 'started', updated_at = ?1 WHERE execution_id = ?2",
             params![now, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if request_affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch request not found for execution {execution_id}"
+            )));
+        }
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(())
     }
@@ -1194,14 +1237,17 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         reason: &str,
     ) -> Result<(), PairingError> {
         let now = now_epoch_secs();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         let handle = evidence.and_then(|e| e.orca_terminal_handle.as_deref());
         let tab_id = evidence.and_then(|e| e.orca_tab_id.as_deref());
         let pane_key = evidence.and_then(|e| e.orca_pane_key.as_deref());
         let pty_id = evidence.and_then(|e| e.orca_pty_id.as_deref());
 
-        conn.execute(
+        let attempt_affected = tx.execute(
             r#"
             UPDATE launch_attempts
             SET invoked_at = ?1,
@@ -1216,12 +1262,25 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             params![now, handle, tab_id, pane_key, pty_id, reason, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if attempt_affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch attempt not found for execution {execution_id}"
+            )));
+        }
 
-        conn.execute(
+        let request_affected = tx.execute(
             "UPDATE launch_requests SET state = 'unknown', updated_at = ?1 WHERE execution_id = ?2",
             params![now, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if request_affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch request not found for execution {execution_id}"
+            )));
+        }
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(())
     }
@@ -1232,19 +1291,30 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         reason: &str,
     ) -> Result<(), PairingError> {
         let now = now_epoch_secs();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        conn.execute(
+        tx.execute(
             "UPDATE launch_attempts SET state = 'failed', failure_reason = ?1 WHERE execution_id = ?2",
             params![reason, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
-        conn.execute(
+        let request_affected = tx.execute(
             "UPDATE launch_requests SET state = 'failed', updated_at = ?1 WHERE execution_id = ?2",
             params![now, execution_id],
         )
         .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if request_affected != 1 {
+            return Err(PairingError::StorageError(format!(
+                "launch request not found for execution {execution_id}"
+            )));
+        }
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(())
     }
