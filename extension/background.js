@@ -91,6 +91,25 @@ async function performScheduledDrain() {
   }
 }
 
+function buildReceiptRecord(rcpt) {
+  return {
+    receiptId: rcpt.receipt_id,
+    executionId: rcpt.execution_id,
+    pairingId: rcpt.pairing_id,
+    returnToken: rcpt.return_token,
+    originConversationId: rcpt.origin_conversation_id,
+    turnIndex: rcpt.turn_index,
+    stopReason: rcpt.stop_reason,
+    assistantMessageId: rcpt.assistant_message_id,
+    assistantText: rcpt.assistant_text,
+    contentDigest: rcpt.content_digest,
+    toolCallCount: rcpt.tool_call_count,
+    state: rcpt.state || "completed",
+    receivedAt: Date.now(),
+    deliveryStatus: "received" // Keep received strictly separate from ChatGPT submission
+  };
+}
+
 async function processDrainResponse(drainResponse, stored, profileId) {
   // 1. Reconcile launch summaries and reconstruct missing receipts from native durable authority
   const summaries = Array.isArray(drainResponse.summaries) ? drainResponse.summaries : [];
@@ -115,22 +134,7 @@ async function processDrainResponse(drainResponse, stored, profileId) {
       if (!existing) {
         // Local storage was lost or missing: reconstruct from native durable authority
         // Retain deliveryStatus: "received" (strictly separate from ChatGPT submission, no send permission)
-        const reconstructedRecord = {
-          receiptId: rcpt.receipt_id,
-          executionId: rcpt.execution_id,
-          pairingId: rcpt.pairing_id,
-          returnToken: rcpt.return_token,
-          originConversationId: rcpt.origin_conversation_id,
-          turnIndex: rcpt.turn_index,
-          stopReason: rcpt.stop_reason,
-          assistantMessageId: rcpt.assistant_message_id,
-          assistantText: rcpt.assistant_text,
-          contentDigest: rcpt.content_digest,
-          toolCallCount: rcpt.tool_call_count,
-          state: rcpt.state || "completed",
-          receivedAt: Date.now(),
-          deliveryStatus: "received"
-        };
+        const reconstructedRecord = buildReceiptRecord(rcpt);
         try {
           await chrome.storage.local.set({
             [receiptStorageKey]: reconstructedRecord,
@@ -152,22 +156,7 @@ async function processDrainResponse(drainResponse, stored, profileId) {
     const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
 
     // Prepare durable browser record: status "received" (separate from ChatGPT submission, no send permission)
-    const receiptRecord = {
-      receiptId: rcpt.receipt_id,
-      executionId: rcpt.execution_id,
-      pairingId: rcpt.pairing_id,
-      returnToken: rcpt.return_token,
-      originConversationId: rcpt.origin_conversation_id,
-      turnIndex: rcpt.turn_index,
-      stopReason: rcpt.stop_reason,
-      assistantMessageId: rcpt.assistant_message_id,
-      assistantText: rcpt.assistant_text,
-      contentDigest: rcpt.content_digest,
-      toolCallCount: rcpt.tool_call_count,
-      state: rcpt.state || "completed",
-      receivedAt: Date.now(),
-      deliveryStatus: "received" // Keep received strictly separate from ChatGPT submission
-    };
+    const receiptRecord = buildReceiptRecord(rcpt);
 
     // Hard gate: Storage write MUST succeed BEFORE reporting acknowledgement to native host
     try {
