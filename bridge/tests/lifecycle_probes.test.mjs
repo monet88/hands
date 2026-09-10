@@ -1004,25 +1004,49 @@ process.kill(process.pid, 9);
       "Locked database must fail closed with 0 receipts"
     );
 
-    // S3b: Permission / open-write denial (readonly file mode on Windows)
+    // S3b: Permission / open-write denial
     const execReadonly = "exec_s3_readonly";
     env.seedLaunchRequest(execReadonly, "req_s3_ro", "ret_s3_ro");
-    // Set database file to read-only
-    fs.chmodSync(env.dbPath, 0o444);
     const adapterRo = await loadAdapter(env.adapterPath, {
       HANDS_RETURN_BRIDGE_EXECUTION_ID: execReadonly,
       HANDS_RETURN_BRIDGE_STATE_DIR: env.tempDir,
     });
-    const piRo = createMockPi();
-    adapterRo(piRo);
-    const ctxRo = createMockCtx("sess_s3_ro");
-    await piRo.emit("agent_start", {}, ctxRo);
-    const msgRo = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Readonly test" }] };
-    await piRo.emit("session_stop", { turn_id: 0, last_assistant_message: msgRo, messages: [msgRo], stop_hook_active: false }, ctxRo);
-    // Fails closed on attempt to write to readonly DB
-    await piRo.emit("agent_end", { messages: [msgRo], willContinue: false }, ctxRo);
-    // Restore write permissions
-    fs.chmodSync(env.dbPath, 0o666);
+    const sqlitePaths = [env.dbPath, `${env.dbPath}-wal`, `${env.dbPath}-shm`].filter((p) => fs.existsSync(p));
+    const originalModes = new Map(sqlitePaths.map((p) => [p, fs.statSync(p).mode & 0o777]));
+    const originalDirMode = fs.statSync(env.tempDir).mode & 0o777;
+
+    try {
+      if (process.platform === "win32") {
+        // Windows maps chmod's write bit to the file read-only attribute.
+        fs.chmodSync(env.dbPath, 0o444);
+      } else {
+        // WAL mode writes through sidecars, so deny writes to both the SQLite files
+        // and their directory. Making only journal.sqlite read-only is insufficient.
+        for (const sqlitePath of sqlitePaths) {
+          fs.chmodSync(sqlitePath, 0o444);
+        }
+        fs.chmodSync(env.tempDir, 0o555);
+      }
+
+      const piRo = createMockPi();
+      adapterRo(piRo);
+      const ctxRo = createMockCtx("sess_s3_ro");
+      await piRo.emit("agent_start", {}, ctxRo);
+      const msgRo = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Readonly test" }] };
+      await piRo.emit("session_stop", { turn_id: 0, last_assistant_message: msgRo, messages: [msgRo], stop_hook_active: false }, ctxRo);
+      // Fails closed on attempt to write to readonly storage.
+      await piRo.emit("agent_end", { messages: [msgRo], willContinue: false }, ctxRo);
+    } finally {
+      if (process.platform !== "win32") {
+        fs.chmodSync(env.tempDir, originalDirMode);
+      }
+      for (const [sqlitePath, mode] of originalModes) {
+        if (fs.existsSync(sqlitePath)) {
+          fs.chmodSync(sqlitePath, mode);
+        }
+      }
+    }
+
     assert.equal(
       env.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execReadonly).length,
       0,
