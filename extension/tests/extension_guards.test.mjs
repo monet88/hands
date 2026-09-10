@@ -73,6 +73,26 @@ function createTestHarness({
         }
         throw new Error("Tab not found: " + tabId);
       },
+      async query(queryInfo) {
+        const res = [];
+        for (const tab of Object.values(mockTabs)) {
+          if (queryInfo && queryInfo.url) {
+            const prefix = queryInfo.url.replace(/\*$/, "");
+            if (tab.url && tab.url.startsWith(prefix)) {
+              res.push(tab);
+            }
+          } else {
+            res.push(tab);
+          }
+        }
+        return res;
+      },
+      async create(createInfo) {
+        const newId = 900 + Math.floor(Math.random() * 100);
+        const newTab = { id: newId, url: createInfo.url, active: createInfo.active ?? true };
+        mockTabs[newId] = newTab;
+        return newTab;
+      },
       lastSendMessageOptions: null,
       sendMessage(tabId, message, optionsOrCb, maybeCb) {
         const options = typeof optionsOrCb === "object" ? optionsOrCb : null;
@@ -1494,6 +1514,533 @@ async function runTests() {
     assert.equal(ackCount, 1, "No duplicate transport ACK should be sent during reconstruction");
 
     console.log("  [PASS] AC4 Recovery: Reconstructs deliveryStatus='received' from native durable authority after local storage loss");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 32: Dispatch Fence: One-time grant consumption and synchronous guard+click
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_dispatch_1",
+      executionId: "exec_dispatch_1",
+      pairingId: "pair_dispatch",
+      returnToken: "ret_dispatch_1",
+      originConversationId: "c_fence_123",
+      originConversationUrl: "https://chatgpt.com/c/c_fence_123",
+      deliveryStatus: "received"
+    };
+
+    let grantCalled = false;
+    let settleCalled = false;
+    let settledOutcome = null;
+    let clickAttempted = 0;
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_dispatch_1: testReceipt
+      },
+      mockTabs: {
+        201: { id: 201, url: "https://chatgpt.com/c/c_fence_123" }
+      },
+      mockTabMessages: {
+        201: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_test_live_1",
+              readiness: {
+                ready: true,
+                transcriptText: "Previous conversation transcript text...",
+                accountText: "Personal (monet@example.com)"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            clickAttempted++;
+            return {
+              ok: true,
+              clicked: true,
+              documentId: "doc_test_live_1",
+              attemptId: msg.attemptId,
+              receiptMarker: msg.receiptMarker
+            };
+          }
+          if (msg.action === "verify_submitted_message") {
+            return {
+              ok: true,
+              observed: true,
+              observedMessageId: "msg_chatgpt_live_999",
+              transcriptText: `Previous text... [Hands Return Bridge] Local agent completed... ${msg.receiptMarker}`
+            };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    // Override sendNativeMessage to mock native dispatch_fence and settle_fence
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "dispatch_fence") {
+        grantCalled = true;
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: msg.expectedDeliveryRevision,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId,
+            receipt_marker: msg.receiptMarker,
+            payload_digest: msg.payloadDigest
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        settleCalled = true;
+        settledOutcome = msg.outcome;
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: msg.outcome === "submitted-observed" || msg.outcome === "not-sent"
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // Dispatch receipt 1
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_dispatch_1" }, trustedSender);
+    assert.equal(res.status, "ok", JSON.stringify(res));
+    assert.equal(res.dispatchResult?.status, "ok", JSON.stringify(res.dispatchResult));
+    assert.equal(res.dispatchResult.outcome, "submitted-observed");
+    assert.equal(clickAttempted, 1, "Click must occur exactly once");
+    assert.ok(grantCalled, "Native dispatch_fence must be called before click");
+    assert.ok(settleCalled, "Native settle_fence must be called after verification");
+    assert.equal(settledOutcome, "submitted-observed");
+
+    // Local record is now terminal submitted-observed
+    const updated = harness.storageStore["receipt_rcpt_dispatch_1"];
+    assert.equal(updated.deliveryStatus, "submitted-observed");
+    assert.equal(updated.observedMessageId, "msg_chatgpt_live_999");
+
+    // Attempting to dispatch again must be skipped (no second grant or click)
+    const res2 = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_dispatch_1" }, trustedSender);
+    assert.equal(res2.dispatchResult.status, "skipped", "Already submitted receipt must be skipped");
+    assert.equal(clickAttempted, 1, "No second click allowed");
+
+    console.log("  [PASS] Dispatch Fence: One-time grant consumption and synchronous guard+click");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 33: User draft preservation: Dispatch halts without overwriting draft
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_draft_1",
+      executionId: "exec_draft_1",
+      originConversationId: "c_draft_123",
+      originConversationUrl: "https://chatgpt.com/c/c_draft_123",
+      deliveryStatus: "received"
+    };
+
+    let clickAttempted = false;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_draft_1: testReceipt
+      },
+      mockTabs: { 202: { id: 202, url: "https://chatgpt.com/c/c_draft_123" } },
+      mockTabMessages: {
+        202: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: false,
+              readiness: {
+                ready: false,
+                reason: "unrelated_draft_present",
+                message: "User draft present in composer; preserving draft without overwrite"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            clickAttempted = true;
+            return { ok: true, clicked: true };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_draft_1" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "waiting");
+    assert.equal(res.dispatchResult.reason, "unrelated_draft_present");
+    assert.equal(clickAttempted, false, "Must never overwrite draft or click");
+
+    console.log("  [PASS] User draft preservation: Dispatch halts without overwriting draft");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 34: Navigation / route change invalidates delivery preparation
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_nav_1",
+      executionId: "exec_nav_1",
+      originConversationId: "c_nav_orig",
+      originConversationUrl: "https://chatgpt.com/c/c_nav_orig",
+      deliveryStatus: "received"
+    };
+
+    let clickAttempted = false;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_nav_1: testReceipt
+      },
+      mockTabs: { 203: { id: 203, url: "https://chatgpt.com/c/c_nav_orig" } },
+      mockTabMessages: {
+        203: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            // Page navigated to a different conversation
+            return {
+              ok: false,
+              readiness: {
+                ready: false,
+                reason: "navigation_invalidated",
+                message: "Document URL or route changed since script load"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            clickAttempted = true;
+            return { ok: true, clicked: true };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_nav_1" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "waiting");
+    assert.equal(res.dispatchResult.reason, "navigation_invalidated");
+    assert.equal(clickAttempted, false, "Navigation must invalidate delivery");
+
+    console.log("  [PASS] Navigation / route change invalidates delivery preparation");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 35: Competing tab / slot busy receives denied status, NEVER permission
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_busy_1",
+      executionId: "exec_busy_1",
+      originConversationId: "c_busy_123",
+      originConversationUrl: "https://chatgpt.com/c/c_busy_123",
+      deliveryStatus: "received"
+    };
+
+    let clickAttempted = false;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_busy_1: testReceipt
+      },
+      mockTabs: { 204: { id: 204, url: "https://chatgpt.com/c/c_busy_123" } },
+      mockTabMessages: {
+        204: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_busy_tab_2",
+              readiness: { ready: true, transcriptText: "t", accountText: "a" }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            clickAttempted = true;
+            return { ok: true, clicked: true };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    // Mock native host returning granted=false (slot busy or competing owner)
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: false, // DENIED
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: "attempt_other_tab",
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: "doc_first_tab"
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_busy_1" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "denied");
+    assert.equal(res.dispatchResult.reason, "slot_busy_or_competing_owner");
+    assert.equal(clickAttempted, false, "Loser must NEVER click");
+
+    console.log("  [PASS] Competing tab / slot busy receives denied status, NEVER permission");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 36: Inconclusive outcome after click leaves attempt UNCERTAIN (retains slot)
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_uncertain_1",
+      executionId: "exec_uncertain_1",
+      originConversationId: "c_uncertain_123",
+      originConversationUrl: "https://chatgpt.com/c/c_uncertain_123",
+      deliveryStatus: "received"
+    };
+
+    let settledOutcome = null;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_uncertain_1: testReceipt
+      },
+      mockTabs: { 205: { id: 205, url: "https://chatgpt.com/c/c_uncertain_123" } },
+      mockTabMessages: {
+        205: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_uncertain_1",
+              readiness: { ready: true, transcriptText: "t", accountText: "a" }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return { ok: true, clicked: true, documentId: "doc_uncertain_1" };
+          }
+          if (msg.action === "verify_submitted_message") {
+            // Inconclusive! Message not yet rendered/persisted
+            return { ok: true, observed: false };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        settledOutcome = msg.outcome;
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: false // Uncertain retains slot!
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_uncertain_1" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "uncertain");
+    assert.equal(res.dispatchResult.outcome, "uncertain");
+    assert.equal(settledOutcome, "uncertain", "Must record outcome='uncertain'");
+
+    const storedRec = harness.storageStore["receipt_rcpt_uncertain_1"];
+    assert.equal(storedRec.deliveryStatus, "dispatching/uncertain", "Local status must stay dispatching/uncertain");
+
+    console.log("  [PASS] Inconclusive outcome after click leaves attempt UNCERTAIN (retains slot)");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 37: N3 State Loss: Loss of extension local state after Dispatch Fence
+  //          does not click Send again; native durable state keeps attempt uncertain
+  // ---------------------------------------------------------------------------
+  {
+    const testReceipt = {
+      receiptId: "rcpt_n3_1",
+      executionId: "exec_n3_1",
+      originConversationId: "c_n3_123",
+      originConversationUrl: "https://chatgpt.com/c/c_n3_123",
+      deliveryStatus: "received"
+    };
+
+    let clickCount = 0;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_n3_1: testReceipt
+      },
+      mockTabs: { 206: { id: 206, url: "https://chatgpt.com/c/c_n3_123" } },
+      mockTabMessages: {
+        206: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_n3_live",
+              readiness: { ready: true, transcriptText: "t", accountText: "a" }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            clickCount++;
+            return { ok: true, clicked: true, documentId: "doc_n3_live" };
+          }
+          if (msg.action === "verify_submitted_message") {
+            return { ok: true, observed: false };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    let nativeFenceState = "not_granted";
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        if (nativeFenceState === "not_granted") {
+          nativeFenceState = "dispatching/uncertain";
+          cb({
+            status: "ok",
+            grant: {
+              granted: true,
+              receipt_id: msg.receiptId,
+              execution_id: msg.executionId,
+              attempt_id: msg.attemptId,
+              delivery_revision: 1,
+              state: "dispatching/uncertain",
+              owner_document_id: msg.documentId
+            }
+          });
+          return;
+        } else {
+          // Slot already owned and uncertain: native host denies grant to fresh attempt!
+          cb({
+            status: "ok",
+            grant: {
+              granted: false,
+              receipt_id: msg.receiptId,
+              execution_id: msg.executionId,
+              attempt_id: "attempt_prior_uncertain",
+              delivery_revision: 1,
+              state: "dispatching/uncertain",
+              owner_document_id: "doc_prior"
+            }
+          });
+          return;
+        }
+      }
+      if (msg.op === "settle_fence") {
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: false
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // 1. Initial attempt clicks once and outcome is uncertain
+    const res1 = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_n3_1" }, trustedSender);
+    assert.equal(res1.dispatchResult.status, "uncertain");
+    assert.equal(clickCount, 1);
+
+    // 2. N3 State Loss: Simulate complete loss of local browser state (e.g. extension storage wiped / reconstructed)
+    delete harness.storageStore["receipt_rcpt_n3_1"];
+    harness.storageStore["receipt_rcpt_n3_1"] = { ...testReceipt, deliveryStatus: "received" }; // Re-drained as received
+
+    // 3. New wakeup / dispatch attempt on reconstructed receipt
+    const res2 = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_n3_1" }, trustedSender);
+    assert.equal(res2.dispatchResult.status, "denied", "Native durable state must deny grant after local state loss");
+    assert.equal(res2.dispatchResult.reason, "slot_busy_or_competing_owner");
+    assert.equal(clickCount, 1, "Must NOT perform second click after N3 state loss!");
+
+    console.log("  [PASS] N3 State Loss: Loss of extension local state does not click Send again");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

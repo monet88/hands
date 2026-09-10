@@ -1496,3 +1496,103 @@ fn test_protocol_drain_and_ack_operations() {
     assert_eq!(drain_again["receipts"].as_array().unwrap().len(), 0);
     assert_eq!(drain_again["summaries"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn test_protocol_dispatch_fence_and_settlement_messages() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_proto_fence";
+    let bootstrap_token = "boot_proto_fence";
+    let profile_id = "profile_proto_fence";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let act_res = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let pairing_secret = act_res.pairing_secret;
+
+    let conv_id = "conv_proto_fence";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_pf_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t_pf".into(),
+        account_evidence_hash: "hash_a_pf".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task pf".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_pf_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_pf', 'pf text', 'digest_pf', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // 1. Acquire grant over protocol
+    let fence_msg = json!({
+        "op": "dispatch_fence",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "receiptId": rcpt_id,
+        "executionId": claim.execution_id,
+        "attemptId": "attempt_proto_1",
+        "expectedDeliveryRevision": 1,
+        "payloadDigest": "digest_proto_stable",
+        "receiptMarker": "marker_proto_1",
+        "originConversationId": conv_id,
+        "originConversationUrl": conv_url,
+        "accountEvidenceHash": "hash_a_pf",
+        "transcriptEvidenceHash": "hash_t_pf",
+        "tabId": "tab_123",
+        "documentId": "doc_proto_1"
+    });
+
+    let fence_resp = handle_native_message(&fence_msg, &journal);
+    assert_eq!(fence_resp["status"], "ok", "fence_resp failed: {:?}", fence_resp);
+    assert_eq!(fence_resp["grant"]["granted"], true);
+    assert_eq!(fence_resp["grant"]["attempt_id"], "attempt_proto_1");
+
+    // 2. Competing document attempt is rejected over protocol
+    let mut competing_msg = fence_msg.clone();
+    competing_msg["documentId"] = json!("doc_proto_2");
+    competing_msg["attemptId"] = json!("attempt_proto_competing");
+    let competing_resp = handle_native_message(&competing_msg, &journal);
+    assert_eq!(competing_resp["status"], "ok");
+    assert_eq!(competing_resp["grant"]["granted"], false, "Competing document must receive granted=false");
+
+    // 3. Settle fence over protocol with CAS check
+    let settle_msg = json!({
+        "op": "settle_fence",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "receiptId": rcpt_id,
+        "executionId": claim.execution_id,
+        "attemptId": "attempt_proto_1",
+        "expectedDeliveryRevision": 1,
+        "outcome": "submitted-observed",
+        "observedMessageId": "msg_chatgpt_real_888",
+        "transcriptEvidenceHash": "hash_transcript_after_submit"
+    });
+
+    let settle_resp = handle_native_message(&settle_msg, &journal);
+    assert_eq!(settle_resp["status"], "ok");
+    assert_eq!(settle_resp["settlement"]["settled"], true);
+    assert_eq!(settle_resp["settlement"]["slot_released"], true);
+}

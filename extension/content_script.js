@@ -3,23 +3,140 @@
 // Does NOT have access to pairing secrets, native messaging, or execution control.
 
 (() => {
-  // Listen for evidence request from extension
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request && request.action === "collect_page_evidence") {
-      try {
-        const href = window.location.href;
-        const pathname = window.location.pathname;
+  // Stable per-document identity generated on script load
+  const DOCUMENT_ID = "doc_" + (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID().replace(/-/g, "").slice(0, 16) : Math.random().toString(36).slice(2, 18));
+  const SCRIPT_LOADED_URL = window.location.href.split("#")[0].split("?")[0];
 
-        // Parse canonical conversation ID: /c/<id> or /g/<gizmo>/c/<id>
-        const segments = pathname.split("/").filter(Boolean);
-        let conversationId = null;
-        if (segments.length === 2 && segments[0] === "c") {
-          conversationId = segments[1];
-        } else if (segments.length === 4 && segments[0] === "g" && segments[2] === "c") {
-          conversationId = segments[3];
+  // Track one-time grant consumption by this exact document
+  let consumedGrantAttemptId = null;
+
+  function getCanonicalConversationId() {
+    const pathname = window.location.pathname;
+    const segments = pathname.split("/").filter(Boolean);
+    let conversationId = null;
+    if (segments.length === 2 && segments[0] === "c") {
+      conversationId = segments[1];
+    } else if (segments.length === 4 && segments[0] === "g" && segments[2] === "c") {
+      conversationId = segments[3];
+    }
+    if (!conversationId || conversationId === "new" || conversationId === "chat" || conversationId.includes("new_chat") || conversationId.includes("provisional")) {
+      return null;
+    }
+    return conversationId;
+  }
+
+  function getRenderedTranscriptText() {
+    const turnSelectors = [
+      'main div[data-testid^="conversation-turn"]',
+      'article',
+      '[data-message-author-role]'
+    ];
+    let turnNodes = [];
+    for (const selector of turnSelectors) {
+      const candidates = Array.from(document.querySelectorAll(selector));
+      if (candidates.length > 0) {
+        turnNodes = candidates;
+        break;
+      }
+    }
+    let transcriptText = "";
+    for (const node of turnNodes) {
+      const text = (node.innerText || "").trim();
+      if (text) {
+        transcriptText += text + "\n";
+        if (transcriptText.length > 128 * 1024) {
+          transcriptText = transcriptText.slice(0, 128 * 1024);
+          break;
         }
+      }
+    }
+    return transcriptText;
+  }
 
-        if (!conversationId || conversationId === "new" || conversationId === "chat" || conversationId.includes("new_chat") || conversationId.includes("provisional")) {
+  function getAccountContextText() {
+    const accountNodes = document.querySelectorAll(
+      '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]'
+    );
+    let accountText = "";
+    for (const node of accountNodes) {
+      const candidate = (node?.innerText || "").trim();
+      if (candidate) {
+        accountText = candidate;
+        break;
+      }
+    }
+    return accountText;
+  }
+
+  function checkReadinessGuards(expectedConversationId, expectedConversationUrl) {
+    // 1. Navigation / Route change check
+    const currentUrl = window.location.href.split("#")[0].split("?")[0];
+    if (currentUrl !== SCRIPT_LOADED_URL || currentUrl !== expectedConversationUrl) {
+      return { ready: false, reason: "navigation_invalidated", message: "Document URL or route changed since script load" };
+    }
+    const currentConvId = getCanonicalConversationId();
+    if (!currentConvId || currentConvId !== expectedConversationId) {
+      return { ready: false, reason: "conversation_mismatch", message: "Page is not the expected canonical conversation" };
+    }
+
+    // 2. Loading / Login / Error page check
+    if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
+      return { ready: false, reason: "login_or_error_page", message: "Page shows login or error state" };
+    }
+    if (document.readyState === "loading") {
+      return { ready: false, reason: "document_loading", message: "Document is still loading" };
+    }
+
+    // 3. Active generation check (never stop generation)
+    const stopButton = document.querySelector(
+      'button[data-testid="stop-button"], button[aria-label*="Stop generating"], button[data-testid="fruitjuice-stop-button"]'
+    );
+    if (stopButton) {
+      return { ready: false, reason: "active_generation", message: "ChatGPT is currently generating a response" };
+    }
+
+    // 4. Draft preservation check (never overwrite user draft)
+    const promptTextarea = document.querySelector(
+      '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
+    );
+    if (promptTextarea) {
+      const draftText = (promptTextarea.value !== undefined ? promptTextarea.value : promptTextarea.innerText || "").trim();
+      if (draftText.length > 0) {
+        return { ready: false, reason: "unrelated_draft_present", message: "User draft present in composer; preserving draft without overwrite" };
+      }
+    } else {
+      return { ready: false, reason: "composer_not_found", message: "Prompt composer element not found" };
+    }
+
+    // 5. Context evidence
+    const transcriptText = getRenderedTranscriptText();
+    if (!transcriptText) {
+      return { ready: false, reason: "missing_transcript", message: "No conversation transcript rendered" };
+    }
+    const accountText = getAccountContextText();
+    if (!accountText) {
+      return { ready: false, reason: "missing_account_context", message: "No account/workspace context found" };
+    }
+
+    return {
+      ready: true,
+      documentId: DOCUMENT_ID,
+      conversationId: currentConvId,
+      currentUrl,
+      transcriptText,
+      accountText
+    };
+  }
+
+  // Listen for messages from background.js
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!request || typeof request !== "object") return false;
+
+    // Op 1: Legacy evidence collector for launch
+    if (request.action === "collect_page_evidence") {
+      try {
+        const conversationId = getCanonicalConversationId();
+        if (!conversationId) {
           sendResponse({
             ok: false,
             error: "invalid_conversation_boundary",
@@ -27,32 +144,7 @@
           });
           return true;
         }
-
-        // Collect rendered transcript text from conversation turns
-        const turnSelectors = [
-          'main div[data-testid^="conversation-turn"]',
-          'article',
-          '[data-message-author-role]'
-        ];
-        let turnNodes = [];
-        for (const selector of turnSelectors) {
-          const candidates = Array.from(document.querySelectorAll(selector));
-          if (candidates.length > 0) {
-            turnNodes = candidates;
-            break;
-          }
-        }
-        let transcriptText = "";
-        for (const node of turnNodes) {
-          const text = (node.innerText || "").trim();
-          if (text) {
-            transcriptText += text + "\n";
-            if (transcriptText.length > 128 * 1024) {
-              transcriptText = transcriptText.slice(0, 128 * 1024);
-              break;
-            }
-          }
-        }
+        const transcriptText = getRenderedTranscriptText();
         if (!transcriptText) {
           sendResponse({
             ok: false,
@@ -61,19 +153,7 @@
           });
           return true;
         }
-
-        // Collect account / workspace evidence if available
-        const accountNodes = document.querySelectorAll(
-          '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]'
-        );
-        let accountText = "";
-        for (const node of accountNodes) {
-          const candidate = (node?.innerText || "").trim();
-          if (candidate) {
-            accountText = candidate;
-            break;
-          }
-        }
+        const accountText = getAccountContextText();
         if (!accountText) {
           sendResponse({
             ok: false,
@@ -84,19 +164,188 @@
         }
         sendResponse({
           ok: true,
+          documentId: DOCUMENT_ID,
           originConversationId: conversationId,
-          originConversationUrl: href.split("#")[0].split("?")[0],
+          originConversationUrl: window.location.href.split("#")[0].split("?")[0],
           transcriptText,
           accountText
         });
       } catch (err) {
+        sendResponse({ ok: false, error: "evidence_collection_failed", message: String(err) });
+      }
+      return true;
+    }
+
+    // Op 2: Check delivery readiness (pre-grant check)
+    if (request.action === "check_delivery_readiness") {
+      try {
+        const readiness = checkReadinessGuards(
+          request.expectedConversationId,
+          request.expectedConversationUrl
+        );
+        sendResponse({
+          ok: readiness.ready,
+          readiness,
+          documentId: DOCUMENT_ID
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: "readiness_check_failed", message: String(err) });
+      }
+      return true;
+    }
+
+    // Op 3: Consume Grant and Synchronous Guard-and-Click
+    if (request.action === "consume_grant_and_dispatch") {
+      try {
+        const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, continuationText, receiptMarker } = request;
+
+        // Document Identity Check: grant is bound to this specific document
+        if (expectedDocumentId !== DOCUMENT_ID) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "document_identity_mismatch",
+            message: "Grant was issued for a different document identity"
+          });
+          return true;
+        }
+
+        // One-time grant consumption guard: this document cannot consume the same or another grant twice!
+        if (consumedGrantAttemptId) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "grant_already_consumed",
+            message: "Grant attempt already consumed by this live document; duplicate click prevented"
+          });
+          return true;
+        }
+
+        // Mark grant consumed immediately before synchronous guards & click
+        consumedGrantAttemptId = attemptId;
+
+        // Synchronous final readiness guard (zero asynchronous gap!)
+        const finalReadiness = checkReadinessGuards(expectedConversationId, expectedConversationUrl);
+        if (!finalReadiness.ready) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: finalReadiness.reason,
+            message: finalReadiness.message
+          });
+          return true;
+        }
+
+        // Locate composer and send button
+        const composer = document.querySelector(
+          '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
+        );
+        const sendBtn = document.querySelector(
+          'button[data-testid="send-button"], button[aria-label*="Send prompt"], button[data-testid="fruitjuice-send-button"]'
+        );
+
+        if (!composer || !sendBtn) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "composer_elements_missing",
+            message: "Composer or send button missing at dispatch moment"
+          });
+          return true;
+        }
+
+        // Synchronously populate continuation payload into composer
+        if (composer.tagName === "TEXTAREA") {
+          composer.value = continuationText;
+          composer.dispatchEvent(new Event("input", { bubbles: true }));
+          composer.dispatchEvent(new Event("change", { bubbles: true }));
+        } else if (composer.isContentEditable) {
+          composer.innerText = continuationText;
+          composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: continuationText }));
+        }
+
+        // Synchronously click send button
+        sendBtn.click();
+
+        sendResponse({
+          ok: true,
+          clicked: true,
+          documentId: DOCUMENT_ID,
+          attemptId,
+          receiptMarker
+        });
+      } catch (err) {
         sendResponse({
           ok: false,
-          error: "evidence_collection_failed",
+          clicked: false,
+          reason: "click_execution_failed",
           message: String(err)
         });
       }
+      return true;
     }
-    return true;
+
+    // Op 4: Verify Submitted User Message in Transcript (for submitted-observed)
+    if (request.action === "verify_submitted_message") {
+      try {
+        const { receiptMarker, expectedConversationId } = request;
+        const currentConvId = getCanonicalConversationId();
+        if (!currentConvId || currentConvId !== expectedConversationId) {
+          sendResponse({
+            ok: false,
+            observed: false,
+            reason: "conversation_mismatch"
+          });
+          return true;
+        }
+
+        // Look for user messages containing the stable receiptMarker
+        const userMessageSelectors = [
+          '[data-message-author-role="user"]',
+          'main div[data-testid^="conversation-turn"]:has([data-message-author-role="user"])',
+          'div[data-message-author-role="user"]'
+        ];
+        let found = null;
+        for (const selector of userMessageSelectors) {
+          const userTurns = document.querySelectorAll(selector);
+          for (const turn of userTurns) {
+            const text = (turn.innerText || "").trim();
+            if (text.includes(receiptMarker)) {
+              const msgId = turn.getAttribute("data-message-id") || turn.getAttribute("data-testid") || ("msg_observed_" + DOCUMENT_ID);
+              found = { messageId: msgId, text };
+              break;
+            }
+          }
+          if (found) break;
+        }
+
+        const transcriptText = getRenderedTranscriptText();
+        if (found) {
+          sendResponse({
+            ok: true,
+            observed: true,
+            observedMessageId: found.messageId,
+            transcriptText,
+            documentId: DOCUMENT_ID
+          });
+        } else {
+          sendResponse({
+            ok: true,
+            observed: false,
+            transcriptText,
+            documentId: DOCUMENT_ID
+          });
+        }
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          observed: false,
+          error: String(err)
+        });
+      }
+      return true;
+    }
+
+    return false;
   });
 })();

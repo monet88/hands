@@ -145,9 +145,17 @@ window.startTest = async function(config = {}) {
       // Find or create bound ChatGPT tab
       const existingTabs = await chrome.tabs.query({ url: "https://chatgpt.com/c/*" });
       let chatTab = existingTabs[0];
-      if (!chatTab) {
+      if (!chatTab || !chatTab.id) {
         chatTab = await chrome.tabs.create({ url: "https://chatgpt.com/c/conv_e2e_123" });
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      } else {
+        // Ensure existing tab is reloaded/ready after browser restart
+        try {
+          const tabDetail = await chrome.tabs.get(chatTab.id);
+          if (tabDetail.status === "loading") {
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+          }
+        } catch {}
       }
 
       // Initialize the mock page once. Re-injecting content_script.js would register
@@ -302,6 +310,28 @@ window.startTest = async function(config = {}) {
       const crossAckRejected = crossAckResp && crossAckResp.status === "error" && crossAckResp.code === "profile_mismatch";
       logResult("profile_isolation_ack", crossAckRejected, crossAckResp);
       results.steps.push({ step: "profile_isolation_ack", pass: crossAckRejected });
+
+      // N4 Profile Isolation: Profile Beta cannot acquire dispatch fence or settle for Profile Alpha's pairing
+      const crossFenceResp = await sendNative({
+        op: "dispatch_fence",
+        pairingId,
+        pairingSecret,
+        profileId: "profile_beta",
+        receiptId: "any_rcpt",
+        executionId: "any_exec",
+        attemptId: "att_cross",
+        expectedDeliveryRevision: 1,
+        payloadDigest: "digest_cross",
+        receiptMarker: "marker_cross",
+        originConversationId: "conv_cross",
+        originConversationUrl: "https://chatgpt.com/c/conv_cross",
+        accountEvidenceHash: "hash_a",
+        transcriptEvidenceHash: "hash_t",
+        documentId: "doc_cross"
+      });
+      const crossFenceRejected = crossFenceResp && crossFenceResp.status === "error" && crossFenceResp.code === "profile_mismatch";
+      logResult("profile_isolation_dispatch_fence", crossFenceRejected, crossFenceResp);
+      results.steps.push({ step: "profile_isolation_dispatch_fence", pass: crossFenceRejected });
     } else if (mode === "revoke") {
       // Step 10: Revoke pairing from Profile Alpha
       const revokeResp = await sendNative({

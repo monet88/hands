@@ -83,6 +83,7 @@ pub enum PairingError {
     AlreadyAttempted,
     ReceiptNotFound,
     ExecutionMismatch,
+    DispatchFenceConflict,
     StorageError(String),
 }
 
@@ -103,6 +104,7 @@ impl std::fmt::Display for PairingError {
             PairingError::AlreadyAttempted => write!(f, "already_attempted"),
             PairingError::ReceiptNotFound => write!(f, "receipt_not_found"),
             PairingError::ExecutionMismatch => write!(f, "execution_mismatch"),
+            PairingError::DispatchFenceConflict => write!(f, "dispatch_fence_conflict"),
             PairingError::StorageError(e) => write!(f, "storage_error: {}", e),
         }
     }
@@ -243,6 +245,60 @@ pub struct AttemptEvidence {
     pub orca_tab_id: Option<String>,
     pub orca_pane_key: Option<String>,
     pub orca_pty_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchClaimParams {
+    pub pairing_id: String,
+    pub receipt_id: String,
+    pub execution_id: String,
+    pub attempt_id: String,
+    pub expected_delivery_revision: i64,
+    pub payload_digest: String,
+    pub receipt_marker: String,
+    pub origin_conversation_id: String,
+    pub origin_conversation_url: String,
+    pub account_evidence_hash: String,
+    pub transcript_evidence_hash: String,
+    pub tab_id: Option<String>,
+    pub document_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchGrantResult {
+    pub granted: bool,
+    pub receipt_id: String,
+    pub execution_id: String,
+    pub attempt_id: String,
+    pub delivery_revision: i64,
+    pub state: String,
+    pub owner_document_id: String,
+    pub owner_tab_id: Option<String>,
+    pub receipt_marker: String,
+    pub payload_digest: String,
+    pub origin_conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchSettlementParams {
+    pub pairing_id: String,
+    pub receipt_id: String,
+    pub execution_id: String,
+    pub attempt_id: String,
+    pub expected_delivery_revision: i64,
+    pub outcome: String, // "submitted-observed" | "not-sent" | "uncertain"
+    pub observed_message_id: Option<String>,
+    pub transcript_evidence_hash: Option<String>,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchSettlementResult {
+    pub settled: bool,
+    pub receipt_id: String,
+    pub attempt_id: String,
+    pub outcome: String,
+    pub slot_released: bool,
 }
 
 
@@ -417,6 +473,43 @@ impl Journal {
                 FOREIGN KEY (receipt_id) REFERENCES completion_receipts(receipt_id) ON DELETE CASCADE,
                 FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE,
                 FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS dispatch_fences (
+                receipt_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                pairing_id TEXT NOT NULL,
+                origin_conversation_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                delivery_revision INTEGER NOT NULL,
+                payload_digest TEXT NOT NULL,
+                receipt_marker TEXT NOT NULL,
+                origin_conversation_url TEXT NOT NULL,
+                account_evidence_hash TEXT NOT NULL,
+                transcript_evidence_hash TEXT NOT NULL,
+                tab_id TEXT,
+                document_id TEXT NOT NULL,
+                state TEXT NOT NULL, -- 'dispatching/uncertain', 'submitted-observed', 'not-sent'
+                observed_message_id TEXT,
+                settled_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (receipt_id) REFERENCES completion_receipts(receipt_id) ON DELETE CASCADE,
+                FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE,
+                FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_delivery_slots (
+                pairing_id TEXT NOT NULL,
+                origin_conversation_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL UNIQUE,
+                attempt_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                state TEXT NOT NULL, -- 'dispatching/uncertain'
+                claimed_at INTEGER NOT NULL,
+                PRIMARY KEY (pairing_id, origin_conversation_id),
+                FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE,
+                FOREIGN KEY (receipt_id) REFERENCES dispatch_fences(receipt_id) ON DELETE CASCADE
             );
             "#,
         )?;
@@ -1689,5 +1782,530 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(true)
+    }
+
+    pub fn acquire_dispatch_fence(
+        &self,
+        params: &DispatchClaimParams,
+    ) -> Result<DispatchGrantResult, PairingError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        // 1. Verify receipt exists, belongs to pairing, matches execution_id, and matches origin_conversation_id
+        let receipt_info: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT pairing_id, execution_id, origin_conversation_id FROM completion_receipts WHERE receipt_id = ?1",
+                params![&params.receipt_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let (rcpt_pairing, rcpt_exec, rcpt_conv) = match receipt_info {
+            Some(info) => info,
+            None => return Err(PairingError::ReceiptNotFound),
+        };
+
+        if rcpt_pairing != params.pairing_id {
+            return Err(PairingError::NotFound);
+        }
+        if rcpt_exec != params.execution_id {
+            return Err(PairingError::ExecutionMismatch);
+        }
+        if rcpt_conv != params.origin_conversation_id {
+            return Err(PairingError::DispatchFenceConflict);
+        }
+
+        // 2. Check existing dispatch_fence for this receipt
+        let existing_fence: Option<(
+            String, // attempt_id
+            i64,    // delivery_revision
+            String, // payload_digest
+            String, // receipt_marker
+            String, // state
+            String, // document_id
+            Option<String>, // tab_id
+        )> = tx
+            .query_row(
+                r#"
+                SELECT attempt_id, delivery_revision, payload_digest, receipt_marker, state, document_id, tab_id
+                FROM dispatch_fences
+                WHERE receipt_id = ?1
+                "#,
+                params![&params.receipt_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let now = now_epoch_secs();
+
+        if let Some((cur_attempt, cur_rev, cur_digest, cur_marker, cur_state, cur_doc, cur_tab)) = existing_fence {
+            // Payload digest and marker must remain stable across attempts!
+            if cur_digest != params.payload_digest || cur_marker != params.receipt_marker {
+                return Err(PairingError::PayloadConflict);
+            }
+
+            // If terminal submitted-observed: no new grant ever! Losers/replays obtain status.
+            if cur_state == "submitted-observed" {
+                return Ok(DispatchGrantResult {
+                    granted: false,
+                    receipt_id: params.receipt_id.clone(),
+                    execution_id: params.execution_id.clone(),
+                    attempt_id: cur_attempt,
+                    delivery_revision: cur_rev,
+                    state: cur_state,
+                    owner_document_id: cur_doc,
+                    owner_tab_id: cur_tab,
+                    receipt_marker: cur_marker,
+                    payload_digest: cur_digest,
+                    origin_conversation_id: params.origin_conversation_id.clone(),
+                });
+            }
+
+            // If currently dispatching/uncertain:
+            if cur_state == "dispatching/uncertain" {
+                // Replay check: exactly same attempt_id and document_id?
+                if cur_attempt == params.attempt_id && cur_doc == params.document_id {
+                    // Same owner replay -> returns existing grant info
+                    return Ok(DispatchGrantResult {
+                        granted: true,
+                        receipt_id: params.receipt_id.clone(),
+                        execution_id: params.execution_id.clone(),
+                        attempt_id: cur_attempt,
+                        delivery_revision: cur_rev,
+                        state: cur_state,
+                        owner_document_id: cur_doc,
+                        owner_tab_id: cur_tab,
+                        receipt_marker: cur_marker,
+                        payload_digest: cur_digest,
+                        origin_conversation_id: params.origin_conversation_id.clone(),
+                    });
+                } else {
+                    // Competing document or separate native host: LOSER receives status, NEVER permission!
+                    return Ok(DispatchGrantResult {
+                        granted: false,
+                        receipt_id: params.receipt_id.clone(),
+                        execution_id: params.execution_id.clone(),
+                        attempt_id: cur_attempt,
+                        delivery_revision: cur_rev,
+                        state: cur_state,
+                        owner_document_id: cur_doc,
+                        owner_tab_id: cur_tab,
+                        receipt_marker: cur_marker,
+                        payload_digest: cur_digest,
+                        origin_conversation_id: params.origin_conversation_id.clone(),
+                    });
+                }
+            }
+
+            // If conclusively not-sent: can transition to a new attempt ONLY if delivery_revision increments
+            if cur_state == "not-sent" {
+                if params.expected_delivery_revision <= cur_rev {
+                    return Err(PairingError::DispatchFenceConflict);
+                }
+                // Check conversation slot availability
+                let slot_owner: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT receipt_id, attempt_id FROM conversation_delivery_slots WHERE pairing_id = ?1 AND origin_conversation_id = ?2",
+                        params![&params.pairing_id, &params.origin_conversation_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                if let Some((active_rcpt, active_att)) = slot_owner {
+                    if active_rcpt != params.receipt_id || active_att != params.attempt_id {
+                        return Ok(DispatchGrantResult {
+                            granted: false,
+                            receipt_id: params.receipt_id.clone(),
+                            execution_id: params.execution_id.clone(),
+                            attempt_id: active_att,
+                            delivery_revision: cur_rev,
+                            state: "slot_busy".to_string(),
+                            owner_document_id: cur_doc,
+                            owner_tab_id: cur_tab,
+                            receipt_marker: cur_marker,
+                            payload_digest: cur_digest,
+                            origin_conversation_id: params.origin_conversation_id.clone(),
+                        });
+                    }
+                }
+
+                // Claim new attempt on the fence
+                tx.execute(
+                    r#"
+                    UPDATE dispatch_fences
+                    SET attempt_id = ?1,
+                        delivery_revision = ?2,
+                        origin_conversation_url = ?3,
+                        account_evidence_hash = ?4,
+                        transcript_evidence_hash = ?5,
+                        tab_id = ?6,
+                        document_id = ?7,
+                        state = 'dispatching/uncertain',
+                        updated_at = ?8
+                    WHERE receipt_id = ?9
+                    "#,
+                    params![
+                        &params.attempt_id,
+                        params.expected_delivery_revision,
+                        &params.origin_conversation_url,
+                        &params.account_evidence_hash,
+                        &params.transcript_evidence_hash,
+                        &params.tab_id,
+                        &params.document_id,
+                        now,
+                        &params.receipt_id,
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                // Claim conversation delivery slot
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO conversation_delivery_slots (
+                        pairing_id, origin_conversation_id, receipt_id, attempt_id, document_id, state, claimed_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching/uncertain', ?6)
+                    "#,
+                    params![
+                        &params.pairing_id,
+                        &params.origin_conversation_id,
+                        &params.receipt_id,
+                        &params.attempt_id,
+                        &params.document_id,
+                        now,
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                tx.commit()
+                    .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                return Ok(DispatchGrantResult {
+                    granted: true,
+                    receipt_id: params.receipt_id.clone(),
+                    execution_id: params.execution_id.clone(),
+                    attempt_id: params.attempt_id.clone(),
+                    delivery_revision: params.expected_delivery_revision,
+                    state: "dispatching/uncertain".to_string(),
+                    owner_document_id: params.document_id.clone(),
+                    owner_tab_id: params.tab_id.clone(),
+                    receipt_marker: params.receipt_marker.clone(),
+                    payload_digest: params.payload_digest.clone(),
+                    origin_conversation_id: params.origin_conversation_id.clone(),
+                });
+            }
+
+            // Any other unhandled state
+            return Err(PairingError::DispatchFenceConflict);
+        }
+
+        // 3. Brand new fence for this receipt:
+        // First, check conversation slot availability across all receipts for this pairing & conversation
+        let slot_owner: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT receipt_id, attempt_id, document_id, state FROM conversation_delivery_slots WHERE pairing_id = ?1 AND origin_conversation_id = ?2",
+                params![&params.pairing_id, &params.origin_conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        if let Some((active_rcpt, active_att, active_doc, active_state)) = slot_owner {
+            let active_tab: Option<String> = tx
+                .query_row(
+                    "SELECT tab_id FROM dispatch_fences WHERE receipt_id = ?1",
+                    params![&active_rcpt],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| PairingError::StorageError(e.to_string()))?
+                .flatten();
+
+            // Conversation slot is already busy with an unresolved attempt for this or another receipt!
+            return Ok(DispatchGrantResult {
+                granted: false,
+                receipt_id: params.receipt_id.clone(),
+                execution_id: params.execution_id.clone(),
+                attempt_id: active_att,
+                delivery_revision: params.expected_delivery_revision,
+                state: active_state,
+                owner_document_id: active_doc,
+                owner_tab_id: active_tab,
+                receipt_marker: params.receipt_marker.clone(),
+                payload_digest: params.payload_digest.clone(),
+                origin_conversation_id: params.origin_conversation_id.clone(),
+            });
+        }
+
+        // Insert dispatch_fence row
+        tx.execute(
+            r#"
+            INSERT INTO dispatch_fences (
+                receipt_id, execution_id, pairing_id, origin_conversation_id,
+                attempt_id, delivery_revision, payload_digest, receipt_marker,
+                origin_conversation_url, account_evidence_hash, transcript_evidence_hash,
+                tab_id, document_id, state, observed_message_id, settled_at,
+                created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11,
+                ?12, ?13, 'dispatching/uncertain', NULL, NULL,
+                ?14, ?14
+            )
+            "#,
+            params![
+                &params.receipt_id,
+                &params.execution_id,
+                &params.pairing_id,
+                &params.origin_conversation_id,
+                &params.attempt_id,
+                params.expected_delivery_revision,
+                &params.payload_digest,
+                &params.receipt_marker,
+                &params.origin_conversation_url,
+                &params.account_evidence_hash,
+                &params.transcript_evidence_hash,
+                &params.tab_id,
+                &params.document_id,
+                now,
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        // Insert conversation_delivery_slots row
+        tx.execute(
+            r#"
+            INSERT INTO conversation_delivery_slots (
+                pairing_id, origin_conversation_id, receipt_id, attempt_id, document_id, state, claimed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching/uncertain', ?6)
+            "#,
+            params![
+                &params.pairing_id,
+                &params.origin_conversation_id,
+                &params.receipt_id,
+                &params.attempt_id,
+                &params.document_id,
+                now,
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(DispatchGrantResult {
+            granted: true,
+            receipt_id: params.receipt_id.clone(),
+            execution_id: params.execution_id.clone(),
+            attempt_id: params.attempt_id.clone(),
+            delivery_revision: params.expected_delivery_revision,
+            state: "dispatching/uncertain".to_string(),
+            owner_document_id: params.document_id.clone(),
+            owner_tab_id: params.tab_id.clone(),
+            receipt_marker: params.receipt_marker.clone(),
+            payload_digest: params.payload_digest.clone(),
+            origin_conversation_id: params.origin_conversation_id.clone(),
+        })
+    }
+
+    pub fn settle_dispatch_fence(
+        &self,
+        params: &DispatchSettlementParams,
+    ) -> Result<DispatchSettlementResult, PairingError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        // 1. Fetch current fence state
+        let fence_info: Option<(
+            String, // pairing_id
+            String, // execution_id
+            String, // origin_conversation_id
+            String, // attempt_id
+            i64,    // delivery_revision
+            String, // state
+        )> = tx
+            .query_row(
+                r#"
+                SELECT pairing_id, execution_id, origin_conversation_id, attempt_id, delivery_revision, state
+                FROM dispatch_fences
+                WHERE receipt_id = ?1
+                "#,
+                params![&params.receipt_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let (f_pairing, f_exec, f_conv, f_attempt, f_rev, f_state) = match fence_info {
+            Some(info) => info,
+            None => return Err(PairingError::ReceiptNotFound),
+        };
+
+        if f_pairing != params.pairing_id {
+            return Err(PairingError::NotFound);
+        }
+        if f_exec != params.execution_id {
+            return Err(PairingError::ExecutionMismatch);
+        }
+
+        // CAS Guard: attempt_id and expected_delivery_revision must match current owner!
+        if f_attempt != params.attempt_id || f_rev != params.expected_delivery_revision {
+            return Err(PairingError::DispatchFenceConflict);
+        }
+
+        // If already terminal submitted-observed: idempotent replay
+        if f_state == "submitted-observed" {
+            return Ok(DispatchSettlementResult {
+                settled: true,
+                receipt_id: params.receipt_id.clone(),
+                attempt_id: f_attempt,
+                outcome: "submitted-observed".to_string(),
+                slot_released: true,
+            });
+        }
+
+        let now = now_epoch_secs();
+        let slot_released;
+
+        match params.outcome.as_str() {
+            "submitted-observed" => {
+                // Requires observed_message_id
+                if params.observed_message_id.is_none() || params.observed_message_id.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(PairingError::StorageError("submitted-observed requires non-empty observed_message_id".to_string()));
+                }
+
+                tx.execute(
+                    r#"
+                    UPDATE dispatch_fences
+                    SET state = 'submitted-observed',
+                        observed_message_id = ?1,
+                        settled_at = ?2,
+                        updated_at = ?2
+                    WHERE receipt_id = ?3 AND attempt_id = ?4 AND delivery_revision = ?5
+                    "#,
+                    params![
+                        params.observed_message_id,
+                        now,
+                        &params.receipt_id,
+                        &params.attempt_id,
+                        params.expected_delivery_revision,
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                // Release conversation delivery slot
+                tx.execute(
+                    "DELETE FROM conversation_delivery_slots WHERE pairing_id = ?1 AND origin_conversation_id = ?2 AND receipt_id = ?3",
+                    params![&params.pairing_id, &f_conv, &params.receipt_id],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                slot_released = true;
+            }
+            "not-sent" => {
+                // Conclusive not-sent: release slot so another attempt or receipt may be scheduled
+                tx.execute(
+                    r#"
+                    UPDATE dispatch_fences
+                    SET state = 'not-sent',
+                        settled_at = ?1,
+                        updated_at = ?1
+                    WHERE receipt_id = ?2 AND attempt_id = ?3 AND delivery_revision = ?4
+                    "#,
+                    params![
+                        now,
+                        &params.receipt_id,
+                        &params.attempt_id,
+                        params.expected_delivery_revision,
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                tx.execute(
+                    "DELETE FROM conversation_delivery_slots WHERE pairing_id = ?1 AND origin_conversation_id = ?2 AND receipt_id = ?3",
+                    params![&params.pairing_id, &f_conv, &params.receipt_id],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                slot_released = true;
+            }
+            "uncertain" => {
+                // Inconclusive outcome: retain dispatching/uncertain and RETAIN conversation slot!
+                // No slot release!
+                tx.execute(
+                    r#"
+                    UPDATE dispatch_fences
+                    SET state = 'dispatching/uncertain',
+                        updated_at = ?1
+                    WHERE receipt_id = ?2 AND attempt_id = ?3 AND delivery_revision = ?4
+                    "#,
+                    params![
+                        now,
+                        &params.receipt_id,
+                        &params.attempt_id,
+                        params.expected_delivery_revision,
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+                slot_released = false;
+            }
+            other => {
+                return Err(PairingError::StorageError(format!("Invalid settlement outcome: {other}")));
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(DispatchSettlementResult {
+            settled: true,
+            receipt_id: params.receipt_id.clone(),
+            attempt_id: params.attempt_id.clone(),
+            outcome: params.outcome.clone(),
+            slot_released,
+        })
+    }
+
+    pub fn get_dispatch_fence(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<DispatchGrantResult>, PairingError> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT receipt_id, execution_id, attempt_id, delivery_revision, state,
+                       document_id, tab_id, receipt_marker, payload_digest, origin_conversation_id
+                FROM dispatch_fences
+                WHERE receipt_id = ?1
+                "#,
+                params![receipt_id],
+                |r| {
+                    Ok(DispatchGrantResult {
+                        granted: false, // informational lookup
+                        receipt_id: r.get(0)?,
+                        execution_id: r.get(1)?,
+                        attempt_id: r.get(2)?,
+                        delivery_revision: r.get(3)?,
+                        state: r.get(4)?,
+                        owner_document_id: r.get(5)?,
+                        owner_tab_id: r.get(6)?,
+                        receipt_marker: r.get(7)?,
+                        payload_digest: r.get(8)?,
+                        origin_conversation_id: r.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Ok(row)
     }
 }

@@ -262,6 +262,38 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             "executionId",
             "ackStatus",
         ],
+        "dispatch_fence" => &[
+            "op",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "receiptId",
+            "executionId",
+            "attemptId",
+            "expectedDeliveryRevision",
+            "payloadDigest",
+            "receiptMarker",
+            "originConversationId",
+            "originConversationUrl",
+            "accountEvidenceHash",
+            "transcriptEvidenceHash",
+            "tabId",
+            "documentId",
+        ],
+        "settle_fence" => &[
+            "op",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "receiptId",
+            "executionId",
+            "attemptId",
+            "expectedDeliveryRevision",
+            "outcome",
+            "observedMessageId",
+            "transcriptEvidenceHash",
+            "details",
+        ],
         _ => {
             return json!({
                 "status": "error",
@@ -760,6 +792,142 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                 Err(e) => map_pairing_error(e),
             }
         }
+        "dispatch_fence" => {
+            let (pairing_id, pairing_secret, profile_id) = match extract_credentials(obj) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            };
+            let _ctx = match journal.authenticate_pairing(pairing_id, pairing_secret, profile_id) {
+                Ok(c) => c,
+                Err(e) => return map_pairing_error(e),
+            };
+
+            let receipt_id = match obj.get("receiptId").and_then(|v| v.as_str()) {
+                Some(r) if !r.trim().is_empty() => r.trim(),
+                _ => return json!({ "status": "error", "code": "missing_receipt_id", "message": "Missing 'receiptId'" }),
+            };
+            let execution_id = match obj.get("executionId").and_then(|v| v.as_str()) {
+                Some(e) if !e.trim().is_empty() => e.trim(),
+                _ => return json!({ "status": "error", "code": "missing_execution_id", "message": "Missing 'executionId'" }),
+            };
+            let attempt_id = match obj.get("attemptId").and_then(|v| v.as_str()) {
+                Some(a) if !a.trim().is_empty() => a.trim(),
+                _ => return json!({ "status": "error", "code": "missing_attempt_id", "message": "Missing 'attemptId'" }),
+            };
+            let expected_delivery_revision = match obj.get("expectedDeliveryRevision").and_then(|v| v.as_i64()) {
+                Some(rev) if rev >= 1 => rev,
+                _ => return json!({ "status": "error", "code": "invalid_delivery_revision", "message": "Missing or invalid 'expectedDeliveryRevision'" }),
+            };
+            let payload_digest = match obj.get("payloadDigest").and_then(|v| v.as_str()) {
+                Some(d) if !d.trim().is_empty() => d.trim(),
+                _ => return json!({ "status": "error", "code": "missing_payload_digest", "message": "Missing 'payloadDigest'" }),
+            };
+            let receipt_marker = match obj.get("receiptMarker").and_then(|v| v.as_str()) {
+                Some(m) if !m.trim().is_empty() => m.trim(),
+                _ => return json!({ "status": "error", "code": "missing_receipt_marker", "message": "Missing 'receiptMarker'" }),
+            };
+            let origin_conversation_id = match obj.get("originConversationId").and_then(|v| v.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim(),
+                _ => return json!({ "status": "error", "code": "missing_origin_conversation_id", "message": "Missing 'originConversationId'" }),
+            };
+            let origin_conversation_url = match obj.get("originConversationUrl").and_then(|v| v.as_str()) {
+                Some(u) if !u.trim().is_empty() => u.trim(),
+                _ => return json!({ "status": "error", "code": "missing_origin_conversation_url", "message": "Missing 'originConversationUrl'" }),
+            };
+            let account_evidence_hash = match obj.get("accountEvidenceHash").and_then(|v| v.as_str()) {
+                Some(a) if !a.trim().is_empty() => a.trim(),
+                _ => return json!({ "status": "error", "code": "missing_account_evidence_hash", "message": "Missing 'accountEvidenceHash'" }),
+            };
+            let transcript_evidence_hash = match obj.get("transcriptEvidenceHash").and_then(|v| v.as_str()) {
+                Some(t) if !t.trim().is_empty() => t.trim(),
+                _ => return json!({ "status": "error", "code": "missing_transcript_evidence_hash", "message": "Missing 'transcriptEvidenceHash'" }),
+            };
+            let document_id = match obj.get("documentId").and_then(|v| v.as_str()) {
+                Some(d) if !d.trim().is_empty() => d.trim(),
+                _ => return json!({ "status": "error", "code": "missing_document_id", "message": "Missing 'documentId'" }),
+            };
+            let tab_id = obj.get("tabId").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            let claim_params = crate::journal::DispatchClaimParams {
+                pairing_id: pairing_id.to_string(),
+                receipt_id: receipt_id.to_string(),
+                execution_id: execution_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                expected_delivery_revision,
+                payload_digest: payload_digest.to_string(),
+                receipt_marker: receipt_marker.to_string(),
+                origin_conversation_id: origin_conversation_id.to_string(),
+                origin_conversation_url: origin_conversation_url.to_string(),
+                account_evidence_hash: account_evidence_hash.to_string(),
+                transcript_evidence_hash: transcript_evidence_hash.to_string(),
+                tab_id,
+                document_id: document_id.to_string(),
+            };
+
+            match journal.acquire_dispatch_fence(&claim_params) {
+                Ok(grant) => json!({
+                    "status": "ok",
+                    "grant": grant,
+                    "trustNotice": TRUST_NOTICE
+                }),
+                Err(e) => map_pairing_error(e),
+            }
+        }
+        "settle_fence" => {
+            let (pairing_id, pairing_secret, profile_id) = match extract_credentials(obj) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            };
+            let _ctx = match journal.authenticate_pairing(pairing_id, pairing_secret, profile_id) {
+                Ok(c) => c,
+                Err(e) => return map_pairing_error(e),
+            };
+
+            let receipt_id = match obj.get("receiptId").and_then(|v| v.as_str()) {
+                Some(r) if !r.trim().is_empty() => r.trim(),
+                _ => return json!({ "status": "error", "code": "missing_receipt_id", "message": "Missing 'receiptId'" }),
+            };
+            let execution_id = match obj.get("executionId").and_then(|v| v.as_str()) {
+                Some(e) if !e.trim().is_empty() => e.trim(),
+                _ => return json!({ "status": "error", "code": "missing_execution_id", "message": "Missing 'executionId'" }),
+            };
+            let attempt_id = match obj.get("attemptId").and_then(|v| v.as_str()) {
+                Some(a) if !a.trim().is_empty() => a.trim(),
+                _ => return json!({ "status": "error", "code": "missing_attempt_id", "message": "Missing 'attemptId'" }),
+            };
+            let expected_delivery_revision = match obj.get("expectedDeliveryRevision").and_then(|v| v.as_i64()) {
+                Some(rev) if rev >= 1 => rev,
+                _ => return json!({ "status": "error", "code": "invalid_delivery_revision", "message": "Missing or invalid 'expectedDeliveryRevision'" }),
+            };
+            let outcome = match obj.get("outcome").and_then(|v| v.as_str()) {
+                Some(o) if matches!(o, "submitted-observed" | "not-sent" | "uncertain") => o,
+                _ => return json!({ "status": "error", "code": "invalid_outcome", "message": "outcome must be 'submitted-observed', 'not-sent', or 'uncertain'" }),
+            };
+            let observed_message_id = obj.get("observedMessageId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let transcript_evidence_hash = obj.get("transcriptEvidenceHash").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let details = obj.get("details").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            let settle_params = crate::journal::DispatchSettlementParams {
+                pairing_id: pairing_id.to_string(),
+                receipt_id: receipt_id.to_string(),
+                execution_id: execution_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                expected_delivery_revision,
+                outcome: outcome.to_string(),
+                observed_message_id,
+                transcript_evidence_hash,
+                details,
+            };
+
+            match journal.settle_dispatch_fence(&settle_params) {
+                Ok(res) => json!({
+                    "status": "ok",
+                    "settlement": res,
+                    "trustNotice": TRUST_NOTICE
+                }),
+                Err(e) => map_pairing_error(e),
+            }
+        }
         other => json!({
             "status": "error",
             "code": "unsupported_operation",
@@ -878,6 +1046,11 @@ fn map_pairing_error(err: PairingError) -> Value {
             "status": "error",
             "code": "execution_mismatch",
             "message": "Execution ID does not match the completion receipt"
+        }),
+        PairingError::DispatchFenceConflict => json!({
+            "status": "error",
+            "code": "dispatch_fence_conflict",
+            "message": "Dispatch fence conflict: slot busy, revision conflict, or conversation mismatch"
         }),
         PairingError::StorageError(e) => json!({
             "status": "error",

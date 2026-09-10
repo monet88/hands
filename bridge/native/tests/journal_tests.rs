@@ -1341,3 +1341,301 @@ fn test_journal_drain_and_ack_completion_receipts() {
     let stored_rcpt = journal.get_completion_receipt(&claim_1.execution_id).unwrap();
     assert!(stored_rcpt.is_some(), "Durable receipt must remain in journal after transport ACK");
 }
+
+#[test]
+fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_fence_test";
+    let bootstrap_token = "boot_fence_test";
+    let profile_id = "profile_fence_test";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    // Seed two launch requests and completion receipts in the SAME conversation
+    let conv_id = "conv_shared_fence";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+
+    let claim1 = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_fence_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t1".into(),
+        account_evidence_hash: "hash_a1".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task 1".into(),
+    }).unwrap();
+
+    let claim2 = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_fence_2".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t2".into(),
+        account_evidence_hash: "hash_a2".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task 2".into(),
+    }).unwrap();
+
+    let rcpt1_id = "rcpt_fence_1";
+    let rcpt2_id = "rcpt_fence_2";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_1', 'assistant finished', 'digest_1', 1, 'completed', 1000)",
+            rusqlite::params![rcpt1_id, &claim1.execution_id, pairing_id, &claim1.return_token, conv_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_2', 'assistant finished 2', 'digest_2', 1, 'completed', 1001)",
+            rusqlite::params![rcpt2_id, &claim2.execution_id, pairing_id, &claim2.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // 1. Initial Grant Acquisition for receipt 1
+    let claim_params_1 = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt1_id.into(),
+        execution_id: claim1.execution_id.clone(),
+        attempt_id: "attempt_1_alpha".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_payload_stable".into(),
+        receipt_marker: "marker_stable_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_a1".into(),
+        transcript_evidence_hash: "hash_t1".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1_alpha".into(),
+    };
+
+    let grant1 = journal.acquire_dispatch_fence(&claim_params_1).unwrap();
+    assert!(grant1.granted, "First dispatch fence grant must succeed");
+    assert_eq!(grant1.state, "dispatching/uncertain");
+    assert_eq!(grant1.attempt_id, "attempt_1_alpha");
+    assert_eq!(grant1.owner_document_id, "doc_1_alpha");
+
+    // 2. Exact same owner replay is idempotent and returns granted=true
+    let replay1 = journal.acquire_dispatch_fence(&claim_params_1).unwrap();
+    assert!(replay1.granted, "Replay of exact attempt and document must return granted=true");
+    assert_eq!(replay1.attempt_id, "attempt_1_alpha");
+
+    // 3. Competing tab/document attempting receipt 1 receives status, NEVER permission (granted=false)
+    let mut competing_params_1 = claim_params_1.clone();
+    competing_params_1.attempt_id = "attempt_1_beta".into();
+    competing_params_1.document_id = "doc_1_beta".into();
+    competing_params_1.tab_id = Some("tab_2".into());
+
+    let competing_grant = journal.acquire_dispatch_fence(&competing_params_1).unwrap();
+    assert!(!competing_grant.granted, "Competing attempt on same receipt MUST be denied grant");
+    assert_eq!(competing_grant.state, "dispatching/uncertain");
+    assert_eq!(competing_grant.owner_document_id, "doc_1_alpha", "Owner document remains doc_1_alpha");
+
+    // 4. Conversation Slot Contention: Receipt 2 in SAME conversation is BLOCKED by active conversation slot!
+    let claim_params_2 = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt2_id.into(),
+        execution_id: claim2.execution_id.clone(),
+        attempt_id: "attempt_2_alpha".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_payload_2".into(),
+        receipt_marker: "marker_stable_2".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_a2".into(),
+        transcript_evidence_hash: "hash_t2".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1_alpha".into(),
+    };
+    let grant2 = journal.acquire_dispatch_fence(&claim_params_2).unwrap();
+    assert!(!grant2.granted, "Receipt 2 must be denied grant because conversation slot is held by receipt 1");
+
+    // 5. Inconclusive settlement ("uncertain") leaves attempt dispatching/uncertain and RETAINS slot
+    let uncertain_settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt1_id.into(),
+        execution_id: claim1.execution_id.clone(),
+        attempt_id: "attempt_1_alpha".into(),
+        expected_delivery_revision: 1,
+        outcome: "uncertain".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: Some("Lost contact before click confirmation".into()),
+    }).unwrap();
+    assert!(uncertain_settle.settled);
+    assert!(!uncertain_settle.slot_released, "Uncertain settlement must NOT release conversation slot");
+
+    // Slot is still blocked for receipt 2
+    let grant2_after_uncertain = journal.acquire_dispatch_fence(&claim_params_2).unwrap();
+    assert!(!grant2_after_uncertain.granted, "Slot must remain held after uncertain settlement");
+
+    // 6. Stale or mismatched CAS settlement attempt fails closed
+    let stale_settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt1_id.into(),
+        execution_id: claim1.execution_id.clone(),
+        attempt_id: "attempt_stale_wrong".into(), // Wrong attempt
+        expected_delivery_revision: 1,
+        outcome: "not-sent".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: None,
+    });
+    assert!(stale_settle.is_err(), "Stale CAS attempt mismatch must fail closed");
+
+    // 7. Conclusive settlement ("submitted-observed") requires message ID, settles fence, and releases slot
+    let missing_msg_id = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt1_id.into(),
+        execution_id: claim1.execution_id.clone(),
+        attempt_id: "attempt_1_alpha".into(),
+        expected_delivery_revision: 1,
+        outcome: "submitted-observed".into(),
+        observed_message_id: None, // Missing!
+        transcript_evidence_hash: None,
+        details: None,
+    });
+    assert!(missing_msg_id.is_err(), "submitted-observed requires non-empty observed_message_id");
+
+    let valid_submitted = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt1_id.into(),
+        execution_id: claim1.execution_id.clone(),
+        attempt_id: "attempt_1_alpha".into(),
+        expected_delivery_revision: 1,
+        outcome: "submitted-observed".into(),
+        observed_message_id: Some("msg_observed_777".into()),
+        transcript_evidence_hash: Some("hash_transcript_final".into()),
+        details: None,
+    }).unwrap();
+    assert!(valid_submitted.settled);
+    assert!(valid_submitted.slot_released, "Conclusive settlement must release conversation slot");
+
+    // 8. After conclusive settlement of receipt 1, receipt 2 can now acquire the conversation slot!
+    let grant2_now = journal.acquire_dispatch_fence(&claim_params_2).unwrap();
+    assert!(grant2_now.granted, "Receipt 2 must now successfully acquire the conversation slot");
+    assert_eq!(grant2_now.attempt_id, "attempt_2_alpha");
+
+    // 9. Replay on settled receipt 1 NEVER grants permission again
+    let replay_settled_1 = journal.acquire_dispatch_fence(&claim_params_1).unwrap();
+    assert!(!replay_settled_1.granted, "Settled receipt 1 can NEVER grant permission again");
+    assert_eq!(replay_settled_1.state, "submitted-observed");
+}
+
+#[test]
+fn test_concurrent_dual_native_hosts_competing_on_same_receipt_and_conversation() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal_init = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_concurrent_hosts";
+    let bootstrap_token = "boot_concurrent_hosts";
+    let profile_id = "profile_concurrent_hosts";
+    journal_init.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal_init.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_concurrent_shared";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+    let claim = journal_init.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_concurrent_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t_conc".into(),
+        account_evidence_hash: "hash_a_conc".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "concurrent task".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_concurrent_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_c', 'concurrent text', 'digest_c', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+    drop(journal_init);
+
+    // Simulate two real separate native host processes by opening two distinct Journal handles
+    // to the same on-disk SQLite database file with WAL mode.
+    let host_1 = Arc::new(Journal::open(&db_path).unwrap());
+    let host_2 = Arc::new(Journal::open(&db_path).unwrap());
+
+    let claim_params_1 = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "attempt_host_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_conc_stable".into(),
+        receipt_marker: "marker_conc_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_a_conc".into(),
+        transcript_evidence_hash: "hash_t_conc".into(),
+        tab_id: Some("tab_host_1".into()),
+        document_id: "doc_host_1".into(),
+    };
+
+    let mut claim_params_2 = claim_params_1.clone();
+    claim_params_2.attempt_id = "attempt_host_2".into();
+    claim_params_2.tab_id = Some("tab_host_2".into());
+    claim_params_2.document_id = "doc_host_2".into();
+
+    let h1 = {
+        let host = Arc::clone(&host_1);
+        let params = claim_params_1.clone();
+        thread::spawn(move || host.acquire_dispatch_fence(&params).unwrap())
+    };
+
+    let h2 = {
+        let host = Arc::clone(&host_2);
+        let params = claim_params_2.clone();
+        thread::spawn(move || host.acquire_dispatch_fence(&params).unwrap())
+    };
+
+    let res1 = h1.join().unwrap();
+    let res2 = h2.join().unwrap();
+
+    // Across separate native host processes, exactly ONE host can acquire the grant!
+    let grants = [res1.granted, res2.granted];
+    assert_eq!(grants.iter().filter(|&&g| g).count(), 1, "Exactly one host must be granted send permission: {:?}", grants);
+
+    // The loser receives existing status, NEVER permission!
+    if res1.granted {
+        assert!(!res2.granted);
+        assert_eq!(res2.owner_document_id, "doc_host_1");
+    } else {
+        assert!(res2.granted);
+        assert_eq!(res1.owner_document_id, "doc_host_2");
+    }
+}
