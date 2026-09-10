@@ -3,8 +3,8 @@ import path from "node:path";
 import vm from "node:vm";
 import assert from "node:assert/strict";
 
-const BACKGROUND_JS_PATH = path.resolve("companion/extension/background.js");
-const CONTENT_SCRIPT_JS_PATH = path.resolve("companion/extension/content_script.js");
+const BACKGROUND_JS_PATH = path.resolve("extension/background.js");
+const CONTENT_SCRIPT_JS_PATH = path.resolve("extension/content_script.js");
 const backgroundCode = fs.readFileSync(BACKGROUND_JS_PATH, "utf8");
 const contentScriptCode = fs.readFileSync(CONTENT_SCRIPT_JS_PATH, "utf8");
 

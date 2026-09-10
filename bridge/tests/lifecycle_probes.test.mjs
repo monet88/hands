@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import cp from "node:child_process";
 import { Database } from "bun:sqlite";
 // Read the production adapter TS content
-const LAUNCHER_RS = fs.readFileSync("companion/native/src/launcher.rs", "utf8");
+const LAUNCHER_RS = fs.readFileSync("bridge/native/src/launcher.rs", "utf8");
 const match = LAUNCHER_RS.match(/pub const ADAPTER_TS_CONTENT: &str = r#"([\s\S]*?)"#;/);
 assert.ok(match, "Must find ADAPTER_TS_CONTENT in launcher.rs");
 const adapterSource = match[1];

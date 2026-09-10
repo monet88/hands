@@ -6,9 +6,8 @@ import os from "node:os";
 const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const HOST_NAME = "com.hands.return_bridge";
 const REPO_ROOT = "F:\\CodeBase\\hands\\issue-66-return-bridge-pairing";
-const COMPANION_DIR = path.join(REPO_ROOT, "companion");
-const EXTENSION_DIR = path.join(COMPANION_DIR, "extension");
-const FIXTURES_DIR = path.join(COMPANION_DIR, "tests", "fixtures");
+const EXTENSION_DIR = path.join(REPO_ROOT, "extension");
+const FIXTURES_DIR = path.join(EXTENSION_DIR, "tests", "fixtures");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -159,12 +158,12 @@ async function main() {
 
   // 1. Build companion binary
   console.log("[1/6] Building hands-return-bridge.exe...");
-  execSync("cargo build --manifest-path companion/native/Cargo.toml", {
+  execSync("cargo build --manifest-path bridge/native/Cargo.toml", {
     cwd: REPO_ROOT,
     stdio: "inherit"
   });
 
-  const exePath = path.join(REPO_ROOT, "companion", "native", "target", "debug", "hands-return-bridge.exe");
+  const exePath = path.join(REPO_ROOT, "bridge", "native", "target", "debug", "hands-return-bridge.exe");
   if (!fs.existsSync(exePath)) {
     throw new Error(`Binary not found at ${exePath}`);
   }
