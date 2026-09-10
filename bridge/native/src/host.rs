@@ -485,10 +485,7 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 }
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
-    let state_dir = match state_dir_opt {
-        Some(path) => resolve_state_dir(Some(path))?,
-        None => resolve_default_state_dir()?,
-    };
+    let state_dir = resolve_state_dir(state_dir_opt)?;
     std::fs::create_dir_all(&state_dir)?;
     let state_dir = state_dir.canonicalize()?;
     std::env::set_var("HANDS_RETURN_BRIDGE_STATE_DIR", &state_dir);

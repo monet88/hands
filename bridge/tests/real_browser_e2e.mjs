@@ -504,6 +504,63 @@ async function main() {
     }
 
     // -------------------------------------------------------------
+    // Phase 1b: AC1/AC4/AC6 Real Chrome Drain & Restart Recovery (N1/N2/S3)
+    // -------------------------------------------------------------
+    console.log("      Phase 1b: Seeding committed Completion Receipt into real journal and testing browser recovery...");
+    const execId = alphaResult?.results?.executionId || "exec_e2e_seed";
+    const rcptId = "rcpt_e2e_" + Date.now();
+
+    // Use sqlite3 CLI or python script to seed a real completion receipt directly into SQLite journal
+    const seedSql = `
+      INSERT INTO completion_receipts (
+        receipt_id, execution_id, pairing_id, return_token,
+        origin_conversation_id, turn_index, stop_reason,
+        assistant_message_id, assistant_text, content_digest,
+        tool_call_count, state, committed_at
+      ) VALUES (
+        '${rcptId}', '${execId}', '${pairingId}', 'ret_e2e_token',
+        'conv_e2e_123', 0, 'stop',
+        'msg_e2e_1', 'E2E Turn completed successfully', 'sha256:e2e_digest',
+        1, 'completed', strftime('%s','now')
+      );
+    `;
+
+    const seedScript = `import sqlite3
+conn = sqlite3.connect(r'''${dbPath}''')
+conn.execute('''${seedSql}''')
+conn.commit()
+conn.close()
+`;
+    execFileSync("python", ["-c", seedScript], { stdio: "pipe" });
+    console.log(`      Seeded real Completion Receipt ${rcptId} for execution ${execId} into ${dbPath}`);
+
+    // Relaunch Profile Alpha (real Chrome MV3 worker restart) to exercise recovery & drain over real native host
+    console.log("      Relaunching Chrome (Profile Alpha) to test startup drain & recovery over real native host...");
+    const chromeAlphaDrain = spawnChrome(chromePath, profileAlphaDir, stateDir);
+    let drainResult;
+    try {
+      const cdpPortDrain = await waitForDevToolsPort(profileAlphaDir);
+      const versionDrain = await waitForBrowserVersion(cdpPortDrain);
+      const drainExtId = await loadUnpackedExtension(versionDrain.webSocketDebuggerUrl, testExtDir);
+      const testUrlDrain = `chrome-extension://${drainExtId}/test_runner.html`;
+      const targetTabDrain = await createTargetTab(versionDrain.webSocketDebuggerUrl, cdpPortDrain, testUrlDrain);
+      await waitForTestReady(targetTabDrain.webSocketDebuggerUrl);
+
+      drainResult = await evalInTab(
+        targetTabDrain.webSocketDebuggerUrl,
+        `window.startTest(${JSON.stringify({ mode: "profile_alpha", profileId: "profile_alpha", pairingId, pairingSecret })})`
+      );
+    } finally {
+      chromeAlphaDrain.kill();
+      await sleep(1000);
+    }
+
+    if (!drainResult || !drainResult.success) {
+      throw new Error(`Profile Alpha restart drain test failed: ${JSON.stringify(drainResult)}`);
+    }
+    console.log("      Profile Alpha restart drain assertions PASSED:\n", drainResult.results.steps.map(s => `        [PASS] ${s.step}`).join("\n"));
+
+    // -------------------------------------------------------------
     // Phase 2: Real Chrome with Profile Beta (Distinct Profile Isolation - N4)
     // -------------------------------------------------------------
     console.log("[6/6] Phase 2: Testing Distinct Profile Isolation (N4) with Profile Beta...");

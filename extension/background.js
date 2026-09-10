@@ -38,6 +38,7 @@ ensureStorageAccessLevel();
 chrome.runtime.onInstalled?.addListener(() => {
   ensureStorageAccessLevel();
   ensureRecoveryAlarm();
+  performScheduledDrain();
 });
 
 chrome.runtime.onStartup?.addListener(() => {
@@ -91,7 +92,7 @@ async function performScheduledDrain() {
 }
 
 async function processDrainResponse(drainResponse, stored, profileId) {
-  // 1. Reconcile launch summaries
+  // 1. Reconcile launch summaries and reconstruct missing receipts from native durable authority
   const summaries = Array.isArray(drainResponse.summaries) ? drainResponse.summaries : [];
   for (const summary of summaries) {
     if (summary.launch_request_id) {
@@ -102,6 +103,42 @@ async function processDrainResponse(drainResponse, stored, profileId) {
         cur.executionId = summary.execution_id;
         cur.terminalEvidence = summary.orca_terminal_handle ? { orcaTerminalHandle: summary.orca_terminal_handle } : null;
         await chrome.storage.local.set({ [recordKey]: cur });
+      }
+    }
+
+    // AC4 Recovery: Reconstruct browser receipt from native durable summary if local receipt was deleted/lost
+    if (summary.completion_receipt && summary.completion_receipt.receipt_id && summary.completion_receipt.execution_id) {
+      const rcpt = summary.completion_receipt;
+      const receiptStorageKey = "receipt_" + rcpt.receipt_id;
+      const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
+      const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
+      if (!existing) {
+        // Local storage was lost or missing: reconstruct from native durable authority
+        // Retain deliveryStatus: "received" (strictly separate from ChatGPT submission, no send permission)
+        const reconstructedRecord = {
+          receiptId: rcpt.receipt_id,
+          executionId: rcpt.execution_id,
+          pairingId: rcpt.pairing_id,
+          returnToken: rcpt.return_token,
+          originConversationId: rcpt.origin_conversation_id,
+          turnIndex: rcpt.turn_index,
+          stopReason: rcpt.stop_reason,
+          assistantMessageId: rcpt.assistant_message_id,
+          assistantText: rcpt.assistant_text,
+          contentDigest: rcpt.content_digest,
+          toolCallCount: rcpt.tool_call_count,
+          state: rcpt.state || "completed",
+          receivedAt: Date.now(),
+          deliveryStatus: "received"
+        };
+        try {
+          await chrome.storage.local.set({
+            [receiptStorageKey]: reconstructedRecord,
+            [executionReceiptKey]: rcpt.receipt_id
+          });
+        } catch (storageErr) {
+          console.error("Failed to reconstruct receipt " + rcpt.receipt_id + " from summary:", storageErr);
+        }
       }
     }
   }

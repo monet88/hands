@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -200,6 +200,26 @@ pub struct CompletionReceipt {
     pub tool_call_count: i64,
     pub state: String,
     pub committed_at: i64,
+}
+
+impl CompletionReceipt {
+    pub fn from_row(r: &Row) -> Result<Self, rusqlite::Error> {
+        Ok(Self {
+            receipt_id: r.get(0)?,
+            execution_id: r.get(1)?,
+            pairing_id: r.get(2)?,
+            return_token: r.get(3)?,
+            origin_conversation_id: r.get(4)?,
+            turn_index: r.get(5)?,
+            stop_reason: r.get(6)?,
+            assistant_message_id: r.get(7)?,
+            assistant_text: r.get(8)?,
+            content_digest: r.get(9)?,
+            tool_call_count: r.get(10)?,
+            state: r.get(11)?,
+            committed_at: r.get(12)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1418,23 +1438,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     WHERE execution_id = ?1
                     "#,
                     params![&summary.execution_id],
-                    |r| {
-                        Ok(CompletionReceipt {
-                            receipt_id: r.get(0)?,
-                            execution_id: r.get(1)?,
-                            pairing_id: r.get(2)?,
-                            return_token: r.get(3)?,
-                            origin_conversation_id: r.get(4)?,
-                            turn_index: r.get(5)?,
-                            stop_reason: r.get(6)?,
-                            assistant_message_id: r.get(7)?,
-                            assistant_text: r.get(8)?,
-                            content_digest: r.get(9)?,
-                            tool_call_count: r.get(10)?,
-                            state: r.get(11)?,
-                            committed_at: r.get(12)?,
-                        })
-                    },
+                    |r| CompletionReceipt::from_row(r),
                 )
                 .optional()
                 .map_err(|e| PairingError::StorageError(e.to_string()))?;
@@ -1491,23 +1495,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     WHERE execution_id = ?1
                     "#,
                     params![&s.execution_id],
-                    |r| {
-                        Ok(CompletionReceipt {
-                            receipt_id: r.get(0)?,
-                            execution_id: r.get(1)?,
-                            pairing_id: r.get(2)?,
-                            return_token: r.get(3)?,
-                            origin_conversation_id: r.get(4)?,
-                            turn_index: r.get(5)?,
-                            stop_reason: r.get(6)?,
-                            assistant_message_id: r.get(7)?,
-                            assistant_text: r.get(8)?,
-                            content_digest: r.get(9)?,
-                            tool_call_count: r.get(10)?,
-                            state: r.get(11)?,
-                            committed_at: r.get(12)?,
-                        })
-                    },
+                    |r| CompletionReceipt::from_row(r),
                 )
                 .optional()
                 .map_err(|e| PairingError::StorageError(e.to_string()))?;
@@ -1532,23 +1520,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 WHERE execution_id = ?1
                 "#,
                 params![execution_id],
-                |r| {
-                    Ok(CompletionReceipt {
-                        receipt_id: r.get(0)?,
-                        execution_id: r.get(1)?,
-                        pairing_id: r.get(2)?,
-                        return_token: r.get(3)?,
-                        origin_conversation_id: r.get(4)?,
-                        turn_index: r.get(5)?,
-                        stop_reason: r.get(6)?,
-                        assistant_message_id: r.get(7)?,
-                        assistant_text: r.get(8)?,
-                        content_digest: r.get(9)?,
-                        tool_call_count: r.get(10)?,
-                        state: r.get(11)?,
-                        committed_at: r.get(12)?,
-                    })
-                },
+                |r| CompletionReceipt::from_row(r),
             )
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
@@ -1612,23 +1584,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     WHERE execution_id = ?1
                     "#,
                     params![&summary.execution_id],
-                    |r| {
-                        Ok(CompletionReceipt {
-                            receipt_id: r.get(0)?,
-                            execution_id: r.get(1)?,
-                            pairing_id: r.get(2)?,
-                            return_token: r.get(3)?,
-                            origin_conversation_id: r.get(4)?,
-                            turn_index: r.get(5)?,
-                            stop_reason: r.get(6)?,
-                            assistant_message_id: r.get(7)?,
-                            assistant_text: r.get(8)?,
-                            content_digest: r.get(9)?,
-                            tool_call_count: r.get(10)?,
-                            state: r.get(11)?,
-                            committed_at: r.get(12)?,
-                        })
-                    },
+                    |r| CompletionReceipt::from_row(r),
                 )
                 .optional()
                 .map_err(|e| PairingError::StorageError(e.to_string()))?;
@@ -1656,21 +1612,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
 
         let receipt_rows = stmt_receipts
             .query_map(params![pairing_id, effective_limit as i64], |r| {
-                Ok(CompletionReceipt {
-                    receipt_id: r.get(0)?,
-                    execution_id: r.get(1)?,
-                    pairing_id: r.get(2)?,
-                    return_token: r.get(3)?,
-                    origin_conversation_id: r.get(4)?,
-                    turn_index: r.get(5)?,
-                    stop_reason: r.get(6)?,
-                    assistant_message_id: r.get(7)?,
-                    assistant_text: r.get(8)?,
-                    content_digest: r.get(9)?,
-                    tool_call_count: r.get(10)?,
-                    state: r.get(11)?,
-                    committed_at: r.get(12)?,
-                })
+                CompletionReceipt::from_row(r)
             })
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
