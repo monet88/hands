@@ -81,6 +81,8 @@ pub enum PairingError {
     PayloadConflict,
     ReplayTombstoned,
     AlreadyAttempted,
+    ReceiptNotFound,
+    ExecutionMismatch,
     StorageError(String),
 }
 
@@ -99,6 +101,8 @@ impl std::fmt::Display for PairingError {
             PairingError::PayloadConflict => write!(f, "payload_conflict"),
             PairingError::ReplayTombstoned => write!(f, "replay_tombstoned"),
             PairingError::AlreadyAttempted => write!(f, "already_attempted"),
+            PairingError::ReceiptNotFound => write!(f, "receipt_not_found"),
+            PairingError::ExecutionMismatch => write!(f, "execution_mismatch"),
             PairingError::StorageError(e) => write!(f, "storage_error: {}", e),
         }
     }
@@ -382,6 +386,17 @@ impl Journal {
                 session_id TEXT NOT NULL,
                 claimed_at INTEGER NOT NULL,
                 FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS receipt_acknowledgements (
+                receipt_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                pairing_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                acknowledged_at INTEGER NOT NULL,
+                FOREIGN KEY (receipt_id) REFERENCES completion_receipts(receipt_id) ON DELETE CASCADE,
+                FOREIGN KEY (execution_id) REFERENCES launch_requests(execution_id) ON DELETE CASCADE,
+                FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
             );
             "#,
         )?;
@@ -1539,5 +1554,198 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
 
         Ok(receipt)
+    }
+
+    pub fn drain_records(
+        &self,
+        pairing_id: &str,
+        limit: Option<usize>,
+    ) -> Result<(Vec<LaunchSummary>, Vec<CompletionReceipt>), PairingError> {
+        let conn = self.conn.lock();
+        let effective_limit = limit.unwrap_or(64).min(256);
+
+        // 1. Fetch launch summaries for this pairing
+        let mut stmt_summaries = conn
+            .prepare(
+                r#"
+                SELECT lr.launch_request_id, lr.execution_id, lr.origin_conversation_id,
+                       lr.origin_conversation_url, lr.target_id, lr.policy_revision,
+                       lr.state, lr.created_at, la.attempt_marked_at, la.orca_terminal_handle
+                FROM launch_requests lr
+                LEFT JOIN launch_attempts la ON lr.execution_id = la.execution_id
+                WHERE lr.pairing_id = ?1
+                ORDER BY lr.created_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let summary_rows = stmt_summaries
+            .query_map(params![pairing_id, effective_limit as i64], |r| {
+                Ok(LaunchSummary {
+                    launch_request_id: r.get(0)?,
+                    execution_id: r.get(1)?,
+                    origin_conversation_id: r.get(2)?,
+                    origin_conversation_url: r.get(3)?,
+                    target_id: r.get(4)?,
+                    policy_revision: r.get(5)?,
+                    state: r.get(6)?,
+                    created_at: r.get(7)?,
+                    attempt_marked_at: r.get(8)?,
+                    orca_terminal_handle: r.get(9)?,
+                    completion_receipt: None,
+                })
+            })
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let mut summaries = Vec::new();
+        for row in summary_rows {
+            let mut summary = row.map_err(|e| PairingError::StorageError(e.to_string()))?;
+            summary.completion_receipt = conn
+                .query_row(
+                    r#"
+                    SELECT receipt_id, execution_id, pairing_id, return_token,
+                           origin_conversation_id, turn_index, stop_reason,
+                           assistant_message_id, assistant_text, content_digest,
+                           tool_call_count, state, committed_at
+                    FROM completion_receipts
+                    WHERE execution_id = ?1
+                    "#,
+                    params![&summary.execution_id],
+                    |r| {
+                        Ok(CompletionReceipt {
+                            receipt_id: r.get(0)?,
+                            execution_id: r.get(1)?,
+                            pairing_id: r.get(2)?,
+                            return_token: r.get(3)?,
+                            origin_conversation_id: r.get(4)?,
+                            turn_index: r.get(5)?,
+                            stop_reason: r.get(6)?,
+                            assistant_message_id: r.get(7)?,
+                            assistant_text: r.get(8)?,
+                            content_digest: r.get(9)?,
+                            tool_call_count: r.get(10)?,
+                            state: r.get(11)?,
+                            committed_at: r.get(12)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+            summaries.push(summary);
+        }
+
+        // 2. Fetch unacknowledged Completion Receipts for this pairing
+        // Enumeration uses a durable exclusion join against receipt_acknowledgements
+        // rather than a timestamp-only cursor, guaranteeing no records are skipped.
+        let mut stmt_receipts = conn
+            .prepare(
+                r#"
+                SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
+                       cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
+                       cr.assistant_message_id, cr.assistant_text, cr.content_digest,
+                       cr.tool_call_count, cr.state, cr.committed_at
+                FROM completion_receipts cr
+                LEFT JOIN receipt_acknowledgements ra ON cr.receipt_id = ra.receipt_id
+                WHERE cr.pairing_id = ?1 AND ra.receipt_id IS NULL
+                ORDER BY cr.committed_at ASC, cr.receipt_id ASC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let receipt_rows = stmt_receipts
+            .query_map(params![pairing_id, effective_limit as i64], |r| {
+                Ok(CompletionReceipt {
+                    receipt_id: r.get(0)?,
+                    execution_id: r.get(1)?,
+                    pairing_id: r.get(2)?,
+                    return_token: r.get(3)?,
+                    origin_conversation_id: r.get(4)?,
+                    turn_index: r.get(5)?,
+                    stop_reason: r.get(6)?,
+                    assistant_message_id: r.get(7)?,
+                    assistant_text: r.get(8)?,
+                    content_digest: r.get(9)?,
+                    tool_call_count: r.get(10)?,
+                    state: r.get(11)?,
+                    committed_at: r.get(12)?,
+                })
+            })
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let mut receipts = Vec::new();
+        for row in receipt_rows {
+            receipts.push(row.map_err(|e| PairingError::StorageError(e.to_string()))?);
+        }
+
+        Ok((summaries, receipts))
+    }
+
+    pub fn acknowledge_receipt(
+        &self,
+        pairing_id: &str,
+        receipt_id: &str,
+        execution_id: &str,
+        status: &str,
+    ) -> Result<bool, PairingError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        // Verify receipt exists, belongs to this pairing, and matches execution_id
+        let found: Option<(String, String)> = tx
+            .query_row(
+                "SELECT pairing_id, execution_id FROM completion_receipts WHERE receipt_id = ?1",
+                params![receipt_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let (rcpt_pairing_id, rcpt_execution_id) = match found {
+            Some(pair) => pair,
+            None => return Err(PairingError::ReceiptNotFound),
+        };
+
+        if rcpt_pairing_id != pairing_id {
+            return Err(PairingError::NotFound);
+        }
+
+        if rcpt_execution_id != execution_id {
+            return Err(PairingError::ExecutionMismatch);
+        }
+
+        // Replay-safe check: check existing acknowledgement
+        let existing_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM receipt_acknowledgements WHERE receipt_id = ?1",
+                params![receipt_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        if let Some(_existing) = existing_status {
+            // Already acknowledged: replay-safe idempotent return
+            return Ok(true);
+        }
+
+        let now = now_epoch_secs();
+        tx.execute(
+            r#"
+            INSERT INTO receipt_acknowledgements (
+                receipt_id, execution_id, pairing_id, status, acknowledged_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![receipt_id, execution_id, pairing_id, status, now],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(true)
     }
 }

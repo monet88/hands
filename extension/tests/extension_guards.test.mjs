@@ -48,6 +48,24 @@ function createTestHarness({
         cb(nativeResponse);
       }
     },
+    alarms: {
+      _alarms: new Map(),
+      _listeners: [],
+      onAlarm: {
+        addListener(fn) {
+          mockChrome.alarms._listeners.push(fn);
+        }
+      },
+      async get(name) {
+        return mockChrome.alarms._alarms.get(name) || null;
+      },
+      async create(name, info) {
+        mockChrome.alarms._alarms.set(name, { name, ...info });
+      },
+      async clear(name) {
+        mockChrome.alarms._alarms.delete(name);
+      }
+    },
     tabs: {
       async get(tabId) {
         if (mockTabs && mockTabs[tabId]) {
@@ -1208,6 +1226,155 @@ async function runTests() {
     assert.equal(second.executionId, "exec_coalesced");
     assert.equal(harness.nativeMessagesSent.filter(x => x.msg.op === "launch").length, 1);
     console.log("  [PASS] Concurrent identical browser launches coalesce to one native request");
+  }
+
+  // Test 26: Drain drains completion receipts and persists browser record before sending transport ACK
+  {
+    let ackSent = false;
+    let storageStateAtAck = null;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_drain_test",
+        pairingSecret: "rb_sec_drain_test"
+      }
+    });
+
+    // Override sendNativeMessage to mock drain & ack
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [],
+          receipts: [{
+            receipt_id: "rcpt_drain_unit_1",
+            execution_id: "exec_drain_unit_1",
+            pairing_id: "pair_drain_test",
+            return_token: "ret_drain_1",
+            origin_conversation_id: "conv_1",
+            turn_index: 0,
+            stop_reason: "stop",
+            assistant_message_id: "msg_1",
+            assistant_text: "Turn done",
+            content_digest: "digest_1",
+            tool_call_count: 2,
+            state: "completed"
+          }]
+        });
+      } else if (msg.op === "ack") {
+        ackSent = true;
+        // Snapshot storage state at the moment ACK is sent!
+        storageStateAtAck = { ...harness.storageStore };
+        cb({
+          status: "ok",
+          acknowledged: true,
+          receiptId: msg.receiptId,
+          executionId: msg.executionId
+        });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(JSON.stringify(res.ackedReceiptIds), JSON.stringify(["rcpt_drain_unit_1"]));
+    assert.ok(ackSent, "Transport ACK must be sent for drained receipt");
+    assert.ok(storageStateAtAck["receipt_rcpt_drain_unit_1"], "Receipt MUST be in browser storage when ACK is sent");
+    assert.equal(storageStateAtAck["receipt_rcpt_drain_unit_1"].deliveryStatus, "received");
+
+    // Verify getPendingReceipts returns this recoverable receipt
+    const pendingRes = await harness.sendMessage({ action: "getPendingReceipts" }, trustedSender);
+    assert.equal(pendingRes.status, "ok");
+    assert.equal(pendingRes.pendingReceipts.length, 1);
+    assert.equal(pendingRes.pendingReceipts[0].receiptId, "rcpt_drain_unit_1");
+    assert.equal(pendingRes.pendingReceipts[0].deliveryStatus, "received");
+    console.log("  [PASS] Drain drains receipts, persists locally before native ACK, and reports pending receipts");
+  }
+
+  // Test 27: Storage failure prevents transport ACK (fail-closed S3)
+  {
+    let ackSentForFail = false;
+    const harness = createTestHarness({
+      failStorageSet: true,
+      initialStorage: {
+        profileId: "prof_storage_fail",
+        isPaired: true,
+        pairingId: "pair_storage_fail",
+        pairingSecret: "rb_sec_storage_fail"
+      }
+    });
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [],
+          receipts: [{
+            receipt_id: "rcpt_fail_1",
+            execution_id: "exec_fail_1",
+            pairing_id: "pair_storage_fail",
+            return_token: "ret_fail_1",
+            origin_conversation_id: "conv_fail",
+            turn_index: 0,
+            stop_reason: "stop",
+            assistant_text: "Should not be acked",
+            content_digest: "digest_fail",
+            tool_call_count: 0
+          }]
+        });
+      } else if (msg.op === "ack") {
+        ackSentForFail = true;
+        cb({ status: "ok", acknowledged: true });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(ackSentForFail, false, "Transport ACK must NOT be sent when browser storage fails");
+    assert.equal(JSON.stringify(res.ackedReceiptIds), JSON.stringify([]), "No receipts should be reported acked on storage failure");
+    console.log("  [PASS] Storage failure prevents transport ACK without false acknowledgement");
+  }
+
+  // Test 28: Alarm scheduling and wakeup drains receipts
+  {
+    let drainSentOnAlarm = false;
+    const harness = createTestHarness({
+      initialStorage: {
+        profileId: "prof_alarm_test",
+        isPaired: true,
+        pairingId: "pair_alarm_test",
+        pairingSecret: "rb_sec_alarm_test"
+      }
+    });
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        drainSentOnAlarm = true;
+        cb({ status: "ok", summaries: [], receipts: [] });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    // 1. Ensure alarms action creates recovery alarm if missing
+    await harness.sendMessage({ action: "ensureAlarms" }, trustedSender);
+    const alarm = await harness.mockChrome.alarms.get("hands_return_bridge_recovery_drain");
+    assert.ok(alarm, "Recovery alarm must be scheduled");
+    assert.equal(alarm.periodInMinutes, 1);
+
+    // 2. Trigger alarm listener
+    for (const listener of harness.mockChrome.alarms._listeners) {
+      await listener({ name: "hands_return_bridge_recovery_drain" });
+    }
+    assert.ok(drainSentOnAlarm, "Drain must be invoked when recovery alarm fires");
+    console.log("  [PASS] Alarm scheduling repairs missing alarms and triggers drain on wakeups");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

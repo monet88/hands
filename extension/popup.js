@@ -8,6 +8,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const policyRevVal = document.getElementById("policyRevVal");
   const targetsVal = document.getElementById("targetsVal");
   const unpairedProfileId = document.getElementById("unpairedProfileId");
+  const pendingReceiptsVal = document.getElementById("pendingReceiptsVal");
 
   const btnOptions = document.getElementById("btnOptions");
   const btnPair = document.getElementById("btnPair");
@@ -36,6 +37,11 @@ document.addEventListener("DOMContentLoaded", async () => {
         pairingIdVal.textContent = state.pairingId || "-";
         policyRevVal.textContent = state.policyRevision || "-";
         targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
+        const pendingResp = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+        const count = pendingResp?.pendingReceipts?.length || 0;
+        if (pendingReceiptsVal) {
+          pendingReceiptsVal.textContent = count > 0 ? `${count} pending (recoverable)` : "None";
+        }
         return;
       }
       if (!status || status.code !== "pairing_retired") {
@@ -47,6 +53,11 @@ document.addEventListener("DOMContentLoaded", async () => {
         pairingIdVal.textContent = state.pairingId || "-";
         policyRevVal.textContent = state.policyRevision || "-";
         targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
+        const pendingResp = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+        const count = pendingResp?.pendingReceipts?.length || 0;
+        if (pendingReceiptsVal) {
+          pendingReceiptsVal.textContent = count > 0 ? `${count} pending (recoverable)` : "None";
+        }
         return;
       }
     }

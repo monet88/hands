@@ -230,6 +230,30 @@ window.startTest = async function(config = {}) {
       logResult("profile_isolation_status", crossStatusRejected, crossStatusResp);
       results.steps.push({ step: "profile_isolation_status", pass: crossStatusRejected });
 
+
+      // N4 Profile Isolation: Profile Beta cannot drain or ACK Profile Alpha's receipts
+      const crossDrainResp = await sendNative({
+        op: "drain",
+        pairingId,
+        pairingSecret,
+        profileId: "profile_beta"
+      });
+      const crossDrainRejected = crossDrainResp && crossDrainResp.status === "error" && crossDrainResp.code === "profile_mismatch";
+      logResult("profile_isolation_drain", crossDrainRejected, crossDrainResp);
+      results.steps.push({ step: "profile_isolation_drain", pass: crossDrainRejected });
+
+      const crossAckResp = await sendNative({
+        op: "ack",
+        pairingId,
+        pairingSecret,
+        profileId: "profile_beta",
+        receiptId: "any_rcpt",
+        executionId: "any_exec",
+        ackStatus: "received"
+      });
+      const crossAckRejected = crossAckResp && crossAckResp.status === "error" && crossAckResp.code === "profile_mismatch";
+      logResult("profile_isolation_ack", crossAckRejected, crossAckResp);
+      results.steps.push({ step: "profile_isolation_ack", pass: crossAckRejected });
     } else if (mode === "revoke") {
       // Step 10: Revoke pairing from Profile Alpha
       const revokeResp = await sendNative({
