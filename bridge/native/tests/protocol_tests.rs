@@ -1387,3 +1387,112 @@ fn test_launch_preflight_adversarial_lookalike_rejection() {
         );
     }
 }
+
+#[test]
+fn test_protocol_drain_and_ack_operations() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_proto_drain";
+    let profile_id = "prof_proto_drain";
+    let token = "boot_proto_drain";
+    journal.create_bootstrap(
+        pairing_id,
+        token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "t1".into(), canonical_path, name: "t1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let activated = journal.activate_bootstrap(token, profile_id).unwrap();
+    let secret = &activated.pairing_secret;
+
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_proto_drain".into(),
+        origin_conversation_id: "c_proto".into(),
+        origin_conversation_url: "https://chatgpt.com/c/c_proto".into(),
+        transcript_evidence_hash: "hash_t".into(),
+        account_evidence_hash: "hash_a".into(),
+        target_id: "t1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "test".into(),
+    };
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+
+    // Commit completion receipt
+    let rcpt_id = "rcpt_proto_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO completion_receipts (
+                receipt_id, execution_id, pairing_id, return_token,
+                origin_conversation_id, turn_index, stop_reason,
+                assistant_message_id, assistant_text, content_digest,
+                tool_call_count, state, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'completed', ?12)
+            "#,
+            rusqlite::params![
+                rcpt_id,
+                claim.execution_id,
+                pairing_id,
+                claim.return_token,
+                "c_proto",
+                0,
+                "stop",
+                "m1",
+                "Done turn",
+                "digest1",
+                1,
+                1000
+            ],
+        ).unwrap();
+    }
+
+    // 1. Drain via handle_native_message
+    let drain_msg = json!({
+        "op": "drain",
+        "pairingId": pairing_id,
+        "pairingSecret": secret,
+        "profileId": profile_id
+    });
+    let drain_resp = handle_native_message(&drain_msg, &journal);
+    assert_eq!(drain_resp["status"], "ok");
+    assert_eq!(drain_resp["summaries"].as_array().unwrap().len(), 1);
+    let receipts = drain_resp["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["receipt_id"], rcpt_id);
+    assert_eq!(receipts[0]["execution_id"], claim.execution_id);
+
+    // 2. ACK via handle_native_message
+    let ack_msg = json!({
+        "op": "ack",
+        "pairingId": pairing_id,
+        "pairingSecret": secret,
+        "profileId": profile_id,
+        "receiptId": rcpt_id,
+        "executionId": claim.execution_id,
+        "ackStatus": "received"
+    });
+    let ack_resp = handle_native_message(&ack_msg, &journal);
+    assert_eq!(ack_resp["status"], "ok");
+    assert_eq!(ack_resp["acknowledged"], true);
+    assert_eq!(ack_resp["receiptId"], rcpt_id);
+
+    // 3. Replay ACK is idempotent
+    let ack_replay = handle_native_message(&ack_msg, &journal);
+    assert_eq!(ack_replay["status"], "ok");
+    assert_eq!(ack_replay["acknowledged"], true);
+
+    // 4. Drain again: receipts array is empty because rcpt_id was acknowledged
+    let drain_again = handle_native_message(&drain_msg, &journal);
+    assert_eq!(drain_again["status"], "ok");
+    assert_eq!(drain_again["receipts"].as_array().unwrap().len(), 0);
+    assert_eq!(drain_again["summaries"].as_array().unwrap().len(), 1);
+}

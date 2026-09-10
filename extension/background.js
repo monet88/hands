@@ -11,6 +11,8 @@ const UNRESOLVED_LAUNCH_STATES = new Set([
   "native-response-uncertain"
 ]);
 const PROVEN_LAUNCH_STATES = new Set(["started", "completed"]);
+const RECOVERY_ALARM_NAME = "hands_return_bridge_recovery_drain";
+const RECOVERY_PERIOD_MINUTES = 1;
 
 async function ensureStorageAccessLevel() {
   if (storageAccessLevelEstablished) {
@@ -35,7 +37,160 @@ ensureStorageAccessLevel();
 
 chrome.runtime.onInstalled?.addListener(() => {
   ensureStorageAccessLevel();
+  ensureRecoveryAlarm();
+  performScheduledDrain();
 });
+
+chrome.runtime.onStartup?.addListener(() => {
+  ensureRecoveryAlarm();
+  performScheduledDrain();
+});
+
+chrome.alarms?.onAlarm?.addListener(async (alarm) => {
+  if (alarm && alarm.name === RECOVERY_ALARM_NAME) {
+    await performScheduledDrain();
+  }
+});
+
+async function ensureRecoveryAlarm() {
+  try {
+    if (!chrome.alarms) return;
+    const existing = await chrome.alarms.get(RECOVERY_ALARM_NAME);
+    if (!existing) {
+      await chrome.alarms.create(RECOVERY_ALARM_NAME, {
+        periodInMinutes: RECOVERY_PERIOD_MINUTES
+      });
+    }
+  } catch (err) {
+    console.warn("Failed to ensure recovery alarm:", err);
+  }
+}
+
+async function performScheduledDrain() {
+  try {
+    await ensureRecoveryAlarm();
+    const isTrustedStorage = await ensureStorageAccessLevel();
+    if (!isTrustedStorage) return;
+
+    const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
+    if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) return;
+
+    const profileId = await getOrCreateProfileId();
+    const drainResponse = await sendNative({
+      op: "drain",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId
+    });
+
+    if (drainResponse && drainResponse.status === "ok") {
+      await processDrainResponse(drainResponse, stored, profileId);
+    }
+  } catch (err) {
+    console.warn("Scheduled drain encounter:", err);
+  }
+}
+
+function buildReceiptRecord(rcpt) {
+  return {
+    receiptId: rcpt.receipt_id,
+    executionId: rcpt.execution_id,
+    pairingId: rcpt.pairing_id,
+    returnToken: rcpt.return_token,
+    originConversationId: rcpt.origin_conversation_id,
+    turnIndex: rcpt.turn_index,
+    stopReason: rcpt.stop_reason,
+    assistantMessageId: rcpt.assistant_message_id,
+    assistantText: rcpt.assistant_text,
+    contentDigest: rcpt.content_digest,
+    toolCallCount: rcpt.tool_call_count,
+    state: rcpt.state || "completed",
+    receivedAt: Date.now(),
+    deliveryStatus: "received" // Keep received strictly separate from ChatGPT submission
+  };
+}
+
+async function processDrainResponse(drainResponse, stored, profileId) {
+  // 1. Reconcile launch summaries and reconstruct missing receipts from native durable authority
+  const summaries = Array.isArray(drainResponse.summaries) ? drainResponse.summaries : [];
+  for (const summary of summaries) {
+    if (summary.launch_request_id) {
+      const recordKey = "launch_" + summary.launch_request_id;
+      const cur = (await chrome.storage.local.get([recordKey]))[recordKey];
+      if (cur && UNRESOLVED_LAUNCH_STATES.has(cur.status)) {
+        cur.status = summary.state || "unknown";
+        cur.executionId = summary.execution_id;
+        cur.terminalEvidence = summary.orca_terminal_handle ? { orcaTerminalHandle: summary.orca_terminal_handle } : null;
+        await chrome.storage.local.set({ [recordKey]: cur });
+      }
+    }
+
+    // AC4 Recovery: Reconstruct browser receipt from native durable summary if local receipt was deleted/lost
+    if (summary.completion_receipt && summary.completion_receipt.receipt_id && summary.completion_receipt.execution_id) {
+      const rcpt = summary.completion_receipt;
+      const receiptStorageKey = "receipt_" + rcpt.receipt_id;
+      const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
+      const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
+      if (!existing) {
+        // Local storage was lost or missing: reconstruct from native durable authority
+        // Retain deliveryStatus: "received" (strictly separate from ChatGPT submission, no send permission)
+        const reconstructedRecord = buildReceiptRecord(rcpt);
+        try {
+          await chrome.storage.local.set({
+            [receiptStorageKey]: reconstructedRecord,
+            [executionReceiptKey]: rcpt.receipt_id
+          });
+        } catch (storageErr) {
+          console.error("Failed to reconstruct receipt " + rcpt.receipt_id + " from summary:", storageErr);
+        }
+      }
+    }
+  }
+
+  // 2. Process real Completion Receipts: Persist browser receipt handling BEFORE sending transport ACK
+  const receipts = Array.isArray(drainResponse.receipts) ? drainResponse.receipts : [];
+  const ackedReceiptIds = [];
+  for (const rcpt of receipts) {
+    if (!rcpt.receipt_id || !rcpt.execution_id) continue;
+    const receiptStorageKey = "receipt_" + rcpt.receipt_id;
+    const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
+
+    // Prepare durable browser record: status "received" (separate from ChatGPT submission, no send permission)
+    const receiptRecord = buildReceiptRecord(rcpt);
+
+    // Hard gate: Storage write MUST succeed BEFORE reporting acknowledgement to native host
+    try {
+      await chrome.storage.local.set({
+        [receiptStorageKey]: receiptRecord,
+        [executionReceiptKey]: rcpt.receipt_id
+      });
+    } catch (storageErr) {
+      // Storage failure reports no successful durable acknowledgement
+      console.error("Browser storage failure for receipt " + rcpt.receipt_id + "; ACK aborted:", storageErr);
+      continue;
+    }
+
+    // Only after browser storage succeeds, send transport ACK to native host
+    try {
+      const ackResponse = await sendNative({
+        op: "ack",
+        pairingId: stored.pairingId,
+        pairingSecret: stored.pairingSecret,
+        profileId,
+        receiptId: rcpt.receipt_id,
+        executionId: rcpt.execution_id,
+        ackStatus: "received"
+      });
+
+      if (ackResponse && ackResponse.status === "ok" && ackResponse.acknowledged) {
+        ackedReceiptIds.push(rcpt.receipt_id);
+      }
+    } catch (ackErr) {
+      console.warn("Transport ACK failed for receipt " + rcpt.receipt_id + ":", ackErr);
+    }
+  }
+  return ackedReceiptIds;
+}
 
 function isTrustedExtensionSender(sender) {
   if (!sender || sender.id !== chrome.runtime.id) {
@@ -132,7 +287,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const profileId = await getOrCreateProfileId();
 
       // Gate: Secret-bearing actions must fail-closed if storage isolation is not established
-      if (["setup", "status", "connect", "revoke", "launch", "recover"].includes(request.action)) {
+      if (["setup", "status", "connect", "revoke", "launch", "recover", "drain"].includes(request.action)) {
         const isTrustedStorage = await ensureStorageAccessLevel();
         if (!isTrustedStorage) {
           sendResponse({
@@ -623,6 +778,65 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
           }
           sendResponse(response);
+          break;
+        }
+        case "drain": {
+          const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
+          if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
+            sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
+            return;
+          }
+
+          await ensureRecoveryAlarm();
+          const payload = {
+            op: "drain",
+            pairingId: stored.pairingId,
+            pairingSecret: stored.pairingSecret,
+            profileId
+          };
+          if (typeof request.limit === "number") {
+            payload.limit = request.limit;
+          }
+
+          const response = await sendNative(payload);
+          if (response && response.status === "ok") {
+            const ackedIds = await processDrainResponse(response, stored, profileId);
+            sendResponse({
+              status: "ok",
+              summaries: response.summaries || [],
+              receipts: response.receipts || [],
+              ackedReceiptIds: ackedIds,
+              trustNotice: TRUST_NOTICE
+            });
+          } else {
+            sendResponse(response || { status: "error", code: "native_failed" });
+          }
+          break;
+        }
+
+        case "getPendingReceipts": {
+          const allData = await chrome.storage.local.get(null);
+          const pending = [];
+          for (const [k, v] of Object.entries(allData)) {
+            if (k.startsWith("receipt_") && v && v.deliveryStatus === "received") {
+              pending.push(v);
+            }
+          }
+          sendResponse({
+            status: "ok",
+            pendingReceipts: pending
+          });
+          break;
+        }
+
+        case "ensureAlarms": {
+          await ensureRecoveryAlarm();
+          const alarm = chrome.alarms ? await chrome.alarms.get(RECOVERY_ALARM_NAME) : null;
+          sendResponse({
+            status: "ok",
+            alarmScheduled: !!alarm,
+            alarmName: RECOVERY_ALARM_NAME
+          });
           break;
         }
 

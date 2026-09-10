@@ -39,26 +39,32 @@ window.startTest = async function(config = {}) {
 
   try {
     if (mode === "profile_alpha") {
-      // Step 1: Setup / activate pairing using bootstrap token
-      const setupResp = await sendNative({
-        op: "setup",
-        bootstrapToken,
-        profileId
-      });
-      const setupOk = setupResp && setupResp.status === "ok" && setupResp.pairingId && setupResp.pairingSecret;
-      logResult("setup_bootstrap", setupOk, setupResp);
-      results.steps.push({ step: "setup_bootstrap", pass: setupOk, resp: setupResp });
+      let activePairingId = pairingId;
+      let activePairingSecret = pairingSecret;
+      let setupResp = null;
+      if (bootstrapToken) {
+        // Step 1: Setup / activate pairing using bootstrap token
+        setupResp = await sendNative({
+          op: "setup",
+          bootstrapToken,
+          profileId
+        });
+        const setupOk = setupResp && setupResp.status === "ok" && setupResp.pairingId && setupResp.pairingSecret;
+        logResult("setup_bootstrap", setupOk, setupResp);
+        results.steps.push({ step: "setup_bootstrap", pass: setupOk, resp: setupResp });
 
-      const activePairingId = setupResp.pairingId;
-      const activePairingSecret = setupResp.pairingSecret;
-      // Pairing credential isolation: verify chrome.storage.local retains secret in trusted context
-      await chrome.storage.local.set({ profileId, isPaired: true, pairingId: activePairingId, pairingSecret: activePairingSecret, targets: setupResp.targets || [], policyRevision: setupResp.policyRevision || "v1" });
-      const stored = await chrome.storage.local.get(["pairingSecret"]);
-      const storageOk = stored.pairingSecret === activePairingSecret;
-      logResult("storage_credential_retention", storageOk, { retained: storageOk });
-      results.steps.push({ step: "storage_credential_retention", pass: storageOk });
-
-
+        activePairingId = setupResp.pairingId;
+        activePairingSecret = setupResp.pairingSecret;
+        // Pairing credential isolation: verify chrome.storage.local retains secret in trusted context
+        await chrome.storage.local.set({ profileId, isPaired: true, pairingId: activePairingId, pairingSecret: activePairingSecret, targets: setupResp.targets || [], policyRevision: setupResp.policyRevision || "v1" });
+        const stored = await chrome.storage.local.get(["pairingSecret"]);
+        const storageOk = stored.pairingSecret === activePairingSecret;
+        logResult("storage_credential_retention", storageOk, { retained: storageOk });
+        results.steps.push({ step: "storage_credential_retention", pass: storageOk });
+      } else {
+        // Reconnected after browser restart: ensure storage retains pairing
+        await chrome.storage.local.set({ profileId, isPaired: true, pairingId: activePairingId, pairingSecret: activePairingSecret });
+      }
       // Step 2: Connect with valid credentials
       const connectResp = await sendNative({
         op: "connect",
@@ -131,7 +137,8 @@ window.startTest = async function(config = {}) {
       results.steps.push({ step: "reject_launch_unauthorized_field", pass: launchBadRejected });
 
       // Step 7b: Valid launch request through extension internal messaging with exact bound ChatGPT tab
-      const targetList = setupResp.targets || [];
+      const storedConfig = await chrome.storage.local.get(["targets"]);
+      const targetList = (setupResp && setupResp.targets) || storedConfig.targets || [];
       const validTargetId = targetList.length > 0 ? targetList[0].target_id : "hands";
       const launchReqId = "e2e_req_" + Date.now();
 
@@ -145,20 +152,28 @@ window.startTest = async function(config = {}) {
 
       // Initialize the mock page once. Re-injecting content_script.js would register
       // duplicate listeners and make replay assertions timing-dependent.
-      async function initializeMockChatGptPage() {
+      async function ensureMockChatGptDom() {
         await chrome.scripting.executeScript({
           target: { tabId: chatTab.id },
           func: () => {
-            document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
+            if (!document.querySelector('article[data-testid="conversation-turn-1"]')) {
+              document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
+            }
           }
-        });
-        await chrome.scripting.executeScript({
-          target: { tabId: chatTab.id },
-          files: ["content_script.js"]
         });
       }
 
-      await initializeMockChatGptPage();
+      await chrome.scripting.executeScript({
+        target: { tabId: chatTab.id },
+        func: () => {
+          document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
+        }
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId: chatTab.id },
+        files: ["content_script.js"]
+      });
+
 
       const runNonce = Date.now().toString(36);
       const testPrompt = `--flag @some_file "quotes" ; echo pipe | unicode: Đại Ca ${runNonce}\nsecond_line_preserved`;
@@ -179,12 +194,14 @@ window.startTest = async function(config = {}) {
       results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
       results.promptSent = launchPayload.promptText;
       // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
+      await ensureMockChatGptDom();
       const replayResp = await chrome.runtime.sendMessage(launchPayload);
       const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
       logResult("launch_idempotent_replay", replayOk, replayResp);
       results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
 
       // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
+      await ensureMockChatGptDom();
       const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
       const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
       const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";
@@ -196,6 +213,37 @@ window.startTest = async function(config = {}) {
       const recoverOk = recoverResp && recoverResp.status === "ok" && Array.isArray(recoverResp.summaries) && recoverResp.summaries.length >= 1;
       logResult("recover_launch_summaries", recoverOk, recoverResp);
       results.steps.push({ step: "recover_launch_summaries", pass: recoverOk });
+
+      // Step 7f: AC1/AC6 Ensure alarms and scheduled wakeup
+      const alarmResp = await chrome.runtime.sendMessage({ action: "ensureAlarms" });
+      const alarmOk = alarmResp && alarmResp.status === "ok" && alarmResp.alarmScheduled === true;
+      logResult("ensure_recovery_alarm", alarmOk, alarmResp);
+      results.steps.push({ step: "ensure_recovery_alarm", pass: alarmOk });
+
+      // Step 7g: AC1/AC3 Drain and transport ACK over real native messaging host process
+      const drainResp = await chrome.runtime.sendMessage({ action: "drain" });
+      const drainOk = drainResp && drainResp.status === "ok" && Array.isArray(drainResp.summaries);
+      logResult("drain_real_native_host", drainOk, drainResp);
+      results.steps.push({ step: "drain_real_native_host", pass: drainOk });
+
+      // Step 7h: AC4 Local storage loss and durable reconstruction verification
+      // If any receipt was drained, delete local receipt storage, re-drain, and verify reconstructed
+      const allStorageBefore = await chrome.storage.local.get(null);
+      const receiptKeys = Object.keys(allStorageBefore).filter(k => k.startsWith("receipt_") || k.startsWith("rcpt_by_exec_"));
+      if (receiptKeys.length > 0) {
+        await chrome.storage.local.remove(receiptKeys);
+        const emptyPending = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+        const lostConfirmed = emptyPending && emptyPending.status === "ok" && emptyPending.pendingReceipts.length === 0;
+        logResult("local_storage_loss_simulated", lostConfirmed, { removed: receiptKeys.length });
+        results.steps.push({ step: "local_storage_loss_simulated", pass: lostConfirmed });
+
+        // Re-drain: native host summaries must reconstruct the receipt with deliveryStatus="received"
+        await chrome.runtime.sendMessage({ action: "drain" });
+        const recoveredPending = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+        const reconstructedOk = recoveredPending && recoveredPending.status === "ok" && recoveredPending.pendingReceipts.length > 0 && recoveredPending.pendingReceipts[0].deliveryStatus === "received";
+        logResult("reconstruct_after_storage_loss", reconstructedOk, recoveredPending);
+        results.steps.push({ step: "reconstruct_after_storage_loss", pass: reconstructedOk });
+      }
       // Step 8: Security: Unsupported operations fail closed
       const unknownOpResp = await sendNative({
         op: "shell_exec",
@@ -230,6 +278,30 @@ window.startTest = async function(config = {}) {
       logResult("profile_isolation_status", crossStatusRejected, crossStatusResp);
       results.steps.push({ step: "profile_isolation_status", pass: crossStatusRejected });
 
+
+      // N4 Profile Isolation: Profile Beta cannot drain or ACK Profile Alpha's receipts
+      const crossDrainResp = await sendNative({
+        op: "drain",
+        pairingId,
+        pairingSecret,
+        profileId: "profile_beta"
+      });
+      const crossDrainRejected = crossDrainResp && crossDrainResp.status === "error" && crossDrainResp.code === "profile_mismatch";
+      logResult("profile_isolation_drain", crossDrainRejected, crossDrainResp);
+      results.steps.push({ step: "profile_isolation_drain", pass: crossDrainRejected });
+
+      const crossAckResp = await sendNative({
+        op: "ack",
+        pairingId,
+        pairingSecret,
+        profileId: "profile_beta",
+        receiptId: "any_rcpt",
+        executionId: "any_exec",
+        ackStatus: "received"
+      });
+      const crossAckRejected = crossAckResp && crossAckResp.status === "error" && crossAckResp.code === "profile_mismatch";
+      logResult("profile_isolation_ack", crossAckRejected, crossAckResp);
+      results.steps.push({ step: "profile_isolation_ack", pass: crossAckRejected });
     } else if (mode === "revoke") {
       // Step 10: Revoke pairing from Profile Alpha
       const revokeResp = await sendNative({

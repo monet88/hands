@@ -1204,3 +1204,140 @@ fn test_revoked_pairing_cannot_claim_or_replay_launch() {
     let fresh_err = journal.reserve_or_claim_launch(&fresh).unwrap_err();
     assert_eq!(fresh_err, PairingError::Retired);
 }
+
+#[test]
+fn test_journal_drain_and_ack_completion_receipts() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id_1 = "pair_drain_1";
+    let pairing_id_2 = "pair_drain_2";
+    let profile_1 = "profile_drain_1";
+    let profile_2 = "profile_drain_2";
+
+    journal.create_bootstrap(
+        pairing_id_1,
+        "boot_1",
+        "chrome",
+        profile_1,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path: canonical_path.clone(), name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap("boot_1", profile_1).unwrap();
+
+    journal.create_bootstrap(
+        pairing_id_2,
+        "boot_2",
+        "chrome",
+        profile_2,
+        &[TargetRecord { target_id: "target_2".into(), canonical_path, name: "target_2".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap("boot_2", profile_2).unwrap();
+
+    let params_1 = LaunchRequestParams {
+        pairing_id: pairing_id_1.into(),
+        launch_request_id: "req_drain_1".into(),
+        origin_conversation_id: "conv_drain_1".into(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_drain_1".into(),
+        transcript_evidence_hash: "hash_t1".into(),
+        account_evidence_hash: "hash_a1".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task 1".into(),
+    };
+    let claim_1 = journal.reserve_or_claim_launch(&params_1).unwrap();
+
+    let params_2 = LaunchRequestParams {
+        pairing_id: pairing_id_2.into(),
+        launch_request_id: "req_drain_2".into(),
+        origin_conversation_id: "conv_drain_2".into(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_drain_2".into(),
+        transcript_evidence_hash: "hash_t2".into(),
+        account_evidence_hash: "hash_a2".into(),
+        target_id: "target_2".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task 2".into(),
+    };
+    let claim_2 = journal.reserve_or_claim_launch(&params_2).unwrap();
+
+    // Before receipt commit: drain for pairing 1 returns summaries but 0 receipts
+    let (summaries_pre, receipts_pre) = journal.drain_records(pairing_id_1, None).unwrap();
+    assert_eq!(summaries_pre.len(), 1);
+    assert_eq!(summaries_pre[0].launch_request_id, "req_drain_1");
+    assert_eq!(receipts_pre.len(), 0);
+
+    // Commit completion receipt for claim 1
+    let receipt_id_1 = "rcpt_drain_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO completion_receipts (
+                receipt_id, execution_id, pairing_id, return_token,
+                origin_conversation_id, turn_index, stop_reason,
+                assistant_message_id, assistant_text, content_digest,
+                tool_call_count, state, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'completed', ?12)
+            "#,
+            rusqlite::params![
+                receipt_id_1,
+                claim_1.execution_id,
+                pairing_id_1,
+                claim_1.return_token,
+                "conv_drain_1",
+                0,
+                "stop",
+                "msg_1",
+                "Turn 1 done",
+                "digest_1",
+                1,
+                1000
+            ],
+        ).unwrap();
+    }
+
+    // Drain pairing 1: should return the unacknowledged receipt
+    let (summaries_1, receipts_1) = journal.drain_records(pairing_id_1, None).unwrap();
+    assert_eq!(summaries_1.len(), 1);
+    assert_eq!(receipts_1.len(), 1);
+    assert_eq!(receipts_1[0].receipt_id, receipt_id_1);
+    assert_eq!(receipts_1[0].execution_id, claim_1.execution_id);
+    assert_eq!(receipts_1[0].pairing_id, pairing_id_1);
+
+    // Isolation (N4): Profile/pairing 2 drain must NOT see pairing 1's receipt or summary
+    let (summaries_2, receipts_2) = journal.drain_records(pairing_id_2, None).unwrap();
+    assert_eq!(summaries_2.len(), 1);
+    assert_eq!(summaries_2[0].launch_request_id, "req_drain_2");
+    assert_eq!(receipts_2.len(), 0, "Pairing 2 must not see pairing 1's completion receipt");
+
+    // ACK receipt from wrong pairing fails closed (N4 isolation)
+    let ack_wrong = journal.acknowledge_receipt(pairing_id_2, receipt_id_1, &claim_1.execution_id, "received");
+    assert!(ack_wrong.is_err());
+
+    // ACK receipt with mismatched execution_id fails closed
+    let ack_mismatch = journal.acknowledge_receipt(pairing_id_1, receipt_id_1, "wrong_exec", "received");
+    assert!(ack_mismatch.is_err());
+
+    // Valid ACK receipt for pairing 1
+    let ack_ok = journal.acknowledge_receipt(pairing_id_1, receipt_id_1, &claim_1.execution_id, "received").unwrap();
+    assert!(ack_ok, "First ACK must record true");
+
+    // Replay ACK is idempotent and safe
+    let ack_replay = journal.acknowledge_receipt(pairing_id_1, receipt_id_1, &claim_1.execution_id, "received").unwrap();
+    assert!(ack_replay, "Replay ACK must be idempotent");
+
+    // Next drain for pairing 1: receipt is already acknowledged so it is NOT returned in pending unacked receipts
+    let (summaries_after, receipts_after) = journal.drain_records(pairing_id_1, None).unwrap();
+    assert_eq!(summaries_after.len(), 1);
+    assert_eq!(receipts_after.len(), 0, "Acknowledged receipt must not be returned in unacked drain");
+
+    // However, receipt remains safely in completion_receipts journal for later delivery (Issue #70)
+    let stored_rcpt = journal.get_completion_receipt(&claim_1.execution_id).unwrap();
+    assert!(stored_rcpt.is_some(), "Durable receipt must remain in journal after transport ACK");
+}

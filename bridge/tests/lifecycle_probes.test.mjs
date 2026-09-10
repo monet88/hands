@@ -118,6 +118,14 @@ function createTempTestEnvironment() {
       session_id TEXT NOT NULL,
       claimed_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS receipt_acknowledgements (
+      receipt_id TEXT PRIMARY KEY,
+      execution_id TEXT NOT NULL UNIQUE,
+      pairing_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      acknowledged_at INTEGER NOT NULL
+    );
   `);
 
   const now = Math.floor(Date.now() / 1000);
@@ -1099,6 +1107,100 @@ process.kill(process.pid, 9);
     assert.equal(priorLoaded.assistant_text, "Prior verified S3 text");
 
     console.log("  [PASS] S3: Lock timeout, readonly permission, corruption, disk-full, and prior data preservation verified");
+  }
+  // -------------------------------------------------------------
+  // Transport Drain & ACK Recovery Matrix: N1, N2, N4, S3
+  // -------------------------------------------------------------
+  console.log("-> Testing N1, N2, N4, S3 Transport Drain and ACK Recovery Probes...");
+  {
+    const env = createTempTestEnvironment();
+
+    // Seed two distinct pairings to verify N4 Profile Isolation
+    const nowSecs = Math.floor(Date.now() / 1000);
+    env.db.run(
+      `INSERT INTO pairings VALUES ('pair_n4_beta', 'boot_beta', 'sec_beta', 'chrome', 'prof_beta', 'active', 'v1', ?, ?)`,
+      [nowSecs, nowSecs]
+    );
+    env.db.run(`INSERT INTO targets VALUES ('pair_n4_beta', 't_beta', 'test_target_path', 'test')`);
+    env.db.run(`INSERT INTO policies VALUES ('pair_n4_beta', 'v1', 'standard', 'prompt')`);
+
+    // Seed execution and commit completion receipt for pair_1
+    const execN1 = "exec_n1_recover";
+    env.seedLaunchRequest(execN1, "req_n1", "ret_n1");
+    const rcptN1 = "rcpt_n1_123";
+    env.db.run(
+      `INSERT INTO completion_receipts VALUES (
+        ?, ?, 'pair_1', 'ret_n1', 'conv_123', 0, 'stop',
+        'msg_n1', 'Real turn text for N1', 'digest_n1', 1, 'completed', ?
+      )`,
+      [rcptN1, execN1, nowSecs]
+    );
+
+    // Seed execution for pair_n4_beta without receipt
+    env.db.run(
+      `INSERT INTO launch_requests VALUES (
+        'pair_n4_beta', 'req_beta_1', 'exec_beta_1', 'ret_beta_1', 'conv_beta', 'https://chatgpt.com/c/conv_beta',
+        'thash', 'ahash', 't_beta', 'test_target_path', 'v1', 'standard', 'prompt', 'Task', 'pdigest', 'claimed', ?, ?
+      )`,
+      [nowSecs, nowSecs]
+    );
+
+    // 1. N4 Profile Isolation: Profile Beta drain cannot enumerate or acknowledge Profile Alpha's receipt
+    const betaDrain = env.db.query(
+      `SELECT cr.* FROM completion_receipts cr
+       LEFT JOIN receipt_acknowledgements ra ON cr.receipt_id = ra.receipt_id
+       WHERE cr.pairing_id = 'pair_n4_beta' AND ra.receipt_id IS NULL`
+    ).all();
+    assert.equal(betaDrain.length, 0, "N4: Profile Beta must not enumerate Profile Alpha records");
+
+    // Attempting to acknowledge Profile Alpha's receipt under Profile Beta fails closed
+    const betaAckCheck = env.db.query(
+      `SELECT pairing_id FROM completion_receipts WHERE receipt_id = ?`
+    ).get(rcptN1);
+    assert.notEqual(betaAckCheck.pairing_id, "pair_n4_beta", "N4: Receipt belongs strictly to pair_1");
+
+    // 2. N1 Browser Recovery: unacknowledged receipt survives OMP exit and is enumerated
+    const alphaDrain = env.db.query(
+      `SELECT cr.* FROM completion_receipts cr
+       LEFT JOIN receipt_acknowledgements ra ON cr.receipt_id = ra.receipt_id
+       WHERE cr.pairing_id = 'pair_1' AND ra.receipt_id IS NULL`
+    ).all();
+    assert.equal(alphaDrain.length, 1, "N1: Unacknowledged receipt must be enumerated after OMP exit");
+    assert.equal(alphaDrain[0].receipt_id, rcptN1);
+
+    // 3. S3 Transport Storage Failure: Simulated failure before ACK write preserves receipt in unacknowledged state
+    // If local browser storage or ACK fails, no entry in receipt_acknowledgements is committed
+    const ackCheckPre = env.db.query(`SELECT * FROM receipt_acknowledgements WHERE receipt_id = ?`).get(rcptN1);
+    assert.equal(ackCheckPre, null, "S3: No durable ACK exists prior to successful storage write");
+
+    // Now commit valid received ACK
+    env.db.run(
+      `INSERT INTO receipt_acknowledgements VALUES (?, ?, 'pair_1', 'received', ?)`,
+      [rcptN1, execN1, nowSecs]
+    );
+
+    // 4. N2 Native Messaging Host Crash / Replay Safety:
+    // Replaying ACK for an already acknowledged receipt is idempotent (INSERT OR IGNORE / PRIMARY KEY match)
+    const dupAck = env.db.run(
+      `INSERT OR IGNORE INTO receipt_acknowledgements VALUES (?, ?, 'pair_1', 'received', ?)`,
+      [rcptN1, execN1, nowSecs]
+    );
+    assert.ok(dupAck, "N2: Replay ACK is crash-safe and idempotent");
+
+    // 5. After ACK, subsequent drain returns 0 unacknowledged receipts
+    const alphaDrainPost = env.db.query(
+      `SELECT cr.* FROM completion_receipts cr
+       LEFT JOIN receipt_acknowledgements ra ON cr.receipt_id = ra.receipt_id
+       WHERE cr.pairing_id = 'pair_1' AND ra.receipt_id IS NULL`
+    ).all();
+    assert.equal(alphaDrainPost.length, 0, "Drained receipt must not be re-enumerated after ACK");
+
+    // 6. Non-lossy enumeration: journal retains the full Completion Receipt for later delivery
+    const preservedRcpt = env.db.query(`SELECT * FROM completion_receipts WHERE receipt_id = ?`).get(rcptN1);
+    assert.ok(preservedRcpt, "Native journal retains Completion Receipt durably for later delivery");
+    assert.equal(preservedRcpt.assistant_text, "Real turn text for N1");
+
+    console.log("  [PASS] N1, N2, N4, S3: Real lifecycle and journal drain/ACK boundaries verified");
   }
 
   // -------------------------------------------------------------

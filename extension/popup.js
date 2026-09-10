@@ -8,6 +8,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const policyRevVal = document.getElementById("policyRevVal");
   const targetsVal = document.getElementById("targetsVal");
   const unpairedProfileId = document.getElementById("unpairedProfileId");
+  const pendingReceiptsVal = document.getElementById("pendingReceiptsVal");
 
   const btnOptions = document.getElementById("btnOptions");
   const btnPair = document.getElementById("btnPair");
@@ -15,6 +16,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   btnOptions?.addEventListener("click", () => {
     chrome.runtime.openOptionsPage();
   });
+
+  async function updatePendingReceiptsDisplay() {
+    if (!pendingReceiptsVal) return;
+    try {
+      const pendingResp = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+      const count = pendingResp?.pendingReceipts?.length || 0;
+      pendingReceiptsVal.textContent = count > 0 ? `${count} pending (recoverable)` : "None";
+    } catch {
+      pendingReceiptsVal.textContent = "-";
+    }
+  }
 
   btnPair?.addEventListener("click", () => {
     chrome.runtime.openOptionsPage();
@@ -36,6 +48,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         pairingIdVal.textContent = state.pairingId || "-";
         policyRevVal.textContent = state.policyRevision || "-";
         targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
+        await updatePendingReceiptsDisplay();
         return;
       }
       if (!status || status.code !== "pairing_retired") {
@@ -47,6 +60,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         pairingIdVal.textContent = state.pairingId || "-";
         policyRevVal.textContent = state.policyRevision || "-";
         targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
+        await updatePendingReceiptsDisplay();
         return;
       }
     }

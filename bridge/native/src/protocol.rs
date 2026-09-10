@@ -246,6 +246,22 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             "profileId",
             "launchRequestId",
         ],
+        "drain" => &[
+            "op",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "limit",
+        ],
+        "ack" => &[
+            "op",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "receiptId",
+            "executionId",
+            "ackStatus",
+        ],
         _ => {
             return json!({
                 "status": "error",
@@ -670,6 +686,80 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                 }
             }
         }
+        "drain" => {
+            let (pairing_id, pairing_secret, profile_id) = match extract_credentials(obj) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            };
+
+            // Authenticate pairing
+            let _ctx = match journal.authenticate_pairing(pairing_id, pairing_secret, profile_id) {
+                Ok(c) => c,
+                Err(e) => return map_pairing_error(e),
+            };
+
+            let limit = obj.get("limit").and_then(|v| v.as_u64()).map(|l| l as usize);
+
+            match journal.drain_records(pairing_id, limit) {
+                Ok((summaries, receipts)) => json!({
+                    "status": "ok",
+                    "summaries": summaries,
+                    "receipts": receipts,
+                    "trustNotice": TRUST_NOTICE
+                }),
+                Err(e) => map_pairing_error(e),
+            }
+        }
+        "ack" => {
+            let (pairing_id, pairing_secret, profile_id) = match extract_credentials(obj) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            };
+
+            // Authenticate pairing
+            let _ctx = match journal.authenticate_pairing(pairing_id, pairing_secret, profile_id) {
+                Ok(c) => c,
+                Err(e) => return map_pairing_error(e),
+            };
+
+            let receipt_id = match obj.get("receiptId").and_then(|v| v.as_str()) {
+                Some(r) if !r.trim().is_empty() => r.trim(),
+                _ => {
+                    return json!({
+                        "status": "error",
+                        "code": "missing_receipt_id",
+                        "message": "Missing or empty 'receiptId'"
+                    });
+                }
+            };
+
+            let execution_id = match obj.get("executionId").and_then(|v| v.as_str()) {
+                Some(e) if !e.trim().is_empty() => e.trim(),
+                _ => {
+                    return json!({
+                        "status": "error",
+                        "code": "missing_execution_id",
+                        "message": "Missing or empty 'executionId'"
+                    });
+                }
+            };
+
+            let ack_status = match obj.get("ackStatus").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => "received",
+            };
+
+            match journal.acknowledge_receipt(pairing_id, receipt_id, execution_id, ack_status) {
+                Ok(acked) => json!({
+                    "status": "ok",
+                    "acknowledged": acked,
+                    "receiptId": receipt_id,
+                    "executionId": execution_id,
+                    "trustNotice": TRUST_NOTICE
+                }),
+                Err(e) => map_pairing_error(e),
+            }
+        }
         other => json!({
             "status": "error",
             "code": "unsupported_operation",
@@ -778,6 +868,16 @@ fn map_pairing_error(err: PairingError) -> Value {
             "status": "error",
             "code": "already_attempted",
             "message": "This launch request has already been attempted"
+        }),
+        PairingError::ReceiptNotFound => json!({
+            "status": "error",
+            "code": "receipt_not_found",
+            "message": "Completion receipt not found"
+        }),
+        PairingError::ExecutionMismatch => json!({
+            "status": "error",
+            "code": "execution_mismatch",
+            "message": "Execution ID does not match the completion receipt"
         }),
         PairingError::StorageError(e) => json!({
             "status": "error",

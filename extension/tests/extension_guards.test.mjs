@@ -48,6 +48,24 @@ function createTestHarness({
         cb(nativeResponse);
       }
     },
+    alarms: {
+      _alarms: new Map(),
+      _listeners: [],
+      onAlarm: {
+        addListener(fn) {
+          mockChrome.alarms._listeners.push(fn);
+        }
+      },
+      async get(name) {
+        return mockChrome.alarms._alarms.get(name) || null;
+      },
+      async create(name, info) {
+        mockChrome.alarms._alarms.set(name, { name, ...info });
+      },
+      async clear(name) {
+        mockChrome.alarms._alarms.delete(name);
+      }
+    },
     tabs: {
       async get(tabId) {
         if (mockTabs && mockTabs[tabId]) {
@@ -1208,6 +1226,274 @@ async function runTests() {
     assert.equal(second.executionId, "exec_coalesced");
     assert.equal(harness.nativeMessagesSent.filter(x => x.msg.op === "launch").length, 1);
     console.log("  [PASS] Concurrent identical browser launches coalesce to one native request");
+  }
+
+  // Test 26: Drain drains completion receipts and persists browser record before sending transport ACK
+  {
+    let ackSent = false;
+    let storageStateAtAck = null;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_drain_test",
+        pairingSecret: "rb_sec_drain_test"
+      }
+    });
+
+    // Override sendNativeMessage to mock drain & ack
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [],
+          receipts: [{
+            receipt_id: "rcpt_drain_unit_1",
+            execution_id: "exec_drain_unit_1",
+            pairing_id: "pair_drain_test",
+            return_token: "ret_drain_1",
+            origin_conversation_id: "conv_1",
+            turn_index: 0,
+            stop_reason: "stop",
+            assistant_message_id: "msg_1",
+            assistant_text: "Turn done",
+            content_digest: "digest_1",
+            tool_call_count: 2,
+            state: "completed"
+          }]
+        });
+      } else if (msg.op === "ack") {
+        ackSent = true;
+        // Snapshot storage state at the moment ACK is sent!
+        storageStateAtAck = { ...harness.storageStore };
+        cb({
+          status: "ok",
+          acknowledged: true,
+          receiptId: msg.receiptId,
+          executionId: msg.executionId
+        });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(JSON.stringify(res.ackedReceiptIds), JSON.stringify(["rcpt_drain_unit_1"]));
+    assert.ok(ackSent, "Transport ACK must be sent for drained receipt");
+    assert.ok(storageStateAtAck["receipt_rcpt_drain_unit_1"], "Receipt MUST be in browser storage when ACK is sent");
+    assert.equal(storageStateAtAck["receipt_rcpt_drain_unit_1"].deliveryStatus, "received");
+
+    // Verify getPendingReceipts returns this recoverable receipt
+    const pendingRes = await harness.sendMessage({ action: "getPendingReceipts" }, trustedSender);
+    assert.equal(pendingRes.status, "ok");
+    assert.equal(pendingRes.pendingReceipts.length, 1);
+    assert.equal(pendingRes.pendingReceipts[0].receiptId, "rcpt_drain_unit_1");
+    assert.equal(pendingRes.pendingReceipts[0].deliveryStatus, "received");
+    console.log("  [PASS] Drain drains receipts, persists locally before native ACK, and reports pending receipts");
+  }
+
+  // Test 27: Storage failure prevents transport ACK (fail-closed S3)
+  {
+    let ackSentForFail = false;
+    const harness = createTestHarness({
+      failStorageSet: true,
+      initialStorage: {
+        profileId: "prof_storage_fail",
+        isPaired: true,
+        pairingId: "pair_storage_fail",
+        pairingSecret: "rb_sec_storage_fail"
+      }
+    });
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [],
+          receipts: [{
+            receipt_id: "rcpt_fail_1",
+            execution_id: "exec_fail_1",
+            pairing_id: "pair_storage_fail",
+            return_token: "ret_fail_1",
+            origin_conversation_id: "conv_fail",
+            turn_index: 0,
+            stop_reason: "stop",
+            assistant_text: "Should not be acked",
+            content_digest: "digest_fail",
+            tool_call_count: 0
+          }]
+        });
+      } else if (msg.op === "ack") {
+        ackSentForFail = true;
+        cb({ status: "ok", acknowledged: true });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(ackSentForFail, false, "Transport ACK must NOT be sent when browser storage fails");
+    assert.equal(JSON.stringify(res.ackedReceiptIds), JSON.stringify([]), "No receipts should be reported acked on storage failure");
+    console.log("  [PASS] Storage failure prevents transport ACK without false acknowledgement");
+  }
+
+  // Test 28: Alarm scheduling and wakeup drains receipts
+  {
+    let drainSentOnAlarm = false;
+    const harness = createTestHarness({
+      initialStorage: {
+        profileId: "prof_alarm_test",
+        isPaired: true,
+        pairingId: "pair_alarm_test",
+        pairingSecret: "rb_sec_alarm_test"
+      }
+    });
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        drainSentOnAlarm = true;
+        cb({ status: "ok", summaries: [], receipts: [] });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    // 1. Ensure alarms action creates recovery alarm if missing
+    await harness.sendMessage({ action: "ensureAlarms" }, trustedSender);
+    const alarm = await harness.mockChrome.alarms.get("hands_return_bridge_recovery_drain");
+    assert.ok(alarm, "Recovery alarm must be scheduled");
+    assert.equal(alarm.periodInMinutes, 1);
+
+    // 2. Trigger alarm listener
+    for (const listener of harness.mockChrome.alarms._listeners) {
+      await listener({ name: "hands_return_bridge_recovery_drain" });
+    }
+    assert.ok(drainSentOnAlarm, "Drain must be invoked when recovery alarm fires");
+    console.log("  [PASS] Alarm scheduling repairs missing alarms and triggers drain on wakeups");
+  }
+
+  // Test 29: AC4 Recovery: Local receipt state loss is reconstructed from native durable summary on later drain
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        profileId: "prof_loss_test",
+        isPaired: true,
+        pairingId: "pair_loss_test",
+        pairingSecret: "rb_sec_loss_test"
+      }
+    });
+
+    let ackCount = 0;
+    const testReceipt = {
+      receipt_id: "rcpt_reconstruct_1",
+      execution_id: "exec_reconstruct_1",
+      pairing_id: "pair_loss_test",
+      return_token: "ret_reconstruct_1",
+      origin_conversation_id: "conv_loss_test",
+      turn_index: 0,
+      stop_reason: "stop",
+      assistant_message_id: "msg_loss_1",
+      assistant_text: "Task completed",
+      content_digest: "digest_loss_1",
+      tool_call_count: 3,
+      state: "completed"
+    };
+
+    const launchSummaryWithReceipt = {
+      launch_request_id: "req_loss_1",
+      execution_id: "exec_reconstruct_1",
+      origin_conversation_id: "conv_loss_test",
+      origin_conversation_url: "https://chatgpt.com/c/conv_loss_test",
+      target_id: "default",
+      policy_revision: "default_v1",
+      state: "completed",
+      created_at: 1000,
+      attempt_marked_at: 1001,
+      orca_terminal_handle: "term_loss_1",
+      completion_receipt: testReceipt
+    };
+
+    // Round 1: First drain returns unacknowledged receipt -> persists & ACKs
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [launchSummaryWithReceipt],
+          receipts: [testReceipt]
+        });
+      } else if (msg.op === "ack") {
+        ackCount++;
+        cb({
+          status: "ok",
+          acknowledged: true,
+          receiptId: msg.receiptId,
+          executionId: msg.executionId
+        });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const firstDrain = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(firstDrain.status, "ok");
+    assert.equal(ackCount, 1, "First drain must send transport ACK");
+    assert.ok(harness.storageStore["receipt_rcpt_reconstruct_1"]);
+    assert.equal(harness.storageStore["receipt_rcpt_reconstruct_1"].deliveryStatus, "received");
+
+    // Simulating catastrophic local storage loss: receipt keys deleted/corrupted
+    delete harness.storageStore["receipt_rcpt_reconstruct_1"];
+    delete harness.storageStore["rcpt_by_exec_exec_reconstruct_1"];
+    assert.equal(harness.storageStore["receipt_rcpt_reconstruct_1"], undefined);
+
+    // Verify getPendingReceipts currently shows 0 due to local storage loss
+    const pendingLost = await harness.sendMessage({ action: "getPendingReceipts" }, trustedSender);
+    assert.equal(pendingLost.pendingReceipts.length, 0, "Receipt is lost in local storage");
+
+    // Round 2: Later drain after local storage loss.
+    // Since receipt was already ACKed, native journal excludes it from receipts[], but it IS in summaries[].
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [launchSummaryWithReceipt],
+          receipts: [] // Already acknowledged in native journal!
+        });
+      } else if (msg.op === "ack") {
+        ackCount++;
+        cb({ status: "ok", acknowledged: true });
+      } else {
+        cb({ status: "ok" });
+      }
+    };
+
+    const secondDrain = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(secondDrain.status, "ok");
+    // Storage must be reconstructed from native summary authority!
+    const reconstructed = harness.storageStore["receipt_rcpt_reconstruct_1"];
+    assert.ok(reconstructed, "Receipt MUST be reconstructed in local storage from native summary");
+    assert.equal(reconstructed.receiptId, "rcpt_reconstruct_1");
+    assert.equal(reconstructed.executionId, "exec_reconstruct_1");
+    assert.equal(reconstructed.deliveryStatus, "received", "Reconstructed status MUST be 'received' without Send permission");
+    assert.equal(harness.storageStore["rcpt_by_exec_exec_reconstruct_1"], "rcpt_reconstruct_1");
+
+    // Verify getPendingReceipts now discovers the reconstructed receipt
+    const pendingRecovered = await harness.sendMessage({ action: "getPendingReceipts" }, trustedSender);
+    assert.equal(pendingRecovered.pendingReceipts.length, 1);
+    assert.equal(pendingRecovered.pendingReceipts[0].receiptId, "rcpt_reconstruct_1");
+    assert.equal(pendingRecovered.pendingReceipts[0].deliveryStatus, "received");
+
+    // No redundant ACK should be sent for already-acknowledged reconstructed receipt
+    assert.equal(ackCount, 1, "No duplicate transport ACK should be sent during reconstruction");
+
+    console.log("  [PASS] AC4 Recovery: Reconstructs deliveryStatus='received' from native durable authority after local storage loss");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");
