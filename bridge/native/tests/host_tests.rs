@@ -1,5 +1,8 @@
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::tempdir;
+
+static LOCAL_INIT_FAULT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use hands_return_bridge::host::{
     HostError, LocalInitOptions, SetupOptions, execute_local_init, execute_setup, resolve_state_dir,
@@ -104,6 +107,9 @@ fn test_local_init_creates_active_local_host_without_bootstrap() {
 
 #[test]
 fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
+    let _fault_env_guard = LOCAL_INIT_FAULT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempdir().unwrap();
     let state_dir = dir.path().to_path_buf();
     let ext_initial = "initial_extension_id_abcdef";
@@ -159,6 +165,9 @@ fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
 #[cfg(windows)]
 #[test]
 fn test_local_init_rollback_restores_prior_registry_snapshot() {
+    let _fault_env_guard = LOCAL_INIT_FAULT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use hands_return_bridge::host::manifest_registry_keys;
 
     // Use an isolated test host name so we don't touch live dev.hands.return_bridge or com.hands.return_bridge
