@@ -47,7 +47,7 @@ function Resolve-ExtensionId {
             }
 
             try {
-                $json = Get-Content -LiteralPath $preferencesPath -Raw |
+                $json = Get-Content -LiteralPath $preferencesPath -Raw -Encoding utf8 |
                     ConvertFrom-Json
                 $settings = $json.extensions.settings
                 if (-not $settings) {
@@ -106,6 +106,12 @@ if (-not (Test-Path -LiteralPath $debugBinary -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item -LiteralPath $debugBinary -Destination $installedBinary -Force
 
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$installDir*") {
+    [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
+    $env:Path = "$env:Path;$installDir"
+}
+
 Write-Host "Registering local native host..."
 & $installedBinary local-init --browser $Browser --extension-id $ExtensionId
 if ($LASTEXITCODE -ne 0) {
@@ -121,4 +127,5 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "Hands Return Bridge installed."
 Write-Host "Workspace: $Workspace"
-Write-Host "Reload the Hands Return Bridge extension once in chrome://extensions, then use it."
+$reloadUrl = if ($Browser -eq "edge") { "edge://extensions" } else { "chrome://extensions" }
+Write-Host "Reload the Hands Return Bridge extension once in $reloadUrl, then use it."

@@ -14,8 +14,8 @@
     select, button { width: 100%; box-sizing: border-box; }
     select { padding: 7px; border: 1px solid #bbb; border-radius: 5px; background: white; }
     button { margin-top: 10px; padding: 8px; border: 0; border-radius: 5px; cursor: pointer; font-weight: 600; background: #e8e8e8; }
-    .cmd-box { margin-top: 6px; padding: 7px 8px; background: #f0f0f0; border-radius: 4px; font: 11px monospace; color: #333; word-break: break-all; cursor: pointer; border: 1px solid #ddd; }
-    .cmd-box:hover { background: #e5e5e5; }
+    .cmd-box { margin-top: 6px; padding: 7px 8px; background: #f0f0f0; border-radius: 4px; font: 11px monospace; color: #333; word-break: break-all; cursor: pointer; border: 1px solid #ddd; text-align: left; }
+    .cmd-box:hover, .cmd-box:focus { background: #e5e5e5; outline: none; border-color: #999; }
     .cmd-hint { font-size: 10px; color: #888; margin-top: 3px; }
     .muted { color: #777; font-size: 12px; line-height: 1.4; }
     .workspace-list { margin-top: 8px; max-height: 110px; overflow-y: auto; }
@@ -53,8 +53,8 @@
 
     <div class="section">
       <div class="label">Local CLI Commands (Click to copy)</div>
-      <div id="cmdAdd" class="cmd-box" title="Click to copy">hands-return-bridge target add --target "&lt;path&gt;"</div>
-      <div id="cmdRemove" class="cmd-box" title="Click to copy">hands-return-bridge target remove --target-id &lt;id&gt;</div>
+      <button id="cmdAdd" class="cmd-box" type="button" title="Click to copy">hands-return-bridge target add --target "&lt;path&gt;"</button>
+      <button id="cmdRemove" class="cmd-box" type="button" title="Click to copy">hands-return-bridge target remove --target-id &lt;id&gt;</button>
       <div id="cmdCopyNotice" class="cmd-hint"></div>
     </div>
 

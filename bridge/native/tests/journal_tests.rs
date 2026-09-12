@@ -2087,3 +2087,207 @@ fn test_acquire_dispatch_fence_rejects_revoked_pairing_in_transaction() {
     let err = journal.acquire_dispatch_fence(&claim_params);
     assert_eq!(err.unwrap_err(), PairingError::Retired);
 }
+
+#[test]
+fn test_dispatch_fence_aged_uncertainty_cannot_acquire_new_grant() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_lease";
+    let bootstrap_token = "boot_lease";
+    let profile_id = "profile_lease";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let _ = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_lease";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_lease_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t_lease".into(),
+        account_evidence_hash: "hash_a_lease".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task lease".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_lease_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_lease', 'lease text', 'digest_lease', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    let mut claim_params = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_lease_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_lease".into(),
+        receipt_marker: "marker_lease".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_a_lease".into(),
+        transcript_evidence_hash: "hash_t_lease".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1".into(),
+    };
+
+    // 1. Initial acquire succeeds
+    let grant1 = journal.acquire_dispatch_fence(&claim_params).unwrap();
+    assert!(grant1.granted);
+
+    // 2. Immediate competing attempt before aging is denied
+    claim_params.attempt_id = "att_lease_2".into();
+    claim_params.document_id = "doc_2".into();
+    claim_params.expected_delivery_revision = 2;
+    let grant2 = journal.acquire_dispatch_fence(&claim_params).unwrap();
+    assert!(!grant2.granted, "Competing attempt must be denied");
+
+    // 3. Settle as uncertain to leave state='dispatching/uncertain' and age the fence significantly
+    journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_lease_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "uncertain".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: Some("channel drop".into()),
+    }).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE dispatch_fences SET updated_at = updated_at - 100000 WHERE receipt_id = ?1",
+            rusqlite::params![rcpt_id],
+        ).unwrap();
+    }
+
+    // 4. Proving aged uncertainty still cannot acquire a new grant (no automatic re-grant / lease expiry)
+    let grant3 = journal.acquire_dispatch_fence(&claim_params).unwrap();
+    assert!(!grant3.granted, "Aged uncertainty must never be re-granted to another attempt");
+    assert_eq!(grant3.state, "dispatching/uncertain");
+}
+
+#[test]
+fn test_acquire_dispatch_fence_rejects_launch_binding_drift() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_acct_drift";
+    let bootstrap_token = "boot_acct_drift";
+    let profile_id = "profile_acct_drift";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let _ = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_acct_drift";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+    let original_acct_hash = "hash_account_original_verified";
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_drift_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t_drift".into(),
+        account_evidence_hash: original_acct_hash.into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task drift test".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_drift_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_drift', 'assistant finished', 'digest_drift', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // 1. Attempt dispatch fence with drifted account hash -> MUST fail closed with AccountContextMismatch
+    let drifted_params = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_drift_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_drift".into(),
+        receipt_marker: "marker_drift".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_account_DRIFTED_bad".into(),
+        transcript_evidence_hash: "hash_t_drift".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_drift_1".into(),
+    };
+
+    let err = journal.acquire_dispatch_fence(&drifted_params);
+    assert_eq!(
+        err.unwrap_err(),
+        PairingError::AccountContextMismatch,
+        "Drifted account evidence must fail closed with AccountContextMismatch"
+    );
+
+    // Verify ZERO side effects in dispatch_fences and conversation_delivery_slots
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let fence_count: i64 = conn.query_row("SELECT COUNT(*) FROM dispatch_fences", [], |r| r.get(0)).unwrap();
+        assert_eq!(fence_count, 0, "No fence row must be created on account drift failure");
+        let slot_count: i64 = conn.query_row("SELECT COUNT(*) FROM conversation_delivery_slots", [], |r| r.get(0)).unwrap();
+        assert_eq!(slot_count, 0, "No slot row must be created on account drift failure");
+    }
+
+    // 2. Matching account evidence but a different canonical route for the same conversation ID must fail closed.
+    let mut valid_params = drifted_params;
+    valid_params.account_evidence_hash = original_acct_hash.into();
+    valid_params.origin_conversation_url = format!("https://chatgpt.com/g/project/c/{}", conv_id);
+    let err = journal.acquire_dispatch_fence(&valid_params);
+    assert_eq!(
+        err.unwrap_err(),
+        PairingError::DispatchFenceConflict,
+        "Origin conversation URL must remain bound to the exact launch route"
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let fence_count: i64 = conn.query_row("SELECT COUNT(*) FROM dispatch_fences", [], |r| r.get(0)).unwrap();
+        assert_eq!(fence_count, 0, "No fence row must be created on origin URL drift failure");
+        let slot_count: i64 = conn.query_row("SELECT COUNT(*) FROM conversation_delivery_slots", [], |r| r.get(0)).unwrap();
+        assert_eq!(slot_count, 0, "No slot row must be created on origin URL drift failure");
+    }
+
+    // 3. Exact launch binding -> MUST succeed.
+    valid_params.origin_conversation_url = conv_url;
+    let grant = journal.acquire_dispatch_fence(&valid_params).unwrap();
+    assert!(grant.granted, "Valid account evidence matching launch binding must be granted");
+    assert_eq!(grant.state, "dispatching/uncertain");
+}

@@ -313,11 +313,14 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
     journal
         .ensure_local_pairing()
         .map_err(|e| HostError::Storage(e.to_string()))?;
-    journal
-        .set_local_extension_id(extension_id)
-        .map_err(|e| HostError::Storage(e.to_string()))?;
 
     let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
+    let previous_manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(HostError::Io(e)),
+    };
+
     let current_exe = std::env::current_exe()?;
     let manifest_json = json!({
         "name": DEFAULT_HOST_NAME,
@@ -330,9 +333,38 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
 
     if !opts.skip_registry {
         #[cfg(windows)]
-        register_manifest_registry(&browser, &manifest_path)?;
+        {
+            if let Err(e) = register_manifest_registry(&browser, &manifest_path) {
+                let restore_result = match previous_manifest.as_deref() {
+                    Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+                    None => match std::fs::remove_file(&manifest_path) {
+                        Ok(()) => Ok(()),
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(remove_err) => Err(HostError::Io(remove_err)),
+                    },
+                };
+                if let Err(restore_err) = restore_result {
+                    return Err(HostError::Registry(format!(
+                        "{}; additionally failed to restore previous manifest: {}",
+                        e, restore_err
+                    )));
+                }
+                return Err(e);
+            }
+        }
     }
 
+    if let Err(e) = journal.set_local_extension_id(extension_id) {
+        let _ = match previous_manifest.as_deref() {
+            Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+            None => match std::fs::remove_file(&manifest_path) {
+                Ok(()) => Ok(()),
+                Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove_err) => Err(HostError::Io(remove_err)),
+            },
+        };
+        return Err(HostError::Storage(e.to_string()));
+    }
     Ok(LocalInitResult {
         browser,
         extension_id: extension_id.to_string(),
@@ -762,9 +794,13 @@ pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>
 
     let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
 
+    let status = journal.get_pairing_status(&pairing_id).map_err(|e| HostError::Storage(e.to_string()))?;
+    if status != crate::journal::PairingStatus::Active {
+        return Err(HostError::Storage(format!("Pairing '{}' is not active ({:?})", pairing_id, status)));
+    }
+
     let targets = journal
         .get_targets(&pairing_id)
         .map_err(|e| HostError::Storage(e.to_string()))?;
-
     Ok(targets)
 }

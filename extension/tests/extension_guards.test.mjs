@@ -2713,6 +2713,12 @@ async function runTests() {
     stopButtonAppearsAfterTicks = 0,
     tamperComposerAfterTicks = 0,
     detachButtonOnPreClick = false,
+    clickThrows = false,
+    replaceComposerAfterTicks = 0,
+    replacementComposerText = "",
+    detachComposerAfterTicks = 0,
+    accountChangesAfterTicks = 0,
+    changedAccount = "Other User",
     userDraft = "",
     turns = ["Turn 1: prior chat"],
     account = "Personal User"
@@ -2725,6 +2731,7 @@ async function runTests() {
     let buttonAttached = true;
     let buttonDisabled = buttonDisabledInitially;
     let buttonAriaDisabled = buttonAriaDisabledInitially;
+    let currentAccount = account;
 
     const mockChrome = {
       runtime: {
@@ -2737,6 +2744,18 @@ async function runTests() {
     };
 
     let preClickChecked = false;
+    let composerAttached = true;
+    let replacementDraft = replacementComposerText;
+    const replacementComposerObj = {
+      tagName: "TEXTAREA",
+      get value() {
+        return replacementDraft;
+      },
+      set value(v) {
+        replacementDraft = v;
+      },
+      dispatchEvent(ev) {}
+    };
     const composerObj = {
       tagName: "TEXTAREA",
       get value() {
@@ -2763,6 +2782,9 @@ async function runTests() {
         return null;
       },
       click() {
+        if (clickThrows) {
+          throw new Error("Simulated DOM click execution failure");
+        }
         clickCount++;
       }
     };
@@ -2770,11 +2792,15 @@ async function runTests() {
     const mockDocument = {
       readyState: "complete",
       contains(node) {
-        return node === sendBtnObj ? buttonAttached : true;
+        if (node === sendBtnObj) return buttonAttached;
+        if (node === composerObj) return composerAttached;
+        return true;
       },
       body: {
         contains(node) {
-          return node === sendBtnObj ? buttonAttached : true;
+          if (node === sendBtnObj) return buttonAttached;
+          if (node === composerObj) return composerAttached;
+          return true;
         }
       },
       querySelector(selector) {
@@ -2785,7 +2811,14 @@ async function runTests() {
           return null;
         }
         if (selector.includes("prompt-textarea") || selector.includes('textarea[data-id="root"]')) {
-          return composerObj;
+          if (detachComposerAfterTicks && buttonTicks >= detachComposerAfterTicks) {
+            composerAttached = false;
+            return null;
+          }
+          if (replaceComposerAfterTicks && buttonTicks >= replaceComposerAfterTicks) {
+            return replacementComposerObj;
+          }
+          return composerAttached ? composerObj : null;
         }
         if (selector.includes("send-button") || selector.includes("composer-submit-button")) {
           buttonTicks++;
@@ -2807,6 +2840,9 @@ async function runTests() {
           if (tamperComposerAfterTicks && buttonTicks >= tamperComposerAfterTicks) {
             composerObj.value = "Tampered text by human";
           }
+          if (accountChangesAfterTicks && buttonTicks >= accountChangesAfterTicks) {
+            currentAccount = changedAccount;
+          }
           return buttonAttached ? sendBtnObj : null;
         }
         return null;
@@ -2818,8 +2854,8 @@ async function runTests() {
         if (selector.includes("profile menu") || selector.includes("user-menu")) {
           return [{
             tagName: "BUTTON",
-            innerText: account,
-            getAttribute: (n) => n === "aria-label" ? account + ", open profile menu" : null
+            innerText: currentAccount,
+            getAttribute: (n) => n === "aria-label" ? currentAccount + ", open profile menu" : null
           }];
         }
         return [];
@@ -2851,6 +2887,7 @@ async function runTests() {
       listener: capturedListener,
       getClickCount: () => clickCount,
       composer: composerObj,
+      replacementComposer: replacementComposerObj,
       sendBtn: sendBtnObj,
       window: mockWindow
     };
@@ -2908,7 +2945,7 @@ async function runTests() {
     assert.equal(resReplay.reason, "grant_already_consumed", "Replay of same attemptId must fail closed");
     assert.equal(cs.getClickCount(), 1, "Replay must not trigger click");
 
-    // Step 4: Later distinct attempt ("att_beta") after slot release MUST be permitted in same document!
+    // Step 4: A distinct later attemptId ("att_beta") in the same document must pass the replay guard
     cs.composer.value = ""; // Composer cleared after prior submission
     let resBeta = null;
     await new Promise((resolve) => {
@@ -3032,7 +3069,7 @@ async function runTests() {
     });
     assert.equal(res1.ok, false);
     assert.equal(res1.clicked, false);
-    assert.ok(res1.reason === "navigation_invalidated" || res1.reason === "conversation_mismatch");
+    assert.equal(res1.reason, "navigation_invalidated");
     assert.equal(csRoute.getClickCount(), 0, "Route change during wait must prevent click");
 
     // Sub-case 2: Active generation appears during wait -> aborts before click
@@ -3108,7 +3145,603 @@ async function runTests() {
     assert.equal(res4.reason, "send_button_invalid");
     assert.equal(csDetach.getClickCount(), 0, "Detached button must prevent click");
 
-    console.log("  [PASS] Finding 6: Content script pre-click revalidations reject route change, active gen, tampered composer, detached button");
+    // Sub-case 5: Account/workspace changes after native grant but before click -> aborts synchronously
+    const csAccountDrift = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountChangesAfterTicks: 2,
+      account: "Personal User",
+      changedAccount: "Other Workspace"
+    });
+    let readResp5 = null;
+    csAccountDrift.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp5 = r; });
+    let res5 = null;
+    await new Promise((resolve) => {
+      csAccountDrift.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_account_drift",
+        expectedDocumentId: readResp5.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedAccountText: "Personal User",
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res5 = r; resolve(); });
+    });
+    assert.equal(res5.ok, false);
+    assert.equal(res5.clicked, false);
+    assert.equal(res5.reason, "account_context_mismatch");
+    assert.equal(csAccountDrift.getClickCount(), 0, "Account drift after grant must prevent click");
+
+    console.log("  [PASS] Finding 6: Content script pre-click revalidations reject route change, active gen, tampered composer, detached button, account drift");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 46: Composer cleanup on failure: tampered content preserved, untouched payload cleared
+  // ---------------------------------------------------------------------------
+  {
+    // Case A: Bridge-owned failure (active generation during wait) with untouched continuationText -> cleared
+    const csUntouched = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      stopButtonAppearsAfterTicks: 2
+    });
+    let readRespA = null;
+    csUntouched.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespA = r; });
+    let resA = null;
+    await new Promise((resolve) => {
+      csUntouched.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_clean_untouched",
+        expectedDocumentId: readRespA.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Untouched bridge payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resA = r; resolve(); });
+    });
+    assert.equal(resA.ok, false);
+    assert.equal(resA.reason, "active_generation");
+    assert.equal(csUntouched.composer.value, "", "Untouched bridge payload must be cleaned up on bridge-owned failure");
+
+    // Case B: User-edited/tampered composer content during bridge failure -> preserved untouched!
+    const csTampered = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      tamperComposerAfterTicks: 2
+    });
+    let readRespB = null;
+    csTampered.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespB = r; });
+    let resB = null;
+    await new Promise((resolve) => {
+      csTampered.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_preserve_tampered",
+        expectedDocumentId: readRespB.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Original bridge payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resB = r; resolve(); });
+    });
+    assert.equal(resB.ok, false);
+    assert.equal(resB.reason, "composer_content_tampered");
+    assert.equal(csTampered.composer.value, "Tampered text by human", "User-edited/tampered content must be preserved untouched");
+
+    console.log("  [PASS] Finding 2: Tampered/user-edited composer content survives failed dispatch while untouched bridge payload is cleaned up");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 47: Dispatch click exception path: no ReferenceError, cleans payload, preserves user text
+  // ---------------------------------------------------------------------------
+  {
+    // Sub-case 1: sendBtn.click() throws with untouched bridge payload
+    // -> catches click_execution_failed, no ReferenceError escapes, untouched payload cleared
+    const csClickThrow = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      clickThrows: true
+    });
+    let readResp = null;
+    csClickThrow.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp = r; });
+    let res = null;
+    await new Promise((resolve) => {
+      csClickThrow.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_throw_clean",
+        expectedDocumentId: readResp.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Bridge text to fail on click",
+        receiptMarker: "marker_throw_1"
+      }, {}, (r) => { res = r; resolve(); });
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.clicked, false);
+    assert.equal(res.reason, "click_execution_failed");
+    assert.ok(!res.message.includes("ReferenceError"), "No ReferenceError should escape catch block");
+    assert.ok(res.message.includes("Simulated DOM click execution failure"));
+    assert.equal(csClickThrow.composer.value, "", "Untouched bridge payload must be cleaned up when dispatch click throws");
+
+    // Sub-case 2: User-edited/tampered text prevents click execution via existing guard and survives untouched
+    const csTampered = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      clickThrows: true,
+      tamperComposerAfterTicks: 1,
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 2
+    });
+    let readResp2 = null;
+    csTampered.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp2 = r; });
+    let res2 = null;
+    await new Promise((resolve) => {
+      csTampered.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_throw_tampered",
+        expectedDocumentId: readResp2.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Bridge payload that got edited",
+        receiptMarker: "marker_throw_2"
+      }, {}, (r) => { res2 = r; resolve(); });
+    });
+
+    assert.equal(res2.ok, false);
+    assert.equal(res2.reason, "composer_content_tampered");
+    assert.equal(csTampered.composer.value, "Tampered text by human", "User-edited text must be preserved by existing guard");
+
+    console.log("  [PASS] Dispatch click execution exception: click_execution_failed reported without ReferenceError, cleans untouched payload, preserves user edit");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 48: Finding 1: Competing owner denial isolates state; loser stays received/retryable
+  // ---------------------------------------------------------------------------
+  {
+    const receiptA = {
+      receiptId: "rcpt_compete_a",
+      executionId: "exec_compete_a",
+      originConversationId: "c_shared_slot",
+      originConversationUrl: "https://chatgpt.com/c/c_shared_slot",
+      deliveryStatus: "dispatching/uncertain",
+      deliveryRevision: 3
+    };
+    const receiptB = {
+      receiptId: "rcpt_compete_b",
+      executionId: "exec_compete_b",
+      originConversationId: "c_shared_slot",
+      originConversationUrl: "https://chatgpt.com/c/c_shared_slot",
+      deliveryStatus: "received",
+      deliveryRevision: 0
+    };
+
+    let slotBusy = true;
+    let bGrantAttemptCount = 0;
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        receipt_rcpt_compete_a: receiptA,
+        receipt_rcpt_compete_b: receiptB
+      },
+      mockTabs: { 204: { id: 204, url: "https://chatgpt.com/c/c_shared_slot" } },
+      mockTabMessages: {
+        204: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return { ok: true, documentId: "doc_b", readiness: { ready: true, transcriptText: "t", accountText: "a" } };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return { ok: true, clicked: true, documentId: "doc_b", attemptId: msg.attemptId };
+          }
+          if (msg.action === "verify_submitted_message") {
+            return { ok: true, observed: true, observedMessageId: "msg_b_done" };
+          }
+          return { ok: true };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        if (msg.receiptId === "rcpt_compete_b") {
+          bGrantAttemptCount++;
+          if (slotBusy) {
+            // Competing receipt A currently holds the slot at revision 3!
+            cb({
+              status: "ok",
+              grant: {
+                granted: false, // DENIED
+                receipt_id: "rcpt_compete_b",
+                execution_id: msg.executionId,
+                attempt_id: "attempt_of_rcpt_a",
+                delivery_revision: 3,
+                state: "dispatching/uncertain",
+                owner_document_id: "doc_a"
+              }
+            });
+            return;
+          } else {
+            // Slot cleared: receipt B acquires fence
+            cb({
+              status: "ok",
+              grant: {
+                granted: true,
+                receipt_id: "rcpt_compete_b",
+                execution_id: msg.executionId,
+                attempt_id: msg.attemptId,
+                delivery_revision: 1,
+                state: "dispatching/uncertain",
+                owner_document_id: "doc_b"
+              }
+            });
+            return;
+          }
+        }
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // Attempt 1: Receipt B attempts dispatch while slot is busy with receipt A
+    const res1 = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_compete_b" }, trustedSender);
+    assert.equal(res1.status, "ok");
+    assert.equal(res1.dispatchResult.status, "denied");
+    assert.equal(res1.dispatchResult.reason, "slot_busy_or_competing_owner");
+
+    // Critical assertion: receipt B MUST NOT copy receipt A's dispatching/uncertain state or revision 3!
+    const storedBAfterDenial = (await harness.mockChrome.storage.local.get("receipt_rcpt_compete_b")).receipt_rcpt_compete_b;
+    assert.equal(storedBAfterDenial.deliveryStatus, "received", "Losing receipt B must remain received and NOT become dispatching/uncertain");
+    assert.equal(storedBAfterDenial.deliveryRevision, 0, "Losing receipt B must not adopt competing owner's revision");
+
+    // Slot clears: receipt A settles
+    slotBusy = false;
+
+    // Attempt 2: Receipt B retries now that slot has cleared
+    const res2 = await harness.sendMessage({ action: "dispatchReceipt", receiptId: "rcpt_compete_b" }, trustedSender);
+    assert.equal(res2.status, "ok");
+    assert.equal(res2.dispatchResult.status, "ok");
+    assert.equal(res2.dispatchResult.outcome, "submitted-observed");
+    assert.equal(bGrantAttemptCount, 2);
+
+    const storedBAfterSuccess = (await harness.mockChrome.storage.local.get("receipt_rcpt_compete_b")).receipt_rcpt_compete_b;
+    assert.equal(storedBAfterSuccess.deliveryStatus, "submitted-observed", "Receipt B acquires fence upon retry after slot clears and completes dispatch");
+    assert.equal(storedBAfterSuccess.deliveryRevision, 1);
+
+    console.log("  [PASS] Finding 1: Competing owner denial isolates state; loser stays received and can retry after slot clears");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 49: Finding 2: Replaced or detached composer after button wait fails closed and preserves user text
+  // ---------------------------------------------------------------------------
+  {
+    // Sub-case 1: Composer replaced during button wait with new element containing user text
+    const csReplaced = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      replaceComposerAfterTicks: 2,
+      replacementComposerText: "Draft typed by user in replacement element"
+    });
+    let readResp1 = null;
+    csReplaced.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp1 = r; });
+    let res1 = null;
+    await new Promise((resolve) => {
+      csReplaced.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_replaced_composer",
+        expectedDocumentId: readResp1.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Bridge payload that got replaced",
+        receiptMarker: "marker_rep_1"
+      }, {}, (r) => { res1 = r; resolve(); });
+    });
+
+    assert.equal(res1.ok, false);
+    assert.equal(res1.clicked, false);
+    assert.equal(res1.reason, "composer_detached_or_replaced");
+    assert.equal(csReplaced.getClickCount(), 0, "Replaced composer must prevent click");
+    assert.equal(csReplaced.replacementComposer.value, "Draft typed by user in replacement element", "User text in replacement composer must be preserved");
+
+    // Sub-case 2: Composer detached completely during button wait
+    const csDetached = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      detachComposerAfterTicks: 2
+    });
+    let readResp2 = null;
+    csDetached.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp2 = r; });
+    let res2 = null;
+    await new Promise((resolve) => {
+      csDetached.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_detached_composer",
+        expectedDocumentId: readResp2.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Bridge payload for detached composer",
+        receiptMarker: "marker_det_1"
+      }, {}, (r) => { res2 = r; resolve(); });
+    });
+
+    assert.equal(res2.ok, false);
+    assert.equal(res2.clicked, false);
+    assert.equal(res2.reason, "composer_detached_or_replaced");
+    assert.equal(csDetached.getClickCount(), 0, "Detached composer must prevent click");
+
+    console.log("  [PASS] Finding 2: Replaced or detached composer after button wait fails closed and preserves user text");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 50: Options page platform detection shows Windows hint on win, unsupported notice on mac/linux
+  // ---------------------------------------------------------------------------
+  {
+    const fs = await import("node:fs");
+    const optionsJsCode = fs.readFileSync(new URL("../options.js", import.meta.url), "utf-8");
+
+    function runOptionsHarness(os) {
+      let installHintDisplay = "none";
+      let unsupportedHintDisplay = "none";
+
+      const mockDocument = {
+        addEventListener(event, fn) {
+          if (event === "DOMContentLoaded") fn();
+        },
+        getElementById(id) {
+          if (id === "statusSpan") return { textContent: "", className: "" };
+          if (id === "installHint") return { style: { set display(v) { installHintDisplay = v; }, get display() { return installHintDisplay; } } };
+          if (id === "unsupportedPlatformHint") return { style: { set display(v) { unsupportedHintDisplay = v; }, get display() { return unsupportedHintDisplay; } } };
+          if (id === "workspaceMsg") return { textContent: "", className: "" };
+          if (id === "workspaceList") return { innerHTML: "", appendChild() {} };
+          return null;
+        },
+        createElement() {
+          return { append() {}, appendChild() {}, style: {}, className: "", textContent: "" };
+        }
+      };
+
+      const mockChrome = {
+        runtime: {
+          getPlatformInfo(cb) {
+            cb({ os });
+          },
+          sendMessage(msg) {
+            return Promise.resolve({ status: "error" }); // Native not installed
+          }
+        }
+      };
+
+      const ctx = vm.createContext({
+        document: mockDocument,
+        chrome: mockChrome,
+        navigator: { userAgent: "test" },
+        console: { log() {}, error() {}, warn() {} },
+        Promise,
+        setTimeout,
+        clearTimeout
+      });
+      vm.runInContext(optionsJsCode, ctx);
+
+      return {
+        getInstallDisplay: () => installHintDisplay,
+        getUnsupportedDisplay: () => unsupportedHintDisplay
+      };
+    }
+
+    // Case A: Windows platform -> installHint shown, unsupportedPlatformHint hidden
+    const winHarness = runOptionsHarness("win");
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(winHarness.getInstallDisplay(), "block");
+    assert.equal(winHarness.getUnsupportedDisplay(), "none");
+
+    // Case B: Non-Windows platform (mac) -> installHint hidden, unsupportedPlatformHint shown
+    const macHarness = runOptionsHarness("mac");
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(macHarness.getInstallDisplay(), "none");
+    assert.equal(macHarness.getUnsupportedDisplay(), "block");
+
+    // Case C: Non-Windows platform (linux) -> installHint hidden, unsupportedPlatformHint shown
+    const linuxHarness = runOptionsHarness("linux");
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(linuxHarness.getInstallDisplay(), "none");
+    assert.equal(linuxHarness.getUnsupportedDisplay(), "block");
+
+    console.log("  [PASS] Options page platform detection shows Windows hint on Windows and unsupported notice on non-Windows");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test: Replay rejection (grant_already_consumed) settles uncertain and retains slot
+  // ---------------------------------------------------------------------------
+  {
+    const rcptId = "rcpt_replay_uncertain";
+    let settledOutcome = null;
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "p_test",
+        pairingSecret: "s_test",
+        profileId: "prof_test",
+        ["receipt_" + rcptId]: {
+          receiptId: rcptId,
+          executionId: "exec_test",
+          originConversationId: "c_conv_replay",
+          originConversationUrl: "https://chatgpt.com/c/c_conv_replay",
+          deliveryStatus: "received",
+          deliveryRevision: 1
+        }
+      },
+      mockTabs: {
+        501: { id: 501, url: "https://chatgpt.com/c/c_conv_replay" }
+      },
+      mockTabMessages: {
+        501: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_replay_live",
+              readiness: {
+                ready: true,
+                transcriptText: "Transcript",
+                accountText: "Personal"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return {
+              ok: false,
+              clicked: false,
+              reason: "grant_already_consumed"
+            };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        settledOutcome = msg.outcome;
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: false
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: rcptId }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "uncertain", "grant_already_consumed must yield uncertain status");
+    assert.equal(settledOutcome, "uncertain", "grant_already_consumed must settle uncertain, NEVER not-sent");
+    assert.equal(harness.storageStore["receipt_" + rcptId].deliveryStatus, "dispatching/uncertain");
+
+    console.log("  [PASS] grant_already_consumed settles uncertain and retains slot without releasing");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test: verify_submitted_message requires real message ID and never synthesizes
+  // ---------------------------------------------------------------------------
+  {
+    let userTurns = [];
+    const mockDocument = {
+      readyState: "complete",
+      querySelector: () => null,
+      querySelectorAll: (sel) => {
+        if (sel.includes("data-message-author-role=\"user\"") || sel.includes("conversation-turn")) {
+          return userTurns;
+        }
+        return [];
+      }
+    };
+
+    let capturedListener = null;
+    const mockChrome = {
+      runtime: {
+        onMessage: {
+          addListener(cb) {
+            capturedListener = cb;
+          }
+        }
+      }
+    };
+
+    const ctx = vm.createContext({
+      chrome: mockChrome,
+      document: mockDocument,
+      window: { location: { pathname: "/c/c_test_verify", href: "https://chatgpt.com/c/c_test_verify" } },
+      console: { log() {}, error() {}, warn() {} },
+      Promise,
+      setTimeout,
+      clearTimeout
+    });
+    vm.runInContext(contentScriptCode, ctx);
+
+    // Case A: User turn contains marker, but has NO data-message-id and NO data-testid
+    userTurns = [
+      {
+        innerText: "Here is the result [hands-receipt:rcpt_abc_123]",
+        getAttribute: () => null
+      }
+    ];
+
+    let respA = null;
+    capturedListener(
+      { action: "verify_submitted_message", receiptMarker: "[hands-receipt:rcpt_abc_123]", expectedConversationId: "c_test_verify" },
+      {},
+      (r) => { respA = r; }
+    );
+    assert.equal(respA.ok, true);
+    assert.equal(respA.observed, false, "Unverified optimistic bubble lacking ID must return observed: false");
+    assert.equal(respA.observedMessageId, undefined, "Must NEVER synthesize msg_observed_DOCUMENT_ID");
+
+    // Case B: Optimistic conversation-turn container has data-testid but no real data-message-id
+    userTurns = [
+      {
+        innerText: "Here is the result [hands-receipt:rcpt_abc_123]",
+        getAttribute: (attr) => attr === "data-testid" ? "conversation-turn-7" : null,
+        querySelector: () => null
+      }
+    ];
+
+    let respB = null;
+    capturedListener(
+      { action: "verify_submitted_message", receiptMarker: "[hands-receipt:rcpt_abc_123]", expectedConversationId: "c_test_verify" },
+      {},
+      (r) => { respB = r; }
+    );
+    assert.equal(respB.ok, true);
+    assert.equal(respB.observed, false, "conversation-turn data-testid is not a durable message identity");
+    assert.equal(respB.observedMessageId, undefined);
+
+    // Case C: User turn contains marker and HAS real data-message-id
+    userTurns = [
+      {
+        innerText: "Here is the result [hands-receipt:rcpt_abc_123]",
+        getAttribute: (attr) => attr === "data-message-id" ? "real_msg_id_999" : null
+      }
+    ];
+
+    let respC = null;
+    capturedListener(
+      { action: "verify_submitted_message", receiptMarker: "[hands-receipt:rcpt_abc_123]", expectedConversationId: "c_test_verify" },
+      {},
+      (r) => { respC = r; }
+    );
+    assert.equal(respC.ok, true);
+    assert.equal(respC.observed, true);
+    assert.equal(respC.observedMessageId, "real_msg_id_999", "Real message identity must be returned");
+
+    console.log("  [PASS] verify_submitted_message requires real message ID and never synthesizes");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

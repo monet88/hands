@@ -88,6 +88,7 @@ pub enum PairingError {
     AlreadyAttempted,
     ReceiptNotFound,
     ExecutionMismatch,
+    AccountContextMismatch,
     DispatchFenceConflict,
     StorageError(String),
 }
@@ -109,6 +110,7 @@ impl std::fmt::Display for PairingError {
             PairingError::AlreadyAttempted => write!(f, "already_attempted"),
             PairingError::ReceiptNotFound => write!(f, "receipt_not_found"),
             PairingError::ExecutionMismatch => write!(f, "execution_mismatch"),
+            PairingError::AccountContextMismatch => write!(f, "account_context_mismatch"),
             PairingError::DispatchFenceConflict => write!(f, "dispatch_fence_conflict"),
             PairingError::StorageError(e) => write!(f, "storage_error: {}", e),
         }
@@ -2043,6 +2045,28 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             return Err(PairingError::DispatchFenceConflict);
         }
 
+        // Verify launch request exists and account evidence matches launch binding (fail-closed against account drift)
+        let launch_info: Option<(String, String)> = tx
+            .query_row(
+                "SELECT account_evidence_hash, origin_conversation_url FROM launch_requests WHERE execution_id = ?1",
+                params![&rcpt_exec],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let (expected_account_hash, expected_url) = match launch_info {
+            Some(info) => info,
+            None => return Err(PairingError::ExecutionMismatch),
+        };
+
+        if params.account_evidence_hash != expected_account_hash {
+            return Err(PairingError::AccountContextMismatch);
+        }
+        if params.origin_conversation_url != expected_url {
+            return Err(PairingError::DispatchFenceConflict);
+        }
+
         // 2. Check existing dispatch_fence for this receipt
         let existing_fence: Option<(
             String, // attempt_id
@@ -2110,6 +2134,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     });
                 } else {
                     // Competing document or separate native host: LOSER receives status, NEVER permission!
+                    // Durable uncertainty survives restart/timeout without lease expiry: no automatic re-grant
                     return Ok(DispatchGrantResult {
                         granted: false,
                         receipt_id: params.receipt_id.clone(),
@@ -2190,7 +2215,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                         &params.attempt_id,
                         params.expected_delivery_revision,
                         &params.origin_conversation_url,
-                        &params.account_evidence_hash,
+                        &expected_account_hash,
                         &params.transcript_evidence_hash,
                         &params.tab_id,
                         &params.document_id,
@@ -2305,7 +2330,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 &params.payload_digest,
                 &params.receipt_marker,
                 &params.origin_conversation_url,
-                &params.account_evidence_hash,
+                &expected_account_hash,
                 &params.transcript_evidence_hash,
                 &params.tab_id,
                 &params.document_id,
@@ -2440,17 +2465,24 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     return Err(PairingError::StorageError("submitted-observed requires non-empty observed_message_id".to_string()));
                 }
 
+                let settlement_hash = params
+                    .transcript_evidence_hash
+                    .as_deref()
+                    .filter(|h| !h.trim().is_empty());
+
                 tx.execute(
                     r#"
                     UPDATE dispatch_fences
                     SET state = 'submitted-observed',
                         observed_message_id = ?1,
-                        settled_at = ?2,
-                        updated_at = ?2
-                    WHERE receipt_id = ?3 AND attempt_id = ?4 AND delivery_revision = ?5
+                        transcript_evidence_hash = COALESCE(?2, transcript_evidence_hash),
+                        settled_at = ?3,
+                        updated_at = ?3
+                    WHERE receipt_id = ?4 AND attempt_id = ?5 AND delivery_revision = ?6
                     "#,
                     params![
                         params.observed_message_id,
+                        settlement_hash,
                         now,
                         &params.receipt_id,
                         &params.attempt_id,

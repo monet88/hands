@@ -103,6 +103,54 @@ fn test_local_init_creates_active_local_host_without_bootstrap() {
 }
 
 #[test]
+fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let ext_initial = "initial_extension_id_abcdef";
+
+    // 1. First init succeeds
+    let res1 = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: ext_initial.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    })
+    .expect("first local init failed");
+
+    let manifest1 = std::fs::read_to_string(&res1.manifest_path).unwrap();
+    assert!(manifest1.contains(ext_initial));
+
+    // 2. Lock the journal with an exclusive transaction
+    let mut conn = rusqlite::Connection::open(&state_dir.join("journal.sqlite")).unwrap();
+    conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive).unwrap();
+
+    // 3. Second init with different extension ID attempts to run, but journal update will fail
+    let ext_second = "second_extension_id_xyz123";
+    let res2 = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: ext_second.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    });
+    assert!(res2.is_err(), "Local init must fail when journal cannot be updated");
+
+    drop(tx);
+    drop(conn);
+
+    // 4. Manifest must be restored to previous manifest containing ext_initial, NOT ext_second
+    let manifest_after = std::fs::read_to_string(&res1.manifest_path).unwrap();
+    assert!(
+        manifest_after.contains(ext_initial),
+        "Manifest must be restored to previous valid manifest on failure"
+    );
+    assert!(
+        !manifest_after.contains(ext_second),
+        "Failed init must not leave partial manifest on disk"
+    );
+}
+
+#[test]
 fn test_setup_rejects_non_git_target() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().to_path_buf();

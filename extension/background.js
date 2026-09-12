@@ -187,7 +187,12 @@ async function processDrainResponse(drainResponse, stored, profileId) {
     const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
 
     // Prepare durable browser record: status "received" (separate from ChatGPT submission, no send permission)
-    const receiptRecord = buildReceiptRecord(rcpt);
+    // Preserve existing terminal delivery state if receipt is redelivered before ACK
+    const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
+    let receiptRecord = buildReceiptRecord(rcpt);
+    if (existing && existing.deliveryStatus && existing.deliveryStatus !== "received") {
+      receiptRecord = existing;
+    }
 
     // Hard gate: Storage write MUST succeed BEFORE reporting acknowledgement to native host
     try {
@@ -409,19 +414,15 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
 
   if (!fenceResponse || fenceResponse.status !== "ok" || !fenceResponse.grant || !fenceResponse.grant.granted) {
     const grant = fenceResponse?.grant;
-    if (grant) {
-      let updated = false;
-      if (grant.delivery_revision && (receiptRecord.deliveryRevision || 0) < grant.delivery_revision) {
+    // Only reconcile terminal states belonging to this receipt (e.g. submitted-observed).
+    // Never copy competing-owner or in-flight conflict states (dispatching/uncertain, slot_busy)
+    // into the losing receipt so it remains retryable after the slot clears.
+    if (grant && grant.state === "submitted-observed" && grant.receipt_id === receiptId) {
+      receiptRecord.deliveryStatus = "submitted-observed";
+      if (grant.delivery_revision) {
         receiptRecord.deliveryRevision = grant.delivery_revision;
-        updated = true;
       }
-      if (grant.state && receiptRecord.deliveryStatus !== grant.state) {
-        receiptRecord.deliveryStatus = grant.state;
-        updated = true;
-      }
-      if (updated) {
-        await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
-      }
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
     }
     // Loser or slot busy: receives status, NEVER permission!
     return {
@@ -451,6 +452,7 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
           expectedDocumentId: documentId,
           expectedConversationId: originConversationId,
           expectedConversationUrl: originConversationUrl,
+          expectedAccountText: accountText,
           continuationText,
           receiptMarker
         },
@@ -491,6 +493,27 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
   }
 
   if (!clickResp.ok || !clickResp.clicked) {
+    if (clickResp.reason === "grant_already_consumed") {
+      // Replay of an already-consumed grant is NOT affirmative no-click evidence!
+      // An earlier callback may still be awaiting button readiness or executing.
+      // Settle as uncertain to preserve the slot and prevent duplicate dispatches.
+      await sendNative({
+        op: "settle_fence",
+        pairingId: stored.pairingId,
+        pairingSecret: stored.pairingSecret,
+        profileId,
+        receiptId,
+        executionId,
+        attemptId,
+        expectedDeliveryRevision,
+        outcome: "uncertain",
+        details: "grant_already_consumed"
+      });
+      receiptRecord.deliveryStatus = "dispatching/uncertain";
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+      return { status: "uncertain", reason: "grant_already_consumed" };
+    }
+
     // Document definitively rejected grant or guards failed synchronously before click:
     // Settle conclusively as not-sent so slot can be released
     await sendNative({
@@ -1298,7 +1321,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const allData = await chrome.storage.local.get(null);
           const pending = [];
           for (const [k, v] of Object.entries(allData)) {
-            if (k.startsWith("receipt_") && v && v.deliveryStatus === "received") {
+            if (k.startsWith("receipt_") && v && (v.deliveryStatus === "received" || v.deliveryStatus === "not-sent" || v.deliveryStatus === "dispatching/uncertain")) {
               pending.push(v);
             }
           }

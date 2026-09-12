@@ -8,7 +8,7 @@ fn live_launcher_tests_enabled() -> bool {
 use hands_return_bridge::journal::{Journal, LaunchRequestParams, PolicyRecord, TargetRecord};
 use hands_return_bridge::launcher::{
     build_omp_startup_command_with_env, build_omp_startup_command_with_env_and_bin,
-    ensure_adapter_file, is_exact_supported_omp_version, split_prompt_for_orca,
+    ensure_adapter_file, is_supported_omp_version, split_prompt_for_orca,
     COMPANION_ADAPTER_REVISION, ORCA_PROMPT_CHUNK_MAX_BYTES, SUPPORTED_OMP_CLI_SHAPE,
     SUPPORTED_OMP_REVISION,
 };
@@ -1365,8 +1365,8 @@ fn test_adapter_v3_generation_and_revision() {
 #[test]
 fn test_launch_preflight_supported_omp_revision_pin() {
     use hands_return_bridge::launcher::verify_launch_preflight;
-    assert_eq!(SUPPORTED_OMP_REVISION, "any");
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/*");
+    assert_eq!(SUPPORTED_OMP_REVISION, ">=18.1.16");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/>=18.1.16");
     if !live_launcher_tests_enabled() {
         eprintln!("SKIP live OMP revision preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
         return;
@@ -1389,25 +1389,31 @@ fn test_launch_preflight_supported_omp_revision_pin() {
 
 #[test]
 fn test_exact_supported_omp_version_matching() {
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/*");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/>=18.1.16");
 
-    // OMP version shapes must pass
-    assert!(is_exact_supported_omp_version("omp/18.1.16"));
-    assert!(is_exact_supported_omp_version("omp/18.1.18"));
-    assert!(is_exact_supported_omp_version("omp/19.0.0"));
-    assert!(is_exact_supported_omp_version("omp/118.1.16"));
-    assert!(is_exact_supported_omp_version("omp/18.1.16\n"));
-    assert!(is_exact_supported_omp_version("omp/18.1.16\r\n"));
-    assert!(is_exact_supported_omp_version("  omp/18.1.16  \n"));
+    // OMP version shapes >= 18.1.16 must pass
+    assert!(is_supported_omp_version("omp/18.1.16"));
+    assert!(is_supported_omp_version("omp/18.1.18"));
+    assert!(is_supported_omp_version("omp/19.0.0"));
+    assert!(is_supported_omp_version("omp/118.1.16"));
+    assert!(is_supported_omp_version("omp/18.1.16\n"));
+    assert!(is_supported_omp_version("omp/18.1.16\r\n"));
+    assert!(is_supported_omp_version("  omp/18.1.16  \n"));
+
+    // Older versions below 18.1.16 floor must be rejected
+    assert!(!is_supported_omp_version("omp/18.1.15"));
+    assert!(!is_supported_omp_version("omp/18.0.99"));
+    assert!(!is_supported_omp_version("omp/17.9.99"));
 
     // Lookalikes, prefixes, suffixes, non-omp CLI MUST BE REJECTED
-    assert!(!is_exact_supported_omp_version("v18.1.16"));
-    assert!(!is_exact_supported_omp_version("18.1.16"));
-    assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("node omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/"));
-    assert!(!is_exact_supported_omp_version("omp/abc"));
-    assert!(!is_exact_supported_omp_version(""));
+    assert!(!is_supported_omp_version("v18.1.16"));
+    assert!(!is_supported_omp_version("18.1.16"));
+    assert!(!is_supported_omp_version("wrapper: omp/18.1.16"));
+    assert!(!is_supported_omp_version("node omp/18.1.16"));
+    assert!(!is_supported_omp_version("omp/"));
+    assert!(!is_supported_omp_version("omp/abc"));
+    assert!(!is_supported_omp_version("omp/18.1.16 extra"));
+    assert!(!is_supported_omp_version(""));
 }
 
 #[test]
@@ -1421,11 +1427,13 @@ fn test_launch_preflight_adversarial_lookalike_rejection() {
     let dir = tempdir().unwrap();
 
     let lookalikes = [
-        "omp/118.1.16",
-        "omp/18.1.16-beta",
+        "omp/",
+        "omp/abc",
         "wrapper: omp/18.1.16",
         "18.1.16",
         "omp/18.1.16 extra",
+        "omp/18.1.15",
+        "omp/17.0.0",
     ];
 
     for (idx, lookalike) in lookalikes.iter().enumerate() {
@@ -1635,6 +1643,19 @@ fn test_protocol_dispatch_fence_and_settlement_messages() {
     assert_eq!(fence_resp["grant"]["granted"], true);
     assert_eq!(fence_resp["grant"]["attempt_id"], "attempt_proto_1");
 
+
+    // 1b. Invalid conversation URL or mismatch fails closed with invalid_conversation_boundary
+    let mut invalid_url_msg = fence_msg.clone();
+    invalid_url_msg["originConversationUrl"] = json!("https://malicious.example.com/c/conv_proto_fence");
+    let invalid_url_resp = handle_native_message(&invalid_url_msg, &journal);
+    assert_eq!(invalid_url_resp["status"], "error");
+    assert_eq!(invalid_url_resp["code"], "invalid_conversation_boundary");
+
+    let mut mismatch_url_msg = fence_msg.clone();
+    mismatch_url_msg["originConversationUrl"] = json!("https://chatgpt.com/c/different_conv_id");
+    let mismatch_url_resp = handle_native_message(&mismatch_url_msg, &journal);
+    assert_eq!(mismatch_url_resp["status"], "error");
+    assert_eq!(mismatch_url_resp["code"], "invalid_conversation_boundary");
     // 2. Competing document attempt is rejected over protocol
     let mut competing_msg = fence_msg.clone();
     competing_msg["documentId"] = json!("doc_proto_2");
@@ -1662,4 +1683,15 @@ fn test_protocol_dispatch_fence_and_settlement_messages() {
     assert_eq!(settle_resp["status"], "ok");
     assert_eq!(settle_resp["settlement"]["settled"], true);
     assert_eq!(settle_resp["settlement"]["slot_released"], true);
+
+    // 4. Verify transcript_evidence_hash was persisted in dispatch_fences
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let hash: String = conn.query_row(
+            "SELECT transcript_evidence_hash FROM dispatch_fences WHERE receipt_id = ?1",
+            rusqlite::params![rcpt_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(hash, "hash_transcript_after_submit");
+    }
 }

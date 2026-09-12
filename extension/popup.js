@@ -15,15 +15,21 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function setupCommandCopy(el, text) {
     if (!el) return;
-    el.addEventListener("click", async () => {
+    const handleCopy = async () => {
       try {
         await navigator.clipboard.writeText(text);
         if (cmdCopyNotice) {
           cmdCopyNotice.textContent = "Copied to clipboard!";
           setTimeout(() => { if (cmdCopyNotice) cmdCopyNotice.textContent = ""; }, 2000);
         }
-      } catch {}
-    });
+      } catch (err) {
+        if (cmdCopyNotice) {
+          cmdCopyNotice.textContent = "Copy failed: " + (err?.message || "clipboard denied");
+          setTimeout(() => { if (cmdCopyNotice) cmdCopyNotice.textContent = ""; }, 3000);
+        }
+      }
+    };
+    el.addEventListener("click", handleCopy);
   }
   setupCommandCopy(cmdAdd, 'hands-return-bridge target add --target "<path>"');
   setupCommandCopy(cmdRemove, 'hands-return-bridge target remove --target-id <id>');
@@ -52,10 +58,16 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function conversationIdFromUrl(url) {
     if (!url || !url.startsWith("https://chatgpt.com/")) return null;
+    if (url.includes("#") || url.includes("?")) return null;
     try {
       const segments = new URL(url).pathname.split("/").filter(Boolean);
-      if (segments.length === 2 && segments[0] === "c") return segments[1];
-      if (segments.length === 4 && segments[0] === "g" && segments[2] === "c") return segments[3];
+      let id = null;
+      if (segments.length === 2 && segments[0] === "c") id = segments[1];
+      if (segments.length === 4 && segments[0] === "g" && segments[2] === "c") id = segments[3];
+      if (!id || id === "new" || id === "chat" || id.includes("new_chat") || id.includes("provisional")) {
+        return null;
+      }
+      return id;
     } catch {}
     return null;
   }
@@ -80,13 +92,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       option.textContent = target.name || target.target_id;
       convTargetSelect.appendChild(option);
     }
-
+    convTargetSelect.disabled = true;
     const binding = await chrome.runtime.sendMessage({
       action: "getConversationTarget",
       conversationId: convId
     });
     if (binding?.targetId) convTargetSelect.value = binding.targetId;
-
+    convTargetSelect.disabled = false;
     convTargetSelect.onchange = async () => {
       await chrome.runtime.sendMessage({
         action: "setConversationTarget",

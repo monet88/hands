@@ -16,6 +16,27 @@
     if (btn.getAttribute && btn.getAttribute("aria-disabled") === "true") return false;
     return true;
   }
+  function clearComposer(composer, expectedText) {
+    if (!composer) return;
+    try {
+      const currentText = (composer.tagName === "TEXTAREA" ? (composer.value || "") : (composer.innerText || "")).trim();
+      // Only clear bridge-authored text if the composer still exactly equals the bridge continuation payload
+      // If the composer differs (user-edited/tampered), preserve it untouched
+      if (expectedText === undefined || currentText !== expectedText.trim()) {
+        return;
+      }
+      if (composer.tagName === "TEXTAREA") {
+        composer.value = "";
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+        composer.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (composer.isContentEditable) {
+        composer.innerText = "";
+        try {
+          composer.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "deleteContentBackward" }));
+        } catch {}
+      }
+    } catch {}
+  }
   function getCanonicalConversationId() {
     const pathname = window.location.pathname;
     const segments = pathname.split("/").filter(Boolean);
@@ -220,8 +241,10 @@
     // Op 3: Consume Grant and Synchronous Guard-and-Click
     if (request.action === "consume_grant_and_dispatch") {
       (async () => {
+        let composer = null;
+        const continuationText = request?.continuationText;
         try {
-          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, continuationText, receiptMarker } = request;
+          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, expectedAccountText, receiptMarker } = request;
 
         // Document Identity Check: grant is bound to this specific document
         if (expectedDocumentId !== DOCUMENT_ID) {
@@ -260,7 +283,7 @@
         }
 
         // Locate composer
-        const composer = document.querySelector(
+        composer = document.querySelector(
           '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
         );
         if (!composer) {
@@ -307,6 +330,7 @@
         }
 
         if (!isButtonEnabled(sendBtn)) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -319,6 +343,7 @@
         // Finding 6: Immediately before click revalidate document/conversation, generation/readiness,
         // composer still contains exact continuation payload, and the actual button is valid and enabled
         if (expectedDocumentId !== DOCUMENT_ID) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -330,6 +355,7 @@
 
         const currentUrl = window.location.href.split("#")[0].split("?")[0];
         if (currentUrl !== SCRIPT_LOADED_URL) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -338,9 +364,9 @@
           });
           return true;
         }
-
         const currentConvId = getCanonicalConversationId();
         if (!currentConvId || currentConvId !== expectedConversationId) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -351,6 +377,7 @@
         }
 
         if (expectedConversationUrl && currentUrl !== expectedConversationUrl && !currentUrl.endsWith(`/c/${expectedConversationId}`)) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -361,6 +388,7 @@
         }
 
         if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -374,6 +402,7 @@
           'button[data-testid="stop-button"], button[aria-label*="Stop generating"], button[data-testid="fruitjuice-stop-button"]'
         );
         if (stopBtn) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -383,8 +412,42 @@
           return true;
         }
 
-        const currentComposerText = (composer.tagName === "TEXTAREA" ? (composer.value || "") : (composer.innerText || "")).trim();
+        // Revalidate the same account/workspace context immediately before click.
+        // Keep this synchronous: hashing here would introduce a fresh async gap after the native grant.
+        if (expectedAccountText) {
+          const currentAccountText = getAccountContextText();
+          if (!currentAccountText || currentAccountText !== expectedAccountText) {
+            clearComposer(composer, continuationText);
+            sendResponse({
+              ok: false,
+              clicked: false,
+              reason: "account_context_mismatch",
+              message: "Account/workspace context changed after dispatch grant"
+            });
+            return true;
+          }
+        }
+
+        // Re-query the current attached composer after the async send-button wait (P2 3995737142)
+        const currentComposer = document.querySelector(
+          '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
+        );
+        const isComposerAttached = currentComposer && (document.contains ? document.contains(currentComposer) : (document.body ? document.body.contains(currentComposer) : true));
+        if (!currentComposer || !isComposerAttached || currentComposer !== composer) {
+          clearComposer(currentComposer, continuationText);
+          clearComposer(composer, continuationText);
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "composer_detached_or_replaced",
+            message: "Composer was detached or replaced during send button wait"
+          });
+          return true;
+        }
+
+        const currentComposerText = (currentComposer.tagName === "TEXTAREA" ? (currentComposer.value || "") : (currentComposer.innerText || "")).trim();
         if (!currentComposerText || currentComposerText !== continuationText.trim()) {
+          clearComposer(currentComposer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -396,6 +459,7 @@
 
         const isAttached = document.contains ? document.contains(sendBtn) : (document.body ? document.body.contains(sendBtn) : true);
         if (!isAttached || !isButtonEnabled(sendBtn)) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -414,6 +478,7 @@
           receiptMarker
         });
         } catch (err) {
+          clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
@@ -451,12 +516,22 @@
           for (const turn of userTurns) {
             const text = (turn.innerText || "").trim();
             if (text.includes(receiptMarker)) {
-              const msgId = turn.getAttribute("data-message-id") || turn.getAttribute("data-testid") || ("msg_observed_" + DOCUMENT_ID);
-              found = { messageId: msgId, text };
-              break;
+              // Only accept a real message identity. Conversation-turn data-testid values are
+              // render/container identities and may exist for unverified optimistic UI.
+              const nestedMessage = typeof turn.querySelector === "function"
+                ? turn.querySelector("[data-message-id]")
+                : null;
+              const rawId = (
+                turn.getAttribute("data-message-id") ||
+                nestedMessage?.getAttribute("data-message-id") ||
+                ""
+              ).trim();
+              if (rawId) {
+                found = { messageId: rawId, text };
+                break;
+              }
             }
           }
-          if (found) break;
         }
 
         const transcriptText = getRenderedTranscriptText();

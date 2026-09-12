@@ -31,7 +31,7 @@ Setup Options:
   --tool-policy <policy>        Tool policy (required, e.g. standard)
   --approval-policy <policy>    Approval policy (required, e.g. prompt)
   --target-id <id>              Target ID identifier (default: dir name)
-  --state-dir <dir>             Override state directory (requires --skip-registry for setup)
+  --state-dir <dir>             Override state directory (requires --skip-registry for setup and local-init)
   --skip-registry               Skip Windows Registry NativeMessagingHosts registration
 
 Target Commands:
