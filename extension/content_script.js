@@ -7,9 +7,15 @@
   const DOCUMENT_ID = "doc_" + (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID().replace(/-/g, "").slice(0, 16) : Math.random().toString(36).slice(2, 18));
   const SCRIPT_LOADED_URL = window.location.href.split("#")[0].split("?")[0];
 
-  // Track one-time grant consumption by this exact document
-  let consumedGrantAttemptId = null;
+  // Track one-time grant consumption by attemptId in this live document
+  const consumedGrantAttemptIds = new Set();
 
+  function isButtonEnabled(btn) {
+    if (!btn) return false;
+    if (btn.disabled) return false;
+    if (btn.getAttribute && btn.getAttribute("aria-disabled") === "true") return false;
+    return true;
+  }
   function getCanonicalConversationId() {
     const pathname = window.location.pathname;
     const segments = pathname.split("/").filter(Boolean);
@@ -228,8 +234,8 @@
           return true;
         }
 
-        // One-time grant consumption guard: this document cannot consume the same or another grant twice!
-        if (consumedGrantAttemptId) {
+        // One-time grant consumption guard: reject replay of the exact same attemptId (Finding 7)
+        if (consumedGrantAttemptIds.has(attemptId)) {
           sendResponse({
             ok: false,
             clicked: false,
@@ -239,9 +245,8 @@
           return true;
         }
 
-        // Mark grant consumed immediately before synchronous guards & click
-        consumedGrantAttemptId = attemptId;
-
+        // Mark this attemptId consumed
+        consumedGrantAttemptIds.add(attemptId);
         // Synchronous final readiness guard (zero asynchronous gap!)
         const finalReadiness = checkReadinessGuards(expectedConversationId, expectedConversationUrl);
         if (!finalReadiness.ready) {
@@ -290,22 +295,112 @@
           } catch {}
         }
 
-        // Locate send button (mounted/enabled upon text input)
+        // Locate send button (mounted/enabled upon text input) (Finding 8)
         const sendBtnSelector = 'button[data-testid="send-button"], button[aria-label*="Send prompt" i], button[data-testid="fruitjuice-send-button"], #composer-submit-button';
         let sendBtn = document.querySelector(sendBtnSelector);
-        if (!sendBtn) {
-          for (let i = 0; i < 5 && !sendBtn; i++) {
+        if (!isButtonEnabled(sendBtn)) {
+          for (let i = 0; i < 10; i++) {
             await new Promise((res) => setTimeout(res, 60));
             sendBtn = document.querySelector(sendBtnSelector);
+            if (isButtonEnabled(sendBtn)) break;
           }
         }
 
-        if (!sendBtn) {
+        if (!isButtonEnabled(sendBtn)) {
           sendResponse({
             ok: false,
             clicked: false,
-            reason: "composer_elements_missing",
-            message: "Send button missing or not mounted after text insertion"
+            reason: "send_button_disabled",
+            message: "Send button missing or disabled after text insertion"
+          });
+          return true;
+        }
+
+        // Finding 6: Immediately before click revalidate document/conversation, generation/readiness,
+        // composer still contains exact continuation payload, and the actual button is valid and enabled
+        if (expectedDocumentId !== DOCUMENT_ID) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "document_identity_mismatch",
+            message: "Document identity mismatch at click moment"
+          });
+          return true;
+        }
+
+        const currentUrl = window.location.href.split("#")[0].split("?")[0];
+        if (currentUrl !== SCRIPT_LOADED_URL) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "navigation_invalidated",
+            message: "Document URL changed since script load"
+          });
+          return true;
+        }
+
+        const currentConvId = getCanonicalConversationId();
+        if (!currentConvId || currentConvId !== expectedConversationId) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "conversation_mismatch",
+            message: "Page is not the expected canonical conversation at click moment"
+          });
+          return true;
+        }
+
+        if (expectedConversationUrl && currentUrl !== expectedConversationUrl && !currentUrl.endsWith(`/c/${expectedConversationId}`)) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "conversation_mismatch",
+            message: "Page URL does not match expected conversation at click moment"
+          });
+          return true;
+        }
+
+        if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "login_or_error_page",
+            message: "Page shows login or error state at click moment"
+          });
+          return true;
+        }
+
+        const stopBtn = document.querySelector(
+          'button[data-testid="stop-button"], button[aria-label*="Stop generating"], button[data-testid="fruitjuice-stop-button"]'
+        );
+        if (stopBtn) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "active_generation",
+            message: "ChatGPT is currently generating a response at click moment"
+          });
+          return true;
+        }
+
+        const currentComposerText = (composer.tagName === "TEXTAREA" ? (composer.value || "") : (composer.innerText || "")).trim();
+        if (!currentComposerText || currentComposerText !== continuationText.trim()) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "composer_content_tampered",
+            message: "Composer content does not match continuation payload at click moment"
+          });
+          return true;
+        }
+
+        const isAttached = document.contains ? document.contains(sendBtn) : (document.body ? document.body.contains(sendBtn) : true);
+        if (!isAttached || !isButtonEnabled(sendBtn)) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "send_button_invalid",
+            message: "Send button is no longer valid, attached, or enabled at click moment"
           });
           return true;
         }

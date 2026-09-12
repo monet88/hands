@@ -1766,3 +1766,324 @@ fn test_local_mode_pairing_is_idempotent_and_preserves_targets() {
         Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     );
 }
+
+#[test]
+fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_not_sent_reconcile";
+    let bootstrap_token = "boot_ns_1";
+    let profile_id = "profile_ns";
+    let canonical_path = repo_dir.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_gizmo_test_1";
+    let conv_url = "https://chatgpt.com/g/g-12345-my-gizmo/c/conv_gizmo_test_1".to_string();
+
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_ns_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t1".into(),
+        account_evidence_hash: "hash_a1".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task ns".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_ns_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_1', 'assistant text', 'digest_1', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // 1. Initial attempt at revision 1
+    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_rev_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_ns".into(),
+        receipt_marker: "marker_ns".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        account_evidence_hash: "hash_a1".into(),
+        transcript_evidence_hash: "hash_t1".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1".into(),
+    };
+
+    let grant1 = journal.acquire_dispatch_fence(&claim_params).unwrap();
+    assert!(grant1.granted);
+    assert_eq!(grant1.delivery_revision, 1);
+
+    // 2. Settle as not-sent
+    let settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_rev_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "not-sent".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: Some("guard_failed".into()),
+    }).unwrap();
+    assert!(settle.settled);
+    assert!(settle.slot_released);
+
+    // 3. Drain and summary recovery: durable fence revision, state, and Gizmo URL must be exposed
+    let (summaries, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].origin_conversation_url, conv_url);
+    let summary_rcpt = summaries[0].completion_receipt.as_ref().unwrap();
+    assert_eq!(summary_rcpt.origin_conversation_url.as_deref(), Some(conv_url.as_str()));
+    assert_eq!(summary_rcpt.delivery_revision, Some(1));
+    assert_eq!(summary_rcpt.delivery_status.as_deref(), Some("not-sent"));
+
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].origin_conversation_url.as_deref(), Some(conv_url.as_str()));
+    assert_eq!(receipts[0].delivery_revision, Some(1));
+    assert_eq!(receipts[0].delivery_status.as_deref(), Some("not-sent"));
+
+    // 4. Stale retry with expected_delivery_revision: 1 is denied and reports durable revision 1
+    let retry_stale_params = hands_return_bridge::journal::DispatchClaimParams {
+        attempt_id: "att_rev_1_stale".into(),
+        expected_delivery_revision: 1,
+        ..claim_params.clone()
+    };
+    let grant_stale = journal.acquire_dispatch_fence(&retry_stale_params).unwrap();
+    assert!(!grant_stale.granted, "Stale retry at current rev 1 must be denied");
+    assert_eq!(grant_stale.delivery_revision, 1);
+    assert_eq!(grant_stale.state, "not-sent");
+
+    // 5. Valid retry at incremented revision (2) succeeds
+    let retry_valid_params = hands_return_bridge::journal::DispatchClaimParams {
+        attempt_id: "att_rev_2".into(),
+        expected_delivery_revision: 2,
+        ..claim_params
+    };
+    let grant2 = journal.acquire_dispatch_fence(&retry_valid_params).unwrap();
+    assert!(grant2.granted, "Retry at incremented revision 2 must be granted");
+    assert_eq!(grant2.delivery_revision, 2);
+    assert_eq!(grant2.state, "dispatching/uncertain");
+}
+
+#[test]
+fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_settle_transitions";
+    let bootstrap_token = "boot_st_1";
+    let profile_id = "profile_st";
+    let canonical_path = repo_dir.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_settle_test";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_st_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t1".into(),
+        account_evidence_hash: "hash_a1".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task st".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_st_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_1', 'assistant text', 'digest_1', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_st_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_st".into(),
+        receipt_marker: "marker_st".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url,
+        account_evidence_hash: "hash_a1".into(),
+        transcript_evidence_hash: "hash_t1".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1".into(),
+    };
+
+    journal.acquire_dispatch_fence(&claim_params).unwrap();
+
+    // Settle as not-sent
+    let settle1 = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_st_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "not-sent".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: None,
+    }).unwrap();
+    assert!(settle1.settled);
+    assert!(settle1.slot_released);
+
+    // Stale uncertain after not-sent MUST be rejected with DispatchFenceConflict (Finding 2)
+    let err_uncertain = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_st_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "uncertain".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: None,
+    });
+    assert_eq!(err_uncertain.unwrap_err(), PairingError::DispatchFenceConflict);
+
+    // Replay of same not-sent is an idempotent success
+    let replay_not_sent = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_st_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "not-sent".into(),
+        observed_message_id: None,
+        transcript_evidence_hash: None,
+        details: None,
+    }).unwrap();
+    assert!(replay_not_sent.settled);
+    assert!(replay_not_sent.slot_released);
+
+    // Stale submitted-observed after not-sent is rejected
+    let err_submitted = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_st_1".into(),
+        expected_delivery_revision: 1,
+        outcome: "submitted-observed".into(),
+        observed_message_id: Some("msg_late".into()),
+        transcript_evidence_hash: None,
+        details: None,
+    });
+    assert_eq!(err_submitted.unwrap_err(), PairingError::DispatchFenceConflict);
+}
+
+#[test]
+fn test_acquire_dispatch_fence_rejects_revoked_pairing_in_transaction() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pair_revoke_race";
+    let bootstrap_token = "boot_rr_1";
+    let profile_id = "profile_rr";
+    let canonical_path = repo_dir.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let conv_id = "conv_rr";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_rr_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t1".into(),
+        account_evidence_hash: "hash_a1".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task rr".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_rr_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_1', 'assistant text', 'digest_1', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // Revoke pairing
+    journal.revoke_pairing(pairing_id, &activated.pairing_secret, profile_id).unwrap();
+
+    // Attempting acquire_dispatch_fence inside transaction must fail with Retired (Finding 5)
+    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+        pairing_id: pairing_id.into(),
+        receipt_id: rcpt_id.into(),
+        execution_id: claim.execution_id.clone(),
+        attempt_id: "att_rr_1".into(),
+        expected_delivery_revision: 1,
+        payload_digest: "digest_rr".into(),
+        receipt_marker: "marker_rr".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url,
+        account_evidence_hash: "hash_a1".into(),
+        transcript_evidence_hash: "hash_t1".into(),
+        tab_id: Some("tab_1".into()),
+        document_id: "doc_1".into(),
+    };
+
+    let err = journal.acquire_dispatch_fence(&claim_params);
+    assert_eq!(err.unwrap_err(), PairingError::Retired);
+}

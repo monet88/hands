@@ -199,6 +199,14 @@ pub struct CompletionReceipt {
     pub pairing_id: String,
     pub return_token: String,
     pub origin_conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_conversation_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_attempt_id: Option<String>,
     pub turn_index: i64,
     pub stop_reason: String,
     pub assistant_message_id: Option<String>,
@@ -211,12 +219,21 @@ pub struct CompletionReceipt {
 
 impl CompletionReceipt {
     pub fn from_row(r: &Row) -> Result<Self, rusqlite::Error> {
+        let origin_conversation_url: Option<String> = r.get::<_, Option<String>>(13).ok().flatten();
+        let delivery_revision: Option<i64> = r.get::<_, Option<i64>>(14).ok().flatten();
+        let delivery_status: Option<String> = r.get::<_, Option<String>>(15).ok().flatten();
+        let active_attempt_id: Option<String> = r.get::<_, Option<String>>(16).ok().flatten();
+
         Ok(Self {
             receipt_id: r.get(0)?,
             execution_id: r.get(1)?,
             pairing_id: r.get(2)?,
             return_token: r.get(3)?,
             origin_conversation_id: r.get(4)?,
+            origin_conversation_url,
+            delivery_revision,
+            delivery_status,
+            active_attempt_id,
             turn_index: r.get(5)?,
             stop_reason: r.get(6)?,
             assistant_message_id: r.get(7)?,
@@ -1700,12 +1717,15 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             summary.completion_receipt = conn
                 .query_row(
                     r#"
-                    SELECT receipt_id, execution_id, pairing_id, return_token,
-                           origin_conversation_id, turn_index, stop_reason,
-                           assistant_message_id, assistant_text, content_digest,
-                           tool_call_count, state, committed_at
-                    FROM completion_receipts
-                    WHERE execution_id = ?1
+                    SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
+                           cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
+                           cr.assistant_message_id, cr.assistant_text, cr.content_digest,
+                           cr.tool_call_count, cr.state, cr.committed_at,
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                    FROM completion_receipts cr
+                    LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
+                    LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
+                    WHERE cr.execution_id = ?1
                     "#,
                     params![&summary.execution_id],
                     |r| CompletionReceipt::from_row(r),
@@ -1757,12 +1777,15 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             s.completion_receipt = conn
                 .query_row(
                     r#"
-                    SELECT receipt_id, execution_id, pairing_id, return_token,
-                           origin_conversation_id, turn_index, stop_reason,
-                           assistant_message_id, assistant_text, content_digest,
-                           tool_call_count, state, committed_at
-                    FROM completion_receipts
-                    WHERE execution_id = ?1
+                    SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
+                           cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
+                           cr.assistant_message_id, cr.assistant_text, cr.content_digest,
+                           cr.tool_call_count, cr.state, cr.committed_at,
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                    FROM completion_receipts cr
+                    LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
+                    LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
+                    WHERE cr.execution_id = ?1
                     "#,
                     params![&s.execution_id],
                     |r| CompletionReceipt::from_row(r),
@@ -1782,12 +1805,15 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         let receipt = conn
             .query_row(
                 r#"
-                SELECT receipt_id, execution_id, pairing_id, return_token,
-                       origin_conversation_id, turn_index, stop_reason,
-                       assistant_message_id, assistant_text, content_digest,
-                       tool_call_count, state, committed_at
-                FROM completion_receipts
-                WHERE execution_id = ?1
+                SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
+                       cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
+                       cr.assistant_message_id, cr.assistant_text, cr.content_digest,
+                       cr.tool_call_count, cr.state, cr.committed_at,
+                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                FROM completion_receipts cr
+                LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
+                LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
+                WHERE cr.execution_id = ?1
                 "#,
                 params![execution_id],
                 |r| CompletionReceipt::from_row(r),
@@ -1846,12 +1872,15 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             summary.completion_receipt = conn
                 .query_row(
                     r#"
-                    SELECT receipt_id, execution_id, pairing_id, return_token,
-                           origin_conversation_id, turn_index, stop_reason,
-                           assistant_message_id, assistant_text, content_digest,
-                           tool_call_count, state, committed_at
-                    FROM completion_receipts
-                    WHERE execution_id = ?1
+                    SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
+                           cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
+                           cr.assistant_message_id, cr.assistant_text, cr.content_digest,
+                           cr.tool_call_count, cr.state, cr.committed_at,
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                    FROM completion_receipts cr
+                    LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
+                    LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
+                    WHERE cr.execution_id = ?1
                     "#,
                     params![&summary.execution_id],
                     |r| CompletionReceipt::from_row(r),
@@ -1870,8 +1899,11 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 SELECT cr.receipt_id, cr.execution_id, cr.pairing_id, cr.return_token,
                        cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                        cr.assistant_message_id, cr.assistant_text, cr.content_digest,
-                       cr.tool_call_count, cr.state, cr.committed_at
+                       cr.tool_call_count, cr.state, cr.committed_at,
+                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
                 FROM completion_receipts cr
+                LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
+                LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
                 LEFT JOIN receipt_acknowledgements ra ON cr.receipt_id = ra.receipt_id
                 WHERE cr.pairing_id = ?1 AND ra.receipt_id IS NULL
                 ORDER BY cr.committed_at ASC, cr.receipt_id ASC
@@ -1969,6 +2001,22 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        // 0. Revalidate pairing activity inside the immediate transaction (Finding 5)
+        let pairing_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM pairings WHERE pairing_id = ?1",
+                params![&params.pairing_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        match pairing_status.as_deref() {
+            Some("active") => {},
+            Some("revoked") => return Err(PairingError::Retired),
+            Some(_) => return Err(PairingError::NotActive),
+            None => return Err(PairingError::NotFound),
+        }
 
         // 1. Verify receipt exists, belongs to pairing, matches execution_id, and matches origin_conversation_id
         let receipt_info: Option<(String, String, String)> = tx
@@ -2081,7 +2129,19 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             // If conclusively not-sent: can transition to a new attempt ONLY if delivery_revision increments
             if cur_state == "not-sent" {
                 if params.expected_delivery_revision <= cur_rev {
-                    return Err(PairingError::DispatchFenceConflict);
+                    return Ok(DispatchGrantResult {
+                        granted: false,
+                        receipt_id: params.receipt_id.clone(),
+                        execution_id: params.execution_id.clone(),
+                        attempt_id: cur_attempt,
+                        delivery_revision: cur_rev,
+                        state: cur_state,
+                        owner_document_id: cur_doc,
+                        owner_tab_id: cur_tab,
+                        receipt_marker: cur_marker,
+                        payload_digest: cur_digest,
+                        origin_conversation_id: params.origin_conversation_id.clone(),
+                    });
                 }
                 // Check conversation slot availability
                 let slot_owner: Option<(String, String)> = tx
@@ -2337,15 +2397,37 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             return Err(PairingError::DispatchFenceConflict);
         }
 
-        // If already terminal submitted-observed: idempotent replay
+        // Terminal / idempotent replay checks (Finding 2)
         if f_state == "submitted-observed" {
-            return Ok(DispatchSettlementResult {
-                settled: true,
-                receipt_id: params.receipt_id.clone(),
-                attempt_id: f_attempt,
-                outcome: "submitted-observed".to_string(),
-                slot_released: true,
-            });
+            if params.outcome == "submitted-observed" {
+                return Ok(DispatchSettlementResult {
+                    settled: true,
+                    receipt_id: params.receipt_id.clone(),
+                    attempt_id: f_attempt,
+                    outcome: "submitted-observed".to_string(),
+                    slot_released: true,
+                });
+            } else {
+                return Err(PairingError::DispatchFenceConflict);
+            }
+        }
+
+        if f_state == "not-sent" {
+            if params.outcome == "not-sent" {
+                return Ok(DispatchSettlementResult {
+                    settled: true,
+                    receipt_id: params.receipt_id.clone(),
+                    attempt_id: f_attempt,
+                    outcome: "not-sent".to_string(),
+                    slot_released: true,
+                });
+            } else {
+                return Err(PairingError::DispatchFenceConflict);
+            }
+        }
+
+        if f_state != "dispatching/uncertain" {
+            return Err(PairingError::DispatchFenceConflict);
         }
 
         let now = now_epoch_secs();

@@ -104,6 +104,7 @@ function createTestHarness({
         if (mockTabMessages && mockTabMessages[tabId]) {
           const resp = mockTabMessages[tabId](message, options);
           if (cb) cb(resp);
+          mockChrome.runtime.lastError = null;
           return Promise.resolve(resp);
         }
         const resp = {
@@ -2469,6 +2470,645 @@ async function runTests() {
     assert.equal(nativeHarness.nativeMessagesSent.length, 1, "Pruned stale target must not be retried against native");
 
     console.log("  [PASS] Removed targets prune stale bindings on cached and native rejection paths");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 41: Findings 1 & 3: Recovery reconciles durable not-sent revision & Gizmo URL
+  // ---------------------------------------------------------------------------
+  {
+    const convId = "conv_gizmo_41";
+    const gizmoUrl = `https://chatgpt.com/g/g-4141-custom-gpt/c/${convId}`;
+    const rcptId = "rcpt_gizmo_41";
+    const execId = "exec_gizmo_41";
+
+    let nativeDispatchRevision = null;
+    let nativeDispatchUrl = null;
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_g41",
+        pairingSecret: "sec_g41",
+        // Local storage has LOST receipt records!
+      },
+      mockTabs: {
+        401: { id: 401, url: gizmoUrl }
+      },
+      mockTabMessages: {
+        401: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_g41",
+              readiness: {
+                ready: true,
+                transcriptText: "Transcript in Gizmo chat",
+                accountText: "Personal"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return { ok: true, clicked: true, documentId: "doc_g41" };
+          }
+          if (msg.action === "verify_submitted_message") {
+            return { ok: true, observed: true, observedMessageId: "msg_g41_done" };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [
+            {
+              launch_request_id: "launch_g41",
+              execution_id: execId,
+              origin_conversation_id: convId,
+              origin_conversation_url: gizmoUrl,
+              state: "completed",
+              completion_receipt: {
+                receipt_id: rcptId,
+                execution_id: execId,
+                pairing_id: "pair_g41",
+                return_token: "ret_g41",
+                origin_conversation_id: convId,
+                origin_conversation_url: gizmoUrl,
+                delivery_status: "not-sent",
+                delivery_revision: 1,
+                turn_index: 0,
+                stop_reason: "stop",
+                assistant_text: "assistant output",
+                content_digest: "digest_g41",
+                tool_call_count: 1,
+                state: "completed"
+              }
+            }
+          ],
+          receipts: []
+        });
+        return;
+      }
+      if (msg.op === "dispatch_fence") {
+        nativeDispatchRevision = msg.expectedDeliveryRevision;
+        nativeDispatchUrl = msg.originConversationUrl;
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: msg.expectedDeliveryRevision,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        cb({ status: "ok", settlement: { settled: true, slot_released: true } });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // 1. Trigger scheduled drain recovery
+    await harness.sendMessage({ action: "drain" }, trustedSender);
+
+    // 2. Verify receipt was reconstructed with durable native truth (not-sent, rev 1, Gizmo URL)
+    const storedRcpt = harness.storageStore["receipt_" + rcptId];
+    assert.ok(storedRcpt, "Receipt must be reconstructed from durable summary");
+    assert.equal(storedRcpt.deliveryStatus, "not-sent", "Durable deliveryStatus must be reconciled from native");
+    assert.equal(storedRcpt.deliveryRevision, 1, "Durable deliveryRevision must be reconciled from native");
+    assert.equal(storedRcpt.originConversationUrl, gizmoUrl, "Gizmo URL must be preserved, not converted to /c/<id>");
+
+    // 3. Dispatch receipt: retry must request incremented revision (1 + 1 = 2) with durable Gizmo URL
+    const dispatchRes = await harness.sendMessage({ action: "dispatchReceipt", receiptId: rcptId }, trustedSender);
+    assert.equal(dispatchRes.status, "ok");
+    assert.equal(nativeDispatchRevision, 2, "Retry after not-sent must request incremented revision 2");
+    assert.equal(nativeDispatchUrl, gizmoUrl, "Dispatch must preserve durable Gizmo URL");
+
+    console.log("  [PASS] Findings 1 & 3: Recovery reconciles durable not-sent revision & Gizmo URL");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 42: Finding 4: Response channel failure (lastError) settles uncertain and retains slot
+  // ---------------------------------------------------------------------------
+  {
+    const rcptId = "rcpt_chan_err";
+    const testReceipt = {
+      receiptId: rcptId,
+      executionId: "exec_chan_err",
+      pairingId: "pair_chan",
+      returnToken: "ret_chan",
+      originConversationId: "c_chan_123",
+      originConversationUrl: "https://chatgpt.com/c/c_chan_123",
+      deliveryStatus: "received"
+    };
+
+    let settledOutcome = null;
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_chan",
+        pairingSecret: "sec_chan",
+        ["receipt_" + rcptId]: testReceipt
+      },
+      mockTabs: {
+        501: { id: 501, url: "https://chatgpt.com/c/c_chan_123" }
+      },
+      mockTabMessages: {
+        501: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_chan_1",
+              readiness: {
+                ready: true,
+                transcriptText: "Transcript",
+                accountText: "Personal"
+              }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            // Simulate channel failure / runtime.lastError: callback called with undefined and lastError set
+            harness.mockChrome.runtime.lastError = {
+              message: "Could not establish connection. Receiving end does not exist."
+            };
+            return undefined;
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        settledOutcome = msg.outcome;
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: false
+          }
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: rcptId }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "uncertain", "Channel error after dispatch must yield uncertain status");
+    assert.equal(settledOutcome, "uncertain", "Channel error must settle uncertain, NEVER not-sent");
+    assert.equal(harness.storageStore["receipt_" + rcptId].deliveryStatus, "dispatching/uncertain");
+
+    console.log("  [PASS] Finding 4: Response channel failure (lastError) settles uncertain and retains slot");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helper for Content Script Tests (Findings 6, 7, 8)
+  // ---------------------------------------------------------------------------
+  function setupContentScriptDispatchHarness({
+    pathname = "/c/c_test_cs",
+    buttonDisabledInitially = false,
+    buttonAriaDisabledInitially = false,
+    buttonEnablesAfterTicks = 0,
+    buttonDetachesAfterTicks = 0,
+    routeChangesAfterTicks = 0,
+    stopButtonAppearsAfterTicks = 0,
+    tamperComposerAfterTicks = 0,
+    detachButtonOnPreClick = false,
+    userDraft = "",
+    turns = ["Turn 1: prior chat"],
+    account = "Personal User"
+  } = {}) {
+    let capturedListener = null;
+    let clickCount = 0;
+    let buttonTicks = 0;
+    let currentPathname = pathname;
+    let stopButtonPresent = false;
+    let buttonAttached = true;
+    let buttonDisabled = buttonDisabledInitially;
+    let buttonAriaDisabled = buttonAriaDisabledInitially;
+
+    const mockChrome = {
+      runtime: {
+        onMessage: {
+          addListener(fn) {
+            capturedListener = fn;
+          }
+        }
+      }
+    };
+
+    let preClickChecked = false;
+    const composerObj = {
+      tagName: "TEXTAREA",
+      get value() {
+        if (preClickChecked && detachButtonOnPreClick) {
+          buttonAttached = false;
+        }
+        return userDraft;
+      },
+      set value(v) {
+        userDraft = v;
+        preClickChecked = true;
+      },
+      dispatchEvent(ev) {}
+    };
+
+    const sendBtnObj = {
+      tagName: "BUTTON",
+      get disabled() {
+        return buttonDisabled;
+      },
+      getAttribute(name) {
+        if (name === "aria-disabled") return buttonAriaDisabled ? "true" : null;
+        if (name === "data-testid") return "send-button";
+        return null;
+      },
+      click() {
+        clickCount++;
+      }
+    };
+
+    const mockDocument = {
+      readyState: "complete",
+      contains(node) {
+        return node === sendBtnObj ? buttonAttached : true;
+      },
+      body: {
+        contains(node) {
+          return node === sendBtnObj ? buttonAttached : true;
+        }
+      },
+      querySelector(selector) {
+        if (selector.includes("stop-button") && stopButtonPresent) {
+          return { tagName: "BUTTON" };
+        }
+        if (selector.includes("login-button") || selector.includes(".auth-error")) {
+          return null;
+        }
+        if (selector.includes("prompt-textarea") || selector.includes('textarea[data-id="root"]')) {
+          return composerObj;
+        }
+        if (selector.includes("send-button") || selector.includes("composer-submit-button")) {
+          buttonTicks++;
+          if (buttonEnablesAfterTicks && buttonTicks >= buttonEnablesAfterTicks) {
+            buttonDisabled = false;
+            buttonAriaDisabled = false;
+          }
+          if (buttonDetachesAfterTicks && buttonTicks >= buttonDetachesAfterTicks) {
+            buttonAttached = false;
+          }
+          if (routeChangesAfterTicks && buttonTicks >= routeChangesAfterTicks) {
+            currentPathname = "/c/c_other_route";
+            mockWindow.location.pathname = currentPathname;
+            mockWindow.location.href = "https://chatgpt.com" + currentPathname;
+          }
+          if (stopButtonAppearsAfterTicks && buttonTicks >= stopButtonAppearsAfterTicks) {
+            stopButtonPresent = true;
+          }
+          if (tamperComposerAfterTicks && buttonTicks >= tamperComposerAfterTicks) {
+            composerObj.value = "Tampered text by human";
+          }
+          return buttonAttached ? sendBtnObj : null;
+        }
+        return null;
+      },
+      querySelectorAll(selector) {
+        if (selector.includes("conversation-turn") || selector === "article") {
+          return turns.map(t => ({ innerText: t }));
+        }
+        if (selector.includes("profile menu") || selector.includes("user-menu")) {
+          return [{
+            tagName: "BUTTON",
+            innerText: account,
+            getAttribute: (n) => n === "aria-label" ? account + ", open profile menu" : null
+          }];
+        }
+        return [];
+      }
+    };
+
+    const mockWindow = {
+      location: {
+        href: "https://chatgpt.com" + currentPathname,
+        pathname: currentPathname
+      }
+    };
+
+    const ctx = vm.createContext({
+      chrome: mockChrome,
+      document: mockDocument,
+      window: mockWindow,
+      setTimeout,
+      clearTimeout,
+      Promise,
+      Set,
+      Event: globalThis.Event || class Event {},
+      InputEvent: globalThis.InputEvent || class InputEvent {},
+      console: { log() {}, error() {}, warn() {} }
+    });
+    vm.runInContext(contentScriptCode, ctx);
+
+    return {
+      listener: capturedListener,
+      getClickCount: () => clickCount,
+      composer: composerObj,
+      sendBtn: sendBtnObj,
+      window: mockWindow
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 43: Finding 7: consumedGrantAttemptIds rejects replay of same attemptId
+  //          but permits distinct later attemptId in same live document
+  // ---------------------------------------------------------------------------
+  {
+    const cs = setupContentScriptDispatchHarness({ pathname: "/c/c_test_cs" });
+
+    // Step 1: Readiness check to obtain documentId
+    let readinessResp = null;
+    cs.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readinessResp = r; });
+    assert.equal(readinessResp.ok, true);
+    const docId = readinessResp.documentId;
+
+    // Step 2: First attempt ("att_alpha") consumes grant and clicks
+    let res1 = null;
+    await new Promise((resolve) => {
+      cs.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_alpha",
+        expectedDocumentId: docId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        continuationText: "Continuation payload alpha",
+        receiptMarker: "marker_alpha"
+      }, {}, (r) => { res1 = r; resolve(); });
+    });
+    assert.equal(res1.ok, true);
+    assert.equal(res1.clicked, true);
+    assert.equal(cs.getClickCount(), 1);
+
+    // Step 3: Replay of same attempt ("att_alpha") MUST be rejected with grant_already_consumed
+    let resReplay = null;
+    await new Promise((resolve) => {
+      cs.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_alpha",
+        expectedDocumentId: docId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        continuationText: "Continuation payload alpha",
+        receiptMarker: "marker_alpha"
+      }, {}, (r) => { resReplay = r; resolve(); });
+    });
+    assert.equal(resReplay.ok, false);
+    assert.equal(resReplay.clicked, false);
+    assert.equal(resReplay.reason, "grant_already_consumed", "Replay of same attemptId must fail closed");
+    assert.equal(cs.getClickCount(), 1, "Replay must not trigger click");
+
+    // Step 4: Later distinct attempt ("att_beta") after slot release MUST be permitted in same document!
+    cs.composer.value = ""; // Composer cleared after prior submission
+    let resBeta = null;
+    await new Promise((resolve) => {
+      cs.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_beta",
+        expectedDocumentId: docId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        continuationText: "Continuation payload beta",
+        receiptMarker: "marker_beta"
+      }, {}, (r) => { resBeta = r; resolve(); });
+    });
+    assert.equal(resBeta.ok, true, "Distinct new attemptId must be allowed");
+    assert.equal(resBeta.clicked, true);
+    assert.equal(cs.getClickCount(), 2, "Second distinct attempt must be clicked");
+
+    console.log("  [PASS] Finding 7: consumedGrantAttemptIds rejects replay but permits distinct attemptId");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 44: Finding 8: Content script waits for enabled send button, rejects disabled button
+  // ---------------------------------------------------------------------------
+  {
+    // Case A: Button stays disabled -> fails closed with send_button_disabled
+    const csDisabled = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true
+    });
+    let readRespA = null;
+    csDisabled.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespA = r; });
+    let resA = null;
+    await new Promise((resolve) => {
+      csDisabled.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_dis_1",
+        expectedDocumentId: readRespA.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation text",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resA = r; resolve(); });
+    });
+    assert.equal(resA.ok, false);
+    assert.equal(resA.clicked, false);
+    assert.equal(resA.reason, "send_button_disabled");
+    assert.equal(csDisabled.getClickCount(), 0, "Disabled button must never be clicked");
+
+    // Case B: Button has aria-disabled="true" -> fails closed
+    const csAriaDisabled = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonAriaDisabledInitially: true
+    });
+    let readRespB = null;
+    csAriaDisabled.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespB = r; });
+    let resB = null;
+    await new Promise((resolve) => {
+      csAriaDisabled.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_aria_1",
+        expectedDocumentId: readRespB.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation text",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resB = r; resolve(); });
+    });
+    assert.equal(resB.ok, false);
+    assert.equal(resB.clicked, false);
+    assert.equal(resB.reason, "send_button_disabled");
+    assert.equal(csAriaDisabled.getClickCount(), 0, "aria-disabled button must never be clicked");
+
+    // Case C: Button starts disabled, becomes enabled on 2nd poll -> succeeds and clicks
+    const csEnables = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 3
+    });
+    let readRespC = null;
+    csEnables.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespC = r; });
+    let resC = null;
+    await new Promise((resolve) => {
+      csEnables.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_enables_1",
+        expectedDocumentId: readRespC.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation text",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resC = r; resolve(); });
+    });
+    assert.equal(resC.ok, true);
+    assert.equal(resC.clicked, true);
+    assert.equal(csEnables.getClickCount(), 1, "Button enabled after wait must be clicked");
+
+    console.log("  [PASS] Finding 8: Content script waits for enabled send button, rejects disabled button");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 45: Finding 6: Content script pre-click revalidations
+  // ---------------------------------------------------------------------------
+  {
+    // Sub-case 1: SPA route change during button wait -> aborts before click
+    const csRoute = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      routeChangesAfterTicks: 2
+    });
+    let readResp1 = null;
+    csRoute.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp1 = r; });
+    let res1 = null;
+    await new Promise((resolve) => {
+      csRoute.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_route_race",
+        expectedDocumentId: readResp1.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res1 = r; resolve(); });
+    });
+    assert.equal(res1.ok, false);
+    assert.equal(res1.clicked, false);
+    assert.ok(res1.reason === "navigation_invalidated" || res1.reason === "conversation_mismatch");
+    assert.equal(csRoute.getClickCount(), 0, "Route change during wait must prevent click");
+
+    // Sub-case 2: Active generation appears during wait -> aborts before click
+    const csActiveGen = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      stopButtonAppearsAfterTicks: 2
+    });
+    let readResp2 = null;
+    csActiveGen.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp2 = r; });
+    let res2 = null;
+    await new Promise((resolve) => {
+      csActiveGen.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_gen_race",
+        expectedDocumentId: readResp2.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res2 = r; resolve(); });
+    });
+    assert.equal(res2.ok, false);
+    assert.equal(res2.clicked, false);
+    assert.equal(res2.reason, "active_generation");
+    assert.equal(csActiveGen.getClickCount(), 0, "Active generation during wait must prevent click");
+
+    // Sub-case 3: User tampers with composer content during wait -> aborts before click
+    const csTamper = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      tamperComposerAfterTicks: 2
+    });
+    let readResp3 = null;
+    csTamper.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp3 = r; });
+    let res3 = null;
+    await new Promise((resolve) => {
+      csTamper.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_tamper_race",
+        expectedDocumentId: readResp3.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res3 = r; resolve(); });
+    });
+    assert.equal(res3.ok, false);
+    assert.equal(res3.clicked, false);
+    assert.equal(res3.reason, "composer_content_tampered");
+    assert.equal(csTamper.getClickCount(), 0, "Tampered composer text must prevent click");
+
+    // Sub-case 4: Button detached from DOM before click -> aborts before click
+    const csDetach = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      detachButtonOnPreClick: true
+    });
+    let readResp4 = null;
+    csDetach.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readResp4 = r; });
+    let res4 = null;
+    await new Promise((resolve) => {
+      csDetach.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_detach_race",
+        expectedDocumentId: readResp4.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res4 = r; resolve(); });
+    });
+    assert.equal(res4.ok, false);
+    assert.equal(res4.clicked, false);
+    assert.equal(res4.reason, "send_button_invalid");
+    assert.equal(csDetach.getClickCount(), 0, "Detached button must prevent click");
+
+    console.log("  [PASS] Finding 6: Content script pre-click revalidations reject route change, active gen, tampered composer, detached button");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

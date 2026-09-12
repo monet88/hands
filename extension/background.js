@@ -102,13 +102,14 @@ async function performScheduledDrain() {
   }
 }
 
-function buildReceiptRecord(rcpt) {
+function buildReceiptRecord(rcpt, fallbackOriginConversationUrl) {
   return {
     receiptId: rcpt.receipt_id,
     executionId: rcpt.execution_id,
     pairingId: rcpt.pairing_id,
     returnToken: rcpt.return_token,
     originConversationId: rcpt.origin_conversation_id,
+    originConversationUrl: rcpt.origin_conversation_url || fallbackOriginConversationUrl || undefined,
     turnIndex: rcpt.turn_index,
     stopReason: rcpt.stop_reason,
     assistantMessageId: rcpt.assistant_message_id,
@@ -117,7 +118,9 @@ function buildReceiptRecord(rcpt) {
     toolCallCount: rcpt.tool_call_count,
     state: rcpt.state || "completed",
     receivedAt: Date.now(),
-    deliveryStatus: "received" // Keep received strictly separate from ChatGPT submission
+    deliveryStatus: rcpt.delivery_status || "received",
+    deliveryRevision: rcpt.delivery_revision || 0,
+    activeAttemptId: rcpt.active_attempt_id || undefined
   };
 }
 
@@ -144,8 +147,8 @@ async function processDrainResponse(drainResponse, stored, profileId) {
       const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
       if (!existing) {
         // Local storage was lost or missing: reconstruct from native durable authority
-        // Retain deliveryStatus: "received" (strictly separate from ChatGPT submission, no send permission)
-        const reconstructedRecord = buildReceiptRecord(rcpt);
+        // Retain durable deliveryStatus, deliveryRevision, and originConversationUrl from native (Findings 1, 3)
+        const reconstructedRecord = buildReceiptRecord(rcpt, summary.origin_conversation_url);
         try {
           await chrome.storage.local.set({
             [receiptStorageKey]: reconstructedRecord,
@@ -154,10 +157,27 @@ async function processDrainResponse(drainResponse, stored, profileId) {
         } catch (storageErr) {
           console.error("Failed to reconstruct receipt " + rcpt.receipt_id + " from summary:", storageErr);
         }
+      } else {
+        // Reconcile existing record with native durable fence if native has more recent revision, state, or URL
+        let updated = false;
+        if (rcpt.delivery_revision && (existing.deliveryRevision || 0) < rcpt.delivery_revision) {
+          existing.deliveryRevision = rcpt.delivery_revision;
+          updated = true;
+        }
+        if (rcpt.delivery_status && rcpt.delivery_status !== existing.deliveryStatus) {
+          existing.deliveryStatus = rcpt.delivery_status;
+          updated = true;
+        }
+        if ((rcpt.origin_conversation_url || summary.origin_conversation_url) && !existing.originConversationUrl) {
+          existing.originConversationUrl = rcpt.origin_conversation_url || summary.origin_conversation_url;
+          updated = true;
+        }
+        if (updated) {
+          await chrome.storage.local.set({ [receiptStorageKey]: existing });
+        }
       }
     }
   }
-
   // 2. Process real Completion Receipts: Persist browser receipt handling BEFORE sending transport ACK
   const receipts = Array.isArray(drainResponse.receipts) ? drainResponse.receipts : [];
   const ackedReceiptIds = [];
@@ -297,6 +317,7 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
   }
 
   const { receiptId, executionId, originConversationId } = receiptRecord;
+  const receiptStorageKey = "receipt_" + receiptId;
   let originConversationUrl = receiptRecord.originConversationUrl;
   if (!originConversationUrl && executionId) {
     const allData = await chrome.storage.local.get(null);
@@ -387,6 +408,21 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
   });
 
   if (!fenceResponse || fenceResponse.status !== "ok" || !fenceResponse.grant || !fenceResponse.grant.granted) {
+    const grant = fenceResponse?.grant;
+    if (grant) {
+      let updated = false;
+      if (grant.delivery_revision && (receiptRecord.deliveryRevision || 0) < grant.delivery_revision) {
+        receiptRecord.deliveryRevision = grant.delivery_revision;
+        updated = true;
+      }
+      if (grant.state && receiptRecord.deliveryStatus !== grant.state) {
+        receiptRecord.deliveryStatus = grant.state;
+        updated = true;
+      }
+      if (updated) {
+        await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+      }
+    }
     // Loser or slot busy: receives status, NEVER permission!
     return {
       status: "denied",
@@ -400,11 +436,11 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
   receiptRecord.deliveryRevision = expectedDeliveryRevision;
   receiptRecord.activeAttemptId = attemptId;
   receiptRecord.activeDocumentId = documentId;
-  const receiptStorageKey = "receipt_" + receiptId;
   await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
 
   // 4. Send attempt-bound grant to live document for one-time consumption & synchronous guard+click
-  let clickResp;
+  let clickResp = null;
+  let clickChannelError = null;
   try {
     clickResp = await new Promise((resolve) => {
       chrome.tabs.sendMessage(
@@ -419,16 +455,43 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
           receiptMarker
         },
         { frameId: 0 },
-        (resp) => resolve(resp)
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            clickChannelError = chrome.runtime.lastError.message || "runtime_channel_error";
+            resolve(null);
+          } else {
+            resolve(resp);
+          }
+        }
       );
     });
   } catch (err) {
-    // Communication failure: outcome is uncertain! Retain uncertainty, do NOT blind retry!
-    return { status: "uncertain", reason: "click_dispatch_communication_error", error: String(err) };
+    clickChannelError = String(err);
   }
 
-  if (!clickResp || !clickResp.ok || !clickResp.clicked) {
-    // Document rejected grant or guards failed synchronously before click:
+  if (clickChannelError || !clickResp) {
+    // Finding 4: Response-channel failure or ambiguity after possible click: outcome is uncertain!
+    // Never treat channel failure as not-sent, never release the slot!
+    const channelReason = clickChannelError || "no_response_from_content_script";
+    await sendNative({
+      op: "settle_fence",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId,
+      receiptId,
+      executionId,
+      attemptId,
+      expectedDeliveryRevision,
+      outcome: "uncertain",
+      details: channelReason
+    });
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    return { status: "uncertain", reason: "click_dispatch_communication_error", error: channelReason };
+  }
+
+  if (!clickResp.ok || !clickResp.clicked) {
+    // Document definitively rejected grant or guards failed synchronously before click:
     // Settle conclusively as not-sent so slot can be released
     await sendNative({
       op: "settle_fence",
@@ -440,11 +503,11 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
       attemptId,
       expectedDeliveryRevision,
       outcome: "not-sent",
-      details: clickResp?.reason || "synchronous_guard_failed"
+      details: clickResp.reason || "synchronous_guard_failed"
     });
     receiptRecord.deliveryStatus = "not-sent";
     await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
-    return { status: "not-sent", reason: clickResp?.reason };
+    return { status: "not-sent", reason: clickResp.reason };
   }
 
   // 5. Verify submitted user message in transcript
