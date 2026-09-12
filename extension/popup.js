@@ -1,80 +1,140 @@
 document.addEventListener("DOMContentLoaded", async () => {
-  const badge = document.getElementById("statusBadge");
-  const pairedContent = document.getElementById("pairedContent");
-  const unpairedContent = document.getElementById("unpairedContent");
-
-  const profileIdVal = document.getElementById("profileIdVal");
-  const pairingIdVal = document.getElementById("pairingIdVal");
-  const policyRevVal = document.getElementById("policyRevVal");
-  const targetsVal = document.getElementById("targetsVal");
-  const unpairedProfileId = document.getElementById("unpairedProfileId");
+  const statusBadge = document.getElementById("statusBadge");
+  const offlineContent = document.getElementById("offlineContent");
+  const connectedContent = document.getElementById("connectedContent");
+  const workspaceList = document.getElementById("workspaceList");
+  const convTargetSection = document.getElementById("convTargetSection");
+  const convTargetSelect = document.getElementById("convTargetSelect");
   const pendingReceiptsVal = document.getElementById("pendingReceiptsVal");
-
   const btnOptions = document.getElementById("btnOptions");
-  const btnPair = document.getElementById("btnPair");
+  const cmdAdd = document.getElementById("cmdAdd");
+  const cmdRemove = document.getElementById("cmdRemove");
+  const cmdCopyNotice = document.getElementById("cmdCopyNotice");
 
-  btnOptions?.addEventListener("click", () => {
-    chrome.runtime.openOptionsPage();
-  });
+  btnOptions?.addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-  async function updatePendingReceiptsDisplay() {
-    if (!pendingReceiptsVal) return;
+  function setupCommandCopy(el, text) {
+    if (!el) return;
+    const handleCopy = async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        if (cmdCopyNotice) {
+          cmdCopyNotice.textContent = "Copied to clipboard!";
+          setTimeout(() => { if (cmdCopyNotice) cmdCopyNotice.textContent = ""; }, 2000);
+        }
+      } catch (err) {
+        if (cmdCopyNotice) {
+          cmdCopyNotice.textContent = "Copy failed: " + (err?.message || "clipboard denied");
+          setTimeout(() => { if (cmdCopyNotice) cmdCopyNotice.textContent = ""; }, 3000);
+        }
+      }
+    };
+    el.addEventListener("click", handleCopy);
+  }
+  setupCommandCopy(cmdAdd, 'hands-return-bridge target add --target "<path>"');
+  setupCommandCopy(cmdRemove, 'hands-return-bridge target remove --target-id <id>');
+  function renderWorkspaces(targets) {
+    workspaceList.innerHTML = "";
+    if (!targets.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No workspaces. Add one in Manage Workspaces.";
+      workspaceList.appendChild(empty);
+      return;
+    }
+    for (const target of targets) {
+      const item = document.createElement("div");
+      item.className = "workspace";
+      const name = document.createElement("div");
+      name.className = "workspace-name";
+      name.textContent = target.name || target.target_id;
+      const path = document.createElement("div");
+      path.className = "workspace-path";
+      path.textContent = target.canonical_path || "";
+      item.append(name, path);
+      workspaceList.appendChild(item);
+    }
+  }
+
+  function conversationIdFromUrl(url) {
+    if (!url || !url.startsWith("https://chatgpt.com/")) return null;
+    if (url.includes("#") || url.includes("?")) return null;
     try {
-      const pendingResp = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
-      const count = pendingResp?.pendingReceipts?.length || 0;
-      pendingReceiptsVal.textContent = count > 0 ? `${count} pending (recoverable)` : "None";
+      const segments = new URL(url).pathname.split("/").filter(Boolean);
+      let id = null;
+      if (segments.length === 2 && segments[0] === "c") id = segments[1];
+      if (segments.length === 4 && segments[0] === "g" && segments[2] === "c") id = segments[3];
+      if (!id || id === "new" || id === "chat" || id.includes("new_chat") || id.includes("provisional")) {
+        return null;
+      }
+      return id;
+    } catch {}
+    return null;
+  }
+
+  async function setupConversationTargetSelector(targets) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const convId = conversationIdFromUrl(tabs?.[0]?.url);
+    if (!convId) {
+      convTargetSection.style.display = "none";
+      return;
+    }
+
+    convTargetSection.style.display = "block";
+    convTargetSelect.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = targets.length === 1 ? `Default (${targets[0].name})` : "Select workspace...";
+    convTargetSelect.appendChild(placeholder);
+    for (const target of targets) {
+      const option = document.createElement("option");
+      option.value = target.target_id;
+      option.textContent = target.name || target.target_id;
+      convTargetSelect.appendChild(option);
+    }
+    convTargetSelect.disabled = true;
+    const binding = await chrome.runtime.sendMessage({
+      action: "getConversationTarget",
+      conversationId: convId
+    });
+    if (binding?.targetId) convTargetSelect.value = binding.targetId;
+    convTargetSelect.disabled = false;
+    convTargetSelect.onchange = async () => {
+      await chrome.runtime.sendMessage({
+        action: "setConversationTarget",
+        conversationId: convId,
+        targetId: convTargetSelect.value || null
+      });
+    };
+  }
+
+  async function updatePendingReceipts() {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "getPendingReceipts" });
+      pendingReceiptsVal.textContent = String(response?.pendingReceipts?.length || 0);
     } catch {
       pendingReceiptsVal.textContent = "-";
     }
   }
 
-  btnPair?.addEventListener("click", () => {
-    chrome.runtime.openOptionsPage();
-  });
-
-  let state = null;
   try {
-    state = await chrome.runtime.sendMessage({ action: "getState" });
-    if (state && state.isPaired) {
-      // Check live connection with native host
-      const status = await chrome.runtime.sendMessage({ action: "status" });
-      if (status && status.status === "ok" && status.pairingStatus === "active") {
-        badge.className = "badge badge-paired";
-        badge.textContent = "Connected & Paired";
-        pairedContent.style.display = "block";
-        unpairedContent.style.display = "none";
-
-        profileIdVal.textContent = state.profileId || "-";
-        pairingIdVal.textContent = state.pairingId || "-";
-        policyRevVal.textContent = state.policyRevision || "-";
-        targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
-        await updatePendingReceiptsDisplay();
-        return;
-      }
-      if (!status || status.code !== "pairing_retired") {
-        badge.className = "badge badge-unpaired";
-        badge.textContent = "Host Unavailable";
-        pairedContent.style.display = "block";
-        unpairedContent.style.display = "none";
-        profileIdVal.textContent = state.profileId || "-";
-        pairingIdVal.textContent = state.pairingId || "-";
-        policyRevVal.textContent = state.policyRevision || "-";
-        targetsVal.textContent = `${state.targets?.length || 0} target(s)`;
-        await updatePendingReceiptsDisplay();
-        return;
-      }
+    const response = await chrome.runtime.sendMessage({ action: "ensureLocalMode" });
+    if (!response || response.status !== "ok") {
+      throw new Error(response?.message || response?.code || "Native host unavailable");
     }
 
-    // Unpaired state
-    badge.className = "badge badge-unpaired";
-    badge.textContent = "Unpaired";
-    pairedContent.style.display = "none";
-    unpairedContent.style.display = "block";
-    unpairedProfileId.textContent = state?.profileId || "-";
-  } catch (err) {
-    badge.className = "badge badge-unpaired";
-    badge.textContent = "Host Unavailable";
-    pairedContent.style.display = state?.isPaired ? "block" : "none";
-    unpairedContent.style.display = state?.isPaired ? "none" : "block";
+    const targets = Array.isArray(response.targets) ? response.targets : [];
+    statusBadge.className = "badge connected";
+    statusBadge.textContent = "Connected";
+    offlineContent.style.display = "none";
+    connectedContent.style.display = "block";
+    renderWorkspaces(targets);
+    await setupConversationTargetSelector(targets);
+    await updatePendingReceipts();
+  } catch {
+    statusBadge.className = "badge offline";
+    statusBadge.textContent = "Host unavailable";
+    connectedContent.style.display = "none";
+    offlineContent.style.display = "block";
   }
 });

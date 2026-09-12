@@ -1,10 +1,14 @@
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::tempdir;
 
+static LOCAL_INIT_FAULT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 use hands_return_bridge::host::{
-    HostError, SetupOptions, execute_setup, resolve_state_dir, run_native_host,
+    HostError, LocalInitOptions, SetupOptions, execute_local_init, execute_setup, resolve_state_dir,
+    run_native_host,
 };
-use hands_return_bridge::journal::{Journal, PairingStatus};
+use hands_return_bridge::journal::{Journal, PairingStatus, LOCAL_PAIRING_ID};
 use hands_return_bridge::protocol::TRUST_NOTICE;
 
 fn init_git_repo(path: &std::path::Path) {
@@ -66,6 +70,176 @@ fn test_setup_flow_with_isolated_state_dir() {
     let manifest_content = std::fs::read_to_string(&manifest_path).unwrap();
     assert!(manifest_content.contains("com.hands.return_bridge"));
     assert!(manifest_content.contains("test_ext_id_123"));
+}
+
+#[test]
+fn test_local_init_creates_active_local_host_without_bootstrap() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let extension_id = "abcdefghijklmnopabcdefghijklmnop";
+
+    let result = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: extension_id.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    })
+    .expect("local init failed");
+
+    assert_eq!(result.browser, "chrome");
+    assert_eq!(result.extension_id, extension_id);
+    assert_eq!(result.pairing_id, LOCAL_PAIRING_ID);
+
+    let journal = Journal::open(&state_dir.join("journal.sqlite")).unwrap();
+    assert_eq!(
+        journal.get_pairing_status(LOCAL_PAIRING_ID).unwrap(),
+        PairingStatus::Active
+    );
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some(extension_id)
+    );
+
+    let manifest = std::fs::read_to_string(&result.manifest_path).unwrap();
+    assert!(manifest.contains("com.hands.return_bridge"));
+    assert!(manifest.contains(extension_id));
+}
+
+#[test]
+fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
+    let _fault_env_guard = LOCAL_INIT_FAULT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let ext_initial = "initial_extension_id_abcdef";
+
+    // 1. First init succeeds
+    let res1 = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: ext_initial.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    })
+    .expect("first local init failed");
+
+    let manifest1 = std::fs::read_to_string(&res1.manifest_path).unwrap();
+    assert!(manifest1.contains(ext_initial));
+
+    // 2. Deterministic post-manifest failure seam: inject journal failure AFTER
+    // manifest overwrite so rollback is actually exercised (exclusive-lock
+    // harnesses fail pre-manifest and pass vacuously). Scoped to this test's
+    // canonical state_dir so parallel tests are unaffected.
+    let canonical_state = state_dir.canonicalize().unwrap();
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
+    let ext_second = "second_extension_id_xyz123";
+    let res2 = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: ext_second.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    assert!(res2.is_err(), "Local init must fail when journal cannot be updated");
+    let err_msg = res2.unwrap_err().to_string();
+    assert!(
+        !err_msg.contains("additionally failed to restore previous manifest"),
+        "Rollback restore must succeed on this path, got: {}",
+        err_msg
+    );
+
+    // 3. Manifest must be restored to previous manifest containing ext_initial, NOT ext_second
+    let manifest_after = std::fs::read_to_string(&res1.manifest_path).unwrap();
+    assert!(
+        manifest_after.contains(ext_initial),
+        "Manifest must be restored to previous valid manifest on failure"
+    );
+    assert!(
+        !manifest_after.contains(ext_second),
+        "Failed init must not leave partial manifest on disk"
+    );
+}
+#[cfg(windows)]
+#[test]
+fn test_local_init_rollback_restores_prior_registry_snapshot() {
+    let _fault_env_guard = LOCAL_INIT_FAULT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    use hands_return_bridge::host::manifest_registry_keys;
+
+    // Use an isolated test host name so we don't touch live dev.hands.return_bridge or com.hands.return_bridge
+    let test_host_name = "com.hands.return_bridge.test_reg_rollback";
+    std::env::set_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME", test_host_name);
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let canonical_state = state_dir.canonicalize().unwrap();
+
+    let chrome_keys = manifest_registry_keys("chrome");
+    let test_key = chrome_keys[0].clone();
+
+    // Ensure test key is clean initially
+    let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+
+    // Scenario A: Test key did not exist prior to init.
+    // When journal update fails, rollback must remove the newly-created registry key.
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
+    let res_a = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: "ext_test_reg_rollback_a".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    assert!(res_a.is_err(), "Local init must fail when fault is armed");
+
+    let query_a = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+    assert!(
+        !query_a.status.success(),
+        "Rollback must remove registry key when it did not exist prior to init"
+    );
+
+    // Scenario B: Test key existed prior to init with a different path.
+    // When journal update fails, rollback must restore the exact prior value.
+    let prior_dummy_path = r"C:\prior\nonexistent\host.json";
+    let setup_prior = Command::new("reg.exe")
+        .args(["add", &test_key, "/ve", "/t", "REG_SZ", "/d", prior_dummy_path, "/f"])
+        .output()
+        .unwrap();
+    assert!(setup_prior.status.success(), "Failed to seed prior registry key");
+
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
+    let res_b = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: "ext_test_reg_rollback_b".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    assert!(res_b.is_err(), "Local init must fail when fault is armed");
+
+    let query_b = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+    assert!(query_b.status.success(), "Prior registry key must still exist after rollback");
+    let stdout_b = String::from_utf8_lossy(&query_b.stdout);
+    assert!(
+        stdout_b.contains(prior_dummy_path),
+        "Rollback must restore prior default value {}, got: {}",
+        prior_dummy_path,
+        stdout_b
+    );
+
+    // Cleanup test registry key and env var
+    let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+    std::env::remove_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME");
 }
 
 #[test]
@@ -598,4 +772,150 @@ fn test_failed_setup_does_not_clear_sticky_extension_authority() {
     let _ = std::fs::remove_dir_all(&manifest_path);
     let res_retry = execute_setup(&opts_failing);
     assert!(res_retry.is_ok(), "Retry with same extension ID must succeed");
+}
+
+#[test]
+fn test_host_target_add_remove_list_flow() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target1_dir = tempdir().unwrap();
+    init_git_repo(target1_dir.path());
+    let target1_path = target1_dir.path().to_str().unwrap().to_string();
+
+    // Setup active pairing
+    let opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_host_t".to_string(),
+        target_path: target1_path,
+        target_id: Some("target_1".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_host_t".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+    let setup_res = execute_setup(&opts).unwrap();
+
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    // Target CLI on pending pairing fails with NotActive
+    let target2_dir = tempdir().unwrap();
+    init_git_repo(target2_dir.path());
+    let target2_path = target2_dir.path().to_str().unwrap().to_string();
+
+    use hands_return_bridge::host::{
+        TargetAddOptions, TargetListOptions, TargetRemoveOptions,
+        execute_target_add, execute_target_list, execute_target_remove,
+    };
+
+    let add_opts = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target2_path.clone(),
+        target_id: Some("target_2".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let add_pending_err = execute_target_add(&add_opts);
+    assert!(add_pending_err.is_err());
+
+    // Activate pairing
+    journal.activate_bootstrap(&setup_res.bootstrap_token, "profile_host_t").unwrap();
+
+    let blank_target_id = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target2_path.clone(),
+        target_id: Some("   \t".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let blank_target_err = execute_target_add(&blank_target_id)
+        .expect_err("Explicit whitespace target ID must be rejected");
+    assert!(blank_target_err.to_string().contains("--target-id"));
+
+    let blank_pairing_id = TargetListOptions {
+        pairing_id: Some("   \t".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let blank_pairing_err = execute_target_list(&blank_pairing_id)
+        .expect_err("Explicit whitespace pairing ID must be rejected");
+    assert!(blank_pairing_err.to_string().contains("--pairing-id"));
+
+    // Now add target_2 succeeds
+    let added = execute_target_add(&add_opts).expect("execute_target_add failed");
+    assert_eq!(added.target_id, "target_2");
+
+    // A target ID is a stable workspace identity. Reusing it for another repo must not
+    // silently redirect existing browser conversation bindings to the new path.
+    let target3_dir = tempdir().unwrap();
+    init_git_repo(target3_dir.path());
+    let retarget_opts = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target3_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("target_2".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let retarget_err = execute_target_add(&retarget_opts)
+        .expect_err("Existing target_id must not be rebound to a different workspace");
+    assert!(retarget_err.to_string().contains("target_id_conflict"));
+
+    // List targets
+    let list_opts = TargetListOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let list = execute_target_list(&list_opts).expect("execute_target_list failed");
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].target_id, "target_1");
+    assert_eq!(list[1].target_id, "target_2");
+    assert_eq!(list[1].canonical_path, added.canonical_path);
+
+    // Add target with invalid non-git path fails
+    let non_git_dir = tempdir().unwrap();
+    let add_invalid = TargetAddOptions {
+        pairing_id: None, // Auto-resolves the single active pairing
+        target_path: non_git_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("invalid_target".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let invalid_err = execute_target_add(&add_invalid);
+    assert!(invalid_err.is_err());
+
+    // Remove target_1
+    let rm_opts = TargetRemoveOptions {
+        pairing_id: None,
+        target_id: "target_1".to_string(),
+        state_dir: Some(state_dir.clone()),
+    };
+    execute_target_remove(&rm_opts).expect("execute_target_remove failed");
+
+    let list_after_rm = execute_target_list(&list_opts).expect("execute_target_list failed");
+    assert_eq!(list_after_rm.len(), 1);
+    assert_eq!(list_after_rm[0].target_id, "target_2");
+
+    // Once more than one pairing is active, local target administration must not guess.
+    let second_setup = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_host_t_2".to_string(),
+        target_path: target3_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("target_other_pairing".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_host_t".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+    let second_setup_res = execute_setup(&second_setup).expect("second setup failed");
+    journal
+        .activate_bootstrap(&second_setup_res.bootstrap_token, "profile_host_t_2")
+        .unwrap();
+
+    let ambiguous_list = TargetListOptions {
+        pairing_id: None,
+        state_dir: Some(state_dir.clone()),
+    };
+    let ambiguous_err = execute_target_list(&ambiguous_list)
+        .expect_err("Multiple active pairings must require an explicit --pairing-id");
+    assert!(ambiguous_err.to_string().contains("Multiple active pairings"));
 }

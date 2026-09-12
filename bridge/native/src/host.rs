@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::journal::{
     is_supported_approval_policy, is_supported_tool_policy, Journal, PolicyRecord, TargetRecord,
+    LOCAL_PAIRING_ID,
 };
 use crate::protocol::{
     ProtocolError, TRUST_NOTICE, handle_native_message, read_native_message, write_native_message,
@@ -256,6 +257,186 @@ pub struct SetupResult {
     pub trust_notice: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalInitOptions {
+    pub browser: String,
+    pub extension_id: String,
+    pub state_dir: Option<PathBuf>,
+    pub skip_registry: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalInitResult {
+    pub browser: String,
+    pub extension_id: String,
+    pub pairing_id: String,
+    pub manifest_path: PathBuf,
+}
+
+pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, HostError> {
+    if !opts.skip_registry {
+        #[cfg(not(windows))]
+        {
+            return Err(HostError::Registry(
+                "Native messaging host automatic registration is only supported on Windows. Use --skip-registry for manual host manifest setup on non-Windows platforms.".to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        if opts.state_dir.is_some() {
+            return Err(HostError::Storage(
+                "--state-dir is only supported with --skip-registry".to_string(),
+            ));
+        }
+    }
+
+    let browser = opts.browser.trim().to_lowercase();
+    if browser != "chrome" && browser != "edge" {
+        return Err(HostError::Storage(format!(
+            "Invalid browser '{}': only 'chrome' and 'edge' are supported",
+            opts.browser
+        )));
+    }
+    let extension_id = opts.extension_id.trim();
+    if extension_id.is_empty() {
+        return Err(HostError::Storage("Missing required --extension-id".to_string()));
+    }
+
+    let state_dir = if opts.skip_registry {
+        resolve_state_dir(opts.state_dir.as_deref())?
+    } else {
+        resolve_default_state_dir()?
+    };
+    std::fs::create_dir_all(&state_dir)?;
+    let state_dir = state_dir.canonicalize()?;
+    let journal = Journal::open(&state_dir.join("journal.sqlite"))
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    journal
+        .ensure_local_pairing()
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
+    let previous_manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(HostError::Io(e)),
+    };
+
+    let current_exe = std::env::current_exe()?;
+    let manifest_json = json!({
+        "name": DEFAULT_HOST_NAME,
+        "description": "Hands Return Bridge Native Companion Host",
+        "path": current_exe.to_string_lossy(),
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{}/", extension_id)]
+    });
+    write_manifest_atomic(&manifest_path, &serde_json::to_vec_pretty(&manifest_json)?)?;
+
+    #[cfg(windows)]
+    let prior_reg_snapshot = if !opts.skip_registry {
+        Some(snapshot_manifest_registry(&browser)?)
+    } else {
+        None
+    };
+
+    if !opts.skip_registry {
+        #[cfg(windows)]
+        {
+            if let Err(e) = register_manifest_registry(&browser, &manifest_path) {
+                let restore_result = match previous_manifest.as_deref() {
+                    Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+                    None => match std::fs::remove_file(&manifest_path) {
+                        Ok(()) => Ok(()),
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(remove_err) => Err(HostError::Io(remove_err)),
+                    },
+                };
+                let reg_restore = if let Some(snapshot) = &prior_reg_snapshot {
+                    restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+                } else {
+                    Ok(())
+                };
+                match (restore_result, reg_restore) {
+                    (Err(restore_err), Ok(())) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}",
+                            e, restore_err
+                        )));
+                    }
+                    (Ok(()), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to rollback registry registration: {}",
+                            e, reg_err
+                        )));
+                    }
+                    (Err(restore_err), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                            e, restore_err, reg_err
+                        )));
+                    }
+                    (Ok(()), Ok(())) => return Err(e),
+                }
+            }
+        }
+    }
+
+    // Deterministic test seam: fail after manifest/registry write to exercise rollback.
+    // Scoped to the calling state_dir so parallel tests with other temp dirs are unaffected.
+    let fault_armed = std::env::var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL")
+        .map(|v| v == "1" || v == state_dir.to_string_lossy())
+        .unwrap_or(false);
+    let journal_update_result = if fault_armed {
+        Err(HostError::Storage("injected journal update failure".to_string()))
+    } else {
+        journal.set_local_extension_id(extension_id).map_err(|e| HostError::Storage(e.to_string()))
+    };
+    if let Err(e) = journal_update_result {
+        let restore_result = match previous_manifest.as_deref() {
+            Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+            None => match std::fs::remove_file(&manifest_path) {
+                Ok(()) => Ok(()),
+                Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove_err) => Err(HostError::Io(remove_err)),
+            },
+        };
+        #[cfg(windows)]
+        let registry_rollback: Result<(), String> = if let Some(snapshot) = &prior_reg_snapshot {
+            restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+        } else {
+            Ok(())
+        };
+        #[cfg(not(windows))]
+        let registry_rollback: Result<(), String> = Ok(());
+        match (restore_result, registry_rollback) {
+            (Ok(()), Ok(())) => return Err(e),
+            (Err(restore_err), Ok(())) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}",
+                    e, restore_err
+                )))
+            }
+            (Ok(()), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to rollback registry registration: {}",
+                    e, reg_err
+                )))
+            }
+            (Err(restore_err), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                    e, restore_err, reg_err
+                )))
+            }
+        }
+    }
+    Ok(LocalInitResult {
+        browser,
+        extension_id: extension_id.to_string(),
+        pairing_id: LOCAL_PAIRING_ID.to_string(),
+        manifest_path,
+    })
+}
+
 pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     // Fail-closed explicitly on unsupported platforms before any durable setup side effects
     if !opts.skip_registry {
@@ -440,31 +621,105 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 }
 
 #[cfg(windows)]
-pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
-    let reg_keys = match browser.to_lowercase().as_str() {
+pub fn manifest_registry_keys(browser: &str) -> Vec<String> {
+    let host_name = std::env::var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST_NAME.to_string());
+
+    match browser.to_lowercase().as_str() {
         "edge" => vec![format!(
             r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "chrome" => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "all" | "both" => vec![
             format!(
                 r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
             format!(
                 r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
         ],
         _ => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
-    };
+    }
+}
+
+#[cfg(windows)]
+pub fn snapshot_manifest_registry(browser: &str) -> Result<Vec<(String, Option<String>)>, HostError> {
+    let keys = manifest_registry_keys(browser);
+    let mut snapshot = Vec::new();
+    for key in keys {
+        let output = Command::new("reg.exe").args(["query", &key, "/ve"]).output()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut val_opt = Some(String::new());
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains("REG_SZ") {
+                    if let Some(pos) = trimmed.find("REG_SZ") {
+                        let raw_val = trimmed[pos + "REG_SZ".len()..].trim();
+                        val_opt = Some(raw_val.to_string());
+                        break;
+                    }
+                }
+            }
+            snapshot.push((key, val_opt));
+        } else {
+            // Key does not exist prior to registration
+            snapshot.push((key, None));
+        }
+    }
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+pub fn restore_manifest_registry_snapshot(snapshot: &[(String, Option<String>)]) -> Result<(), HostError> {
+    for (key, val_opt) in snapshot {
+        match val_opt {
+            Some(prev_val) => {
+                // Key existed before: restore its prior default value
+                let output = Command::new("reg.exe")
+                    .args(["add", key, "/ve", "/t", "REG_SZ", "/d", prev_val, "/f"])
+                    .output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr);
+                    return Err(HostError::Registry(format!(
+                        "reg.exe add restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+            None => {
+                // Key did not exist before: delete the newly created key
+                let output = Command::new("reg.exe").args(["delete", key, "/f"]).output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if err_msg.contains("unable to find") || err_msg.contains("was not found") {
+                        continue;
+                    }
+                    return Err(HostError::Registry(format!(
+                        "reg.exe delete restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
+    let reg_keys = manifest_registry_keys(browser);
 
     for key in reg_keys {
         let manifest_str = manifest_path.to_string_lossy();
@@ -483,6 +738,7 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 
     Ok(())
 }
+
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
     let state_dir = resolve_state_dir(state_dir_opt)?;
@@ -557,4 +813,133 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetAddOptions {
+    pub pairing_id: Option<String>,
+    pub target_path: String,
+    pub target_id: Option<String>,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetRemoveOptions {
+    pub pairing_id: Option<String>,
+    pub target_id: String,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetListOptions {
+    pub pairing_id: Option<String>,
+    pub state_dir: Option<PathBuf>,
+}
+
+fn resolve_pairing_id_for_target_cmd(
+    journal: &Journal,
+    explicit_pairing_id: Option<&str>,
+) -> Result<String, HostError> {
+    if let Some(pid) = explicit_pairing_id {
+        let trimmed = pid.trim();
+        if trimmed.is_empty() {
+            return Err(HostError::Storage(
+                "--pairing-id must not be empty or whitespace".to_string(),
+            ));
+        }
+        return Ok(trimmed.to_string());
+    }
+    let active_ids = journal
+        .get_active_pairing_ids()
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    match active_ids.len() {
+        0 => Err(HostError::Storage(
+            "No active pairing found. Please run setup first or provide --pairing-id.".to_string(),
+        )),
+        1 => Ok(active_ids[0].clone()),
+        _ => Err(HostError::Storage(format!(
+            "Multiple active pairings found ({:?}). Please specify --pairing-id <id> explicitly.",
+            active_ids
+        ))),
+    }
+}
+
+pub fn execute_target_add(opts: &TargetAddOptions) -> Result<TargetRecord, HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    std::fs::create_dir_all(&state_dir)?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let raw_path = Path::new(&opts.target_path);
+    let canonical_path = verify_and_canonicalize_git_target(raw_path)?;
+    let canonical_path_str = canonical_path.to_string_lossy().to_string();
+
+    let derived_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let target_id = match opts.target_id.as_deref() {
+        Some(id) if id.trim().is_empty() => {
+            return Err(HostError::Storage(
+                "--target-id must not be empty or whitespace".to_string(),
+            ));
+        }
+        Some(id) => id.trim().to_string(),
+        None => derived_name.clone(),
+    };
+
+    let target = TargetRecord {
+        target_id,
+        canonical_path: canonical_path_str,
+        name: derived_name,
+    };
+
+    journal
+        .add_target_admin(&pairing_id, &target)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    Ok(target)
+}
+
+pub fn execute_target_remove(opts: &TargetRemoveOptions) -> Result<(), HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let target_id = opts.target_id.trim();
+    if target_id.is_empty() {
+        return Err(HostError::Storage(
+            "--target-id must not be empty or whitespace".to_string(),
+        ));
+    }
+
+    journal
+        .remove_target_admin(&pairing_id, target_id)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    Ok(())
+}
+
+pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>, HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let status = journal.get_pairing_status(&pairing_id).map_err(|e| HostError::Storage(e.to_string()))?;
+    if status != crate::journal::PairingStatus::Active {
+        return Err(HostError::Storage(format!("Pairing '{}' is not active ({:?})", pairing_id, status)));
+    }
+
+    let targets = journal
+        .get_targets(&pairing_id)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    Ok(targets)
 }

@@ -1,5 +1,9 @@
 const NATIVE_HOST = "com.hands.return_bridge";
 const TRUST_NOTICE = "Notice: A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.";
+const LOCAL_PAIRING_ID = "local";
+const LOCAL_PAIRING_SECRET = "local";
+const LOCAL_PROFILE_ID = "local";
+const LOCAL_POLICY_REVISION = "v1";
 
 let storageAccessLevelEstablished = false;
 const inFlightLaunches = new Map();
@@ -85,19 +89,27 @@ async function performScheduledDrain() {
 
     if (drainResponse && drainResponse.status === "ok") {
       await processDrainResponse(drainResponse, stored, profileId);
+      // Attempt delivery of pending receipts
+      const allData = await chrome.storage.local.get(null);
+      for (const [k, v] of Object.entries(allData)) {
+        if (k.startsWith("receipt_") && v && (v.deliveryStatus === "received" || v.deliveryStatus === "not-sent")) {
+          await dispatchSingleReceipt(v, stored, profileId);
+        }
+      }
     }
   } catch (err) {
     console.warn("Scheduled drain encounter:", err);
   }
 }
 
-function buildReceiptRecord(rcpt) {
+function buildReceiptRecord(rcpt, fallbackOriginConversationUrl) {
   return {
     receiptId: rcpt.receipt_id,
     executionId: rcpt.execution_id,
     pairingId: rcpt.pairing_id,
     returnToken: rcpt.return_token,
     originConversationId: rcpt.origin_conversation_id,
+    originConversationUrl: rcpt.origin_conversation_url || fallbackOriginConversationUrl || undefined,
     turnIndex: rcpt.turn_index,
     stopReason: rcpt.stop_reason,
     assistantMessageId: rcpt.assistant_message_id,
@@ -106,7 +118,9 @@ function buildReceiptRecord(rcpt) {
     toolCallCount: rcpt.tool_call_count,
     state: rcpt.state || "completed",
     receivedAt: Date.now(),
-    deliveryStatus: "received" // Keep received strictly separate from ChatGPT submission
+    deliveryStatus: rcpt.delivery_status || "received",
+    deliveryRevision: rcpt.delivery_revision || 0,
+    activeAttemptId: rcpt.active_attempt_id || undefined
   };
 }
 
@@ -133,8 +147,8 @@ async function processDrainResponse(drainResponse, stored, profileId) {
       const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
       if (!existing) {
         // Local storage was lost or missing: reconstruct from native durable authority
-        // Retain deliveryStatus: "received" (strictly separate from ChatGPT submission, no send permission)
-        const reconstructedRecord = buildReceiptRecord(rcpt);
+        // Retain durable deliveryStatus, deliveryRevision, and originConversationUrl from native (Findings 1, 3)
+        const reconstructedRecord = buildReceiptRecord(rcpt, summary.origin_conversation_url);
         try {
           await chrome.storage.local.set({
             [receiptStorageKey]: reconstructedRecord,
@@ -143,10 +157,37 @@ async function processDrainResponse(drainResponse, stored, profileId) {
         } catch (storageErr) {
           console.error("Failed to reconstruct receipt " + rcpt.receipt_id + " from summary:", storageErr);
         }
+      } else {
+        // Reconcile existing record with native durable fence. Conclusive native
+        // states (not-sent/submitted-observed) must not be masked by stale local
+        // dispatching/uncertain. Terminal local state is preserved unless native
+        // reports a newer conclusive revision. No lease, no auto-retry of uncertainty.
+        const NATIVE_CONCLUSIVE = new Set(["not-sent", "submitted-observed"]);
+        const nativeRev = rcpt.delivery_revision || 0;
+        const localRev = existing.deliveryRevision || 0;
+        const nativeConclusive = rcpt.delivery_status && NATIVE_CONCLUSIVE.has(rcpt.delivery_status);
+        const localStaleUncertain = existing.deliveryStatus === "dispatching/uncertain" || existing.deliveryStatus === "dispatching";
+        let updated = false;
+        if (rcpt.delivery_revision && localRev < nativeRev) {
+          existing.deliveryRevision = rcpt.delivery_revision;
+          updated = true;
+        }
+        if (rcpt.delivery_status && rcpt.delivery_status !== existing.deliveryStatus) {
+          if (localRev < nativeRev || (nativeConclusive && localStaleUncertain)) {
+            existing.deliveryStatus = rcpt.delivery_status;
+            updated = true;
+          }
+        }
+        if ((rcpt.origin_conversation_url || summary.origin_conversation_url) && !existing.originConversationUrl) {
+          existing.originConversationUrl = rcpt.origin_conversation_url || summary.origin_conversation_url;
+          updated = true;
+        }
+        if (updated) {
+          await chrome.storage.local.set({ [receiptStorageKey]: existing });
+        }
       }
     }
   }
-
   // 2. Process real Completion Receipts: Persist browser receipt handling BEFORE sending transport ACK
   const receipts = Array.isArray(drainResponse.receipts) ? drainResponse.receipts : [];
   const ackedReceiptIds = [];
@@ -156,7 +197,19 @@ async function processDrainResponse(drainResponse, stored, profileId) {
     const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
 
     // Prepare durable browser record: status "received" (separate from ChatGPT submission, no send permission)
-    const receiptRecord = buildReceiptRecord(rcpt);
+    // Preserve existing terminal delivery state, but never let stale local
+    // dispatching/uncertain mask a newer conclusive native state (not-sent/submitted-observed).
+    const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
+    let receiptRecord = buildReceiptRecord(rcpt);
+    if (existing && existing.deliveryStatus && existing.deliveryStatus !== "received") {
+      const conclusiveNative = rcpt.delivery_status === "not-sent" || rcpt.delivery_status === "submitted-observed";
+      const localStale = existing.deliveryStatus === "dispatching/uncertain" || existing.deliveryStatus === "dispatching";
+      const nativeRev = rcpt.delivery_revision || 0;
+      const localRev = existing.deliveryRevision || 0;
+      if (!(conclusiveNative && (localStale || nativeRev > localRev))) {
+        receiptRecord = existing;
+      }
+    }
 
     // Hard gate: Storage write MUST succeed BEFORE reporting acknowledgement to native host
     try {
@@ -252,6 +305,355 @@ function sendNative(msg) {
   });
 }
 
+function buildContinuationPayload(rcpt) {
+  const receiptMarker = `[hands-return-bridge:receipt=${rcpt.receiptId}]`;
+  const continuationText = `[Hands Return Bridge] Local agent execution completed (receipt: ${rcpt.receiptId}, execution: ${rcpt.executionId}). Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+  return { receiptMarker, continuationText };
+}
+
+async function findOrReopenConversationTab(conversationUrl, conversationId) {
+  if (!chrome.tabs) return null;
+  // 1. Check existing tabs without stealing focus
+  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+  for (const tab of tabs) {
+    if (tab.url) {
+      const tabCleanUrl = tab.url.split("#")[0].split("?")[0];
+      const tabConvId = parseCanonicalConversationId(tabCleanUrl);
+      if (tabCleanUrl === conversationUrl || (tabConvId && tabConvId === conversationId)) {
+        return { tabId: tab.id, reopened: false };
+      }
+    }
+  }
+  // 2. Not found: reopen in background without focus stealing (active: false)
+  const created = await chrome.tabs.create({
+    url: conversationUrl,
+    active: false
+  });
+  return { tabId: created.id, reopened: true };
+}
+
+async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
+  // Hard gate: Only "received" or "not-sent" can attempt dispatch
+  if (!receiptRecord || (receiptRecord.deliveryStatus !== "received" && receiptRecord.deliveryStatus !== "not-sent")) {
+    return { status: "skipped", reason: "not_eligible_for_dispatch" };
+  }
+
+  const { receiptId, executionId, originConversationId } = receiptRecord;
+  const receiptStorageKey = "receipt_" + receiptId;
+  let originConversationUrl = receiptRecord.originConversationUrl;
+  if (!originConversationUrl && executionId) {
+    const allData = await chrome.storage.local.get(null);
+    for (const [k, v] of Object.entries(allData)) {
+      if (k.startsWith("launch_") && v && v.executionId === executionId && v.originConversationUrl) {
+        originConversationUrl = v.originConversationUrl;
+        break;
+      }
+    }
+  }
+  if (!originConversationUrl) {
+    originConversationUrl = `https://chatgpt.com/c/${originConversationId}`;
+  }
+
+  // 1. Locate or reopen the bound ChatGPT tab in the background without focus stealing
+  let tabInfo;
+  try {
+    tabInfo = await findOrReopenConversationTab(originConversationUrl, originConversationId);
+  } catch (err) {
+    return { status: "error", code: "tab_lookup_failed", message: String(err) };
+  }
+  if (!tabInfo || !tabInfo.tabId) {
+    return { status: "error", code: "tab_unavailable", message: "Failed to locate or open background tab" };
+  }
+
+  const tabId = tabInfo.tabId;
+
+  // 2. Pre-grant check: query content script for delivery readiness and document identity
+  let readinessResp;
+  try {
+    readinessResp = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(
+        tabId,
+        {
+          action: "check_delivery_readiness",
+          expectedConversationId: originConversationId,
+          expectedConversationUrl: originConversationUrl
+        },
+        { frameId: 0 },
+        (resp) => resolve(resp)
+      );
+    });
+  } catch (err) {
+    return { status: "waiting", reason: "tab_not_ready", message: String(err) };
+  }
+
+  if (!readinessResp || !readinessResp.ok || !readinessResp.documentId) {
+    return {
+      status: "waiting",
+      reason: readinessResp?.readiness?.reason || "readiness_guards_not_passed",
+      message: readinessResp?.readiness?.message || "Content script reports page not ready"
+    };
+  }
+
+  const documentId = readinessResp.documentId;
+  const transcriptText = readinessResp.readiness.transcriptText || "";
+  const accountText = readinessResp.readiness.accountText || "";
+
+  const transcriptEvidenceHash = await sha256Hex(transcriptText);
+  const accountEvidenceHash = await sha256Hex(accountText);
+
+  // Build bounded synthetic continuation
+  const { receiptMarker, continuationText } = buildContinuationPayload(receiptRecord);
+  const payloadDigest = await sha256Hex(continuationText);
+
+  // Preallocate attempt ID and revision
+  const attemptId = "att_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  const expectedDeliveryRevision = (receiptRecord.deliveryRevision || 0) + 1;
+
+  // 3. Atomically acquire Dispatch Fence ownership from native SQLite journal
+  const fenceResponse = await sendNative({
+    op: "dispatch_fence",
+    pairingId: stored.pairingId,
+    pairingSecret: stored.pairingSecret,
+    profileId,
+    receiptId,
+    executionId,
+    attemptId,
+    expectedDeliveryRevision,
+    payloadDigest,
+    receiptMarker,
+    originConversationId,
+    originConversationUrl,
+    accountEvidenceHash,
+    transcriptEvidenceHash,
+    tabId: String(tabId),
+    documentId
+  });
+
+  if (!fenceResponse || fenceResponse.status !== "ok" || !fenceResponse.grant || !fenceResponse.grant.granted) {
+    const grant = fenceResponse?.grant;
+    // Only reconcile terminal states belonging to this receipt (e.g. submitted-observed).
+    // Never copy competing-owner or in-flight conflict states (dispatching/uncertain, slot_busy)
+    // into the losing receipt so it remains retryable after the slot clears.
+    if (grant && grant.state === "submitted-observed" && grant.receipt_id === receiptId) {
+      receiptRecord.deliveryStatus = "submitted-observed";
+      if (grant.delivery_revision) {
+        receiptRecord.deliveryRevision = grant.delivery_revision;
+      }
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    }
+    // Loser or slot busy: receives status, NEVER permission!
+    return {
+      status: "denied",
+      reason: "slot_busy_or_competing_owner",
+      grantState: fenceResponse?.grant?.state
+    };
+  }
+
+  // Mark local state as dispatching/uncertain
+  receiptRecord.deliveryStatus = "dispatching/uncertain";
+  receiptRecord.deliveryRevision = expectedDeliveryRevision;
+  receiptRecord.activeAttemptId = attemptId;
+  receiptRecord.activeDocumentId = documentId;
+  await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+
+  // 4. Send attempt-bound grant to live document for one-time consumption & synchronous guard+click
+  let clickResp = null;
+  let clickChannelError = null;
+  try {
+    clickResp = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(
+        tabId,
+        {
+          action: "consume_grant_and_dispatch",
+          attemptId,
+          expectedDocumentId: documentId,
+          expectedConversationId: originConversationId,
+          expectedConversationUrl: originConversationUrl,
+          expectedAccountText: accountText,
+          continuationText,
+          receiptMarker
+        },
+        { frameId: 0 },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            clickChannelError = chrome.runtime.lastError.message || "runtime_channel_error";
+            resolve(null);
+          } else {
+            resolve(resp);
+          }
+        }
+      );
+    });
+  } catch (err) {
+    clickChannelError = String(err);
+  }
+
+  if (clickChannelError || !clickResp) {
+    // Finding 4: Response-channel failure or ambiguity after possible click: outcome is uncertain!
+    // Never treat channel failure as not-sent, never release the slot!
+    const channelReason = clickChannelError || "no_response_from_content_script";
+    await sendNative({
+      op: "settle_fence",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId,
+      receiptId,
+      executionId,
+      attemptId,
+      expectedDeliveryRevision,
+      outcome: "uncertain",
+      details: channelReason
+    });
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    return { status: "uncertain", reason: "click_dispatch_communication_error", error: channelReason };
+  }
+
+  if (!clickResp.ok || !clickResp.clicked) {
+    if (clickResp.reason === "grant_already_consumed") {
+      // Replay of an already-consumed grant is NOT affirmative no-click evidence!
+      // An earlier callback may still be awaiting button readiness or executing.
+      // Settle as uncertain to preserve the slot and prevent duplicate dispatches.
+      await sendNative({
+        op: "settle_fence",
+        pairingId: stored.pairingId,
+        pairingSecret: stored.pairingSecret,
+        profileId,
+        receiptId,
+        executionId,
+        attemptId,
+        expectedDeliveryRevision,
+        outcome: "uncertain",
+        details: "grant_already_consumed"
+      });
+      receiptRecord.deliveryStatus = "dispatching/uncertain";
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+      return { status: "uncertain", reason: "grant_already_consumed" };
+    }
+
+    // Document definitively rejected grant or guards failed synchronously before click:
+    // Settle conclusively as not-sent so slot can be released.
+    const settleResp = await sendNative({
+      op: "settle_fence",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId,
+      receiptId,
+      executionId,
+      attemptId,
+      expectedDeliveryRevision,
+      outcome: "not-sent",
+      details: clickResp.reason || "synchronous_guard_failed"
+    });
+    if (settleResp && settleResp.status === "ok" && settleResp.settlement && settleResp.settlement.settled) {
+      receiptRecord.deliveryStatus = "not-sent";
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+      return { status: "not-sent", reason: clickResp.reason };
+    }
+
+    // Native settlement is authoritative. If storage/CAS fails, retain uncertainty and the slot.
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    return {
+      status: "uncertain",
+      outcome: "uncertain",
+      receiptId,
+      reason: settleResp?.code || "native_settlement_failed"
+    };
+  }
+
+  // 5. Verify submitted user message in transcript
+  // Wait briefly for optimistic/submitted render
+  let verifyResp = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      verifyResp = await new Promise((resolve) => {
+        chrome.tabs.sendMessage(
+          tabId,
+          {
+            action: "verify_submitted_message",
+            receiptMarker,
+            expectedConversationId: originConversationId
+          },
+          { frameId: 0 },
+          (resp) => resolve(resp)
+        );
+      });
+      if (verifyResp && verifyResp.ok && verifyResp.observed && verifyResp.observedMessageId) {
+        break;
+      }
+    } catch {
+      // Tab may be re-rendering
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (verifyResp && verifyResp.ok && verifyResp.observed && verifyResp.observedMessageId) {
+    // Conclusive submitted-observed!
+    const settleResp = await sendNative({
+      op: "settle_fence",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId,
+      receiptId,
+      executionId,
+      attemptId,
+      expectedDeliveryRevision,
+      outcome: "submitted-observed",
+      observedMessageId: verifyResp.observedMessageId,
+      transcriptEvidenceHash: await sha256Hex(verifyResp.transcriptText || "")
+    });
+
+    // Issue #70: Native settlement is authoritative.
+    // Only persist submitted-observed when native settlement succeeds conclusively.
+    if (settleResp && settleResp.status === "ok" && settleResp.settlement && settleResp.settlement.settled) {
+      receiptRecord.deliveryStatus = "submitted-observed";
+      receiptRecord.observedMessageId = verifyResp.observedMessageId;
+      receiptRecord.settledAt = Date.now();
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+
+      return {
+        status: "ok",
+        outcome: "submitted-observed",
+        receiptId,
+        observedMessageId: verifyResp.observedMessageId,
+        slotReleased: settleResp.settlement.slot_released
+      };
+    }
+
+    // Native storage or fence conflict failure: keep receipt uncertain and retain slot!
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    return {
+      status: "uncertain",
+      outcome: "uncertain",
+      receiptId,
+      reason: settleResp?.code || "native_settlement_failed"
+    };
+  } else {
+    // Inconclusive outcome: retain uncertain! CAS settlement records uncertainty without releasing slot
+    await sendNative({
+      op: "settle_fence",
+      pairingId: stored.pairingId,
+      pairingSecret: stored.pairingSecret,
+      profileId,
+      receiptId,
+      executionId,
+      attemptId,
+      expectedDeliveryRevision,
+      outcome: "uncertain",
+      details: "Message not yet observed in transcript after click"
+    });
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    return {
+      status: "uncertain",
+      outcome: "uncertain",
+      receiptId
+    };
+  }
+}
+
 function sameLaunchPayload(record, payload) {
   return !!record &&
     record.originConversationId === payload.originConversationId &&
@@ -287,7 +689,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const profileId = await getOrCreateProfileId();
 
       // Gate: Secret-bearing actions must fail-closed if storage isolation is not established
-      if (["setup", "status", "connect", "revoke", "launch", "recover", "drain"].includes(request.action)) {
+      if (["setup", "status", "connect", "revoke", "launch", "recover", "drain", "dispatchReceipt", "getConversationTarget", "setConversationTarget", "ensureLocalMode"].includes(request.action)) {
         const isTrustedStorage = await ensureStorageAccessLevel();
         if (!isTrustedStorage) {
           sendResponse({
@@ -300,6 +702,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       switch (request.action) {
+        case "ensureLocalMode": {
+          let response;
+          try {
+            response = await sendNative({ op: "local_status" });
+          } catch (err) {
+            sendResponse({
+              status: "error",
+              code: "native_host_unavailable",
+              message: err.message || String(err)
+            });
+            break;
+          }
+          if (!response || response.status !== "ok") {
+            sendResponse(response || { status: "error", code: "native_host_unavailable" });
+            break;
+          }
+          const targets = Array.isArray(response.targets) ? response.targets : [];
+          await chrome.storage.local.set({
+            profileId: LOCAL_PROFILE_ID,
+            isPaired: true,
+            pairingId: LOCAL_PAIRING_ID,
+            pairingSecret: LOCAL_PAIRING_SECRET,
+            policyRevision: LOCAL_POLICY_REVISION,
+            targets
+          });
+          sendResponse({
+            status: "ok",
+            isPaired: true,
+            pairingStatus: response.pairingStatus || "active",
+            taskExecutionAvailable: response.taskExecutionAvailable !== false,
+            targetsCount: targets.length,
+            targets
+          });
+          break;
+        }
+
+
         case "getState": {
           const isTrustedStorage = await ensureStorageAccessLevel();
           if (!isTrustedStorage) {
@@ -387,12 +826,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           });
 
           if (response && response.status === "ok") {
+            if (Array.isArray(response.targets)) {
+              await chrome.storage.local.set({ targets: response.targets });
+            }
             sendResponse({
               status: "ok",
               isPaired: true,
               profileId,
               pairingStatus: response.pairingStatus,
               targetsCount: response.targetsCount,
+              targets: response.targets || stored.targets || [],
               policyRevision: response.policyRevision,
               taskExecutionAvailable: response.taskExecutionAvailable,
               trustNotice: TRUST_NOTICE
@@ -496,12 +939,103 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           const originConversationUrl = tabUrl.split("#")[0].split("?")[0];
 
-          const targetId = request.targetId?.trim();
+          // Resolve target: saved binding is authoritative.
+          // If request.targetId is also supplied and differs from an existing valid binding, fail closed.
+          // If unbound, an explicit registered targetId may be used and establishes the binding.
+          // Fallback to single target for unbound conversations.
+          const hasAuthoritativeTargets = Array.isArray(stored.targets);
+          const availableTargets = hasAuthoritativeTargets ? stored.targets : [];
+          const convBindingKey = `conv_target_${stored.pairingId}_${originConversationId}`;
+          const requestedTargetId = request.targetId?.trim() || null;
+          const storedBinding = (await chrome.storage.local.get([convBindingKey]))[convBindingKey];
+          const existingBinding = (typeof storedBinding === "string" && storedBinding.trim()) ? storedBinding.trim() : null;
+
+          let targetId = null;
+          if (existingBinding) {
+            // Check if existing binding is valid
+            if (hasAuthoritativeTargets && !availableTargets.some(t => t.target_id === existingBinding)) {
+              // Stale binding to removed target: prune and fail closed
+              await chrome.storage.local.remove([convBindingKey]);
+              sendResponse({
+                status: "error",
+                code: "target_not_found",
+                message: `Bound target '${existingBinding}' is not registered or was removed from this pairing.`
+              });
+              return;
+            }
+
+            // Binding is authoritative: if request.targetId is also supplied and differs, fail closed with mismatch
+            if (requestedTargetId && requestedTargetId !== existingBinding) {
+              sendResponse({
+                status: "error",
+                code: "conversation_target_mismatch",
+                message: `Target mismatch: conversation is bound to target '${existingBinding}', but launch requested '${requestedTargetId}'.`
+              });
+              return;
+            }
+            targetId = existingBinding;
+          } else {
+            // Conversation is unbound
+            if (requestedTargetId) {
+              // Validate against available targets if targets list is known
+              if (hasAuthoritativeTargets && !availableTargets.some(t => t.target_id === requestedTargetId)) {
+                sendResponse({
+                  status: "error",
+                  code: "target_not_found",
+                  message: `Target '${requestedTargetId}' is not registered.`
+                });
+                return;
+              }
+              // Establish binding for future launches
+              try {
+                await chrome.storage.local.set({ [convBindingKey]: requestedTargetId });
+              } catch (storageErr) {
+                sendResponse({
+                  status: "error",
+                  code: "browser_persistence_failure",
+                  message: "Failed to persist conversation target binding in browser storage; launch aborted"
+                });
+                return;
+              }
+              targetId = requestedTargetId;
+            } else if (availableTargets.length === 1) {
+              // Fallback to the only registered target and make that choice durable for
+              // this conversation before the pairing gains additional workspaces.
+              targetId = availableTargets[0].target_id;
+              try {
+                await chrome.storage.local.set({ [convBindingKey]: targetId });
+              } catch (storageErr) {
+                sendResponse({
+                  status: "error",
+                  code: "browser_persistence_failure",
+                  message: "Failed to persist conversation target binding in browser storage; launch aborted"
+                });
+                return;
+              }
+            }
+          }
+
           if (!targetId) {
-            sendResponse({ status: "error", code: "missing_target_id", message: "Target ID is required" });
+            sendResponse({
+              status: "error",
+              code: "missing_target_id",
+              message: availableTargets.length === 0
+                ? "No workspace targets registered. Add a target via hands-return-bridge target add."
+                : "Target ID is required. Select a workspace target for this conversation."
+            });
             return;
           }
 
+          // Final sanity check when targets list is known
+          if (hasAuthoritativeTargets && !availableTargets.some(t => t.target_id === targetId)) {
+            await chrome.storage.local.remove([convBindingKey]);
+            sendResponse({
+              status: "error",
+              code: "target_not_found",
+              message: `Target '${targetId}' is not registered or was removed from this pairing.`
+            });
+            return;
+          }
           const promptText = request.promptText;
           if (!promptText || typeof promptText !== "string" || !promptText.trim()) {
             sendResponse({ status: "error", code: "missing_prompt_text", message: "Prompt text is required" });
@@ -726,6 +1260,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               launchRecord.rejectMessage = response.message;
               await chrome.storage.local.set({ [pendingLaunchKey]: launchRecord });
               await chrome.storage.local.remove([activeKey]);
+              if (response.code === "target_not_found") {
+                const staleState = await chrome.storage.local.get(["targets", convBindingKey]);
+                if (Array.isArray(staleState.targets)) {
+                  await chrome.storage.local.set({
+                    targets: staleState.targets.filter(t => t.target_id !== targetId)
+                  });
+                }
+                const currentBinding = (await chrome.storage.local.get([convBindingKey]))[convBindingKey];
+                if (currentBinding === targetId) {
+                  await chrome.storage.local.remove([convBindingKey]);
+                }
+              }
             }
             return response;
           })();
@@ -818,13 +1364,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const allData = await chrome.storage.local.get(null);
           const pending = [];
           for (const [k, v] of Object.entries(allData)) {
-            if (k.startsWith("receipt_") && v && v.deliveryStatus === "received") {
+            if (k.startsWith("receipt_") && v && (v.deliveryStatus === "received" || v.deliveryStatus === "not-sent" || v.deliveryStatus === "dispatching/uncertain")) {
               pending.push(v);
             }
           }
           sendResponse({
             status: "ok",
             pendingReceipts: pending
+          });
+          break;
+        }
+
+        case "dispatchReceipt": {
+          const stored = await chrome.storage.local.get(["pairingId", "pairingSecret", "isPaired"]);
+          if (!stored.isPaired || !stored.pairingId || !stored.pairingSecret) {
+            sendResponse({ status: "error", code: "not_paired", message: "Extension is not paired" });
+            return;
+          }
+          const receiptId = request.receiptId;
+          if (!receiptId) {
+            sendResponse({ status: "error", code: "missing_receipt_id", message: "Missing 'receiptId'" });
+            return;
+          }
+          const receiptKey = "receipt_" + receiptId;
+          const receiptRecord = (await chrome.storage.local.get([receiptKey]))[receiptKey];
+          if (!receiptRecord) {
+            sendResponse({ status: "error", code: "receipt_not_found", message: "Receipt record not found" });
+            return;
+          }
+          const dispatchResult = await dispatchSingleReceipt(receiptRecord, stored, profileId);
+          sendResponse({
+            status: "ok",
+            dispatchResult,
+            trustNotice: TRUST_NOTICE
           });
           break;
         }
@@ -837,6 +1409,63 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             alarmScheduled: !!alarm,
             alarmName: RECOVERY_ALARM_NAME
           });
+          break;
+        }
+
+        case "getConversationTarget": {
+          const convId = request.conversationId?.trim();
+          if (!convId) {
+            sendResponse({ status: "error", code: "missing_conversation_id" });
+            return;
+          }
+          const stored = await chrome.storage.local.get(["pairingId", "targets"]);
+          if (!stored.pairingId) {
+            sendResponse({ status: "ok", targetId: null });
+            return;
+          }
+          const bindingKey = `conv_target_${stored.pairingId}_${convId}`;
+          const bindingVal = (await chrome.storage.local.get([bindingKey]))[bindingKey];
+          const availableTargets = Array.isArray(stored.targets) ? stored.targets : [];
+          let resolvedTargetId = null;
+          if (bindingVal && availableTargets.some(t => t.target_id === bindingVal)) {
+            resolvedTargetId = bindingVal;
+          } else if (!bindingVal && availableTargets.length === 1) {
+            resolvedTargetId = availableTargets[0].target_id;
+          }
+          sendResponse({
+            status: "ok",
+            conversationId: convId,
+            targetId: resolvedTargetId,
+            targets: availableTargets
+          });
+          break;
+        }
+
+        case "setConversationTarget": {
+          const convId = request.conversationId?.trim();
+          const targetId = request.targetId?.trim();
+          if (!convId) {
+            sendResponse({ status: "error", code: "missing_conversation_id" });
+            return;
+          }
+          const stored = await chrome.storage.local.get(["pairingId", "targets"]);
+          if (!stored.pairingId) {
+            sendResponse({ status: "error", code: "not_paired" });
+            return;
+          }
+          const bindingKey = `conv_target_${stored.pairingId}_${convId}`;
+          if (!targetId) {
+            await chrome.storage.local.remove([bindingKey]);
+            sendResponse({ status: "ok", conversationId: convId, targetId: null });
+            return;
+          }
+          const availableTargets = Array.isArray(stored.targets) ? stored.targets : [];
+          if (!availableTargets.some(t => t.target_id === targetId)) {
+            sendResponse({ status: "error", code: "target_not_found", message: `Target '${targetId}' is not registered.` });
+            return;
+          }
+          await chrome.storage.local.set({ [bindingKey]: targetId });
+          sendResponse({ status: "ok", conversationId: convId, targetId });
           break;
         }
 

@@ -2,7 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 use hands_return_bridge::host::{
-    SetupOptions, execute_setup, resolve_state_dir, run_native_host,
+    LocalInitOptions, SetupOptions, TargetAddOptions, TargetListOptions, TargetRemoveOptions,
+    execute_local_init, execute_setup, execute_target_add, execute_target_list,
+    execute_target_remove, resolve_state_dir, run_native_host,
 };
 use hands_return_bridge::journal::Journal;
 use hands_return_bridge::protocol::TRUST_NOTICE;
@@ -10,12 +12,15 @@ use hands_return_bridge::protocol::TRUST_NOTICE;
 fn print_help() {
     eprintln!(
         r#"Hands Return Bridge Companion CLI
-
 Usage:
   hands-return-bridge native-host [--state-dir <dir>]
+  hands-return-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
   hands-return-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
   hands-return-bridge status [--state-dir <dir>]
   hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
+  hands-return-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
+  hands-return-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
+  hands-return-bridge target list [--pairing-id <id>] [--state-dir <dir>]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
@@ -26,8 +31,13 @@ Setup Options:
   --tool-policy <policy>        Tool policy (required, e.g. standard)
   --approval-policy <policy>    Approval policy (required, e.g. prompt)
   --target-id <id>              Target ID identifier (default: dir name)
-  --state-dir <dir>             Override state directory (requires --skip-registry for setup)
+  --state-dir <dir>             Override state directory (requires --skip-registry for setup and local-init)
   --skip-registry               Skip Windows Registry NativeMessagingHosts registration
+
+Target Commands:
+  target add                    Register a new git workspace target on active pairing
+  target remove                 Remove a registered target from active pairing
+  target list                   List registered targets on active pairing
 "#
     );
 }
@@ -67,6 +77,65 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "local-init" => {
+            let mut browser = "chrome".to_string();
+            let mut extension_id = None;
+            let mut state_dir = None;
+            let mut skip_registry = false;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--browser" if i + 1 < args.len() => {
+                        browser = args[i + 1].clone();
+                        i += 1;
+                    }
+                    "--extension-id" if i + 1 < args.len() => {
+                        extension_id = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "--skip-registry" => skip_registry = true,
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
+                    }
+                    other => {
+                        eprintln!("Unknown option for local-init: {}", other);
+                        std::process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+
+            let extension_id = match extension_id {
+                Some(id) if !id.trim().is_empty() => id,
+                _ => {
+                    eprintln!("Error: --extension-id <id> is required");
+                    std::process::exit(1);
+                }
+            };
+            match execute_local_init(&LocalInitOptions {
+                browser,
+                extension_id,
+                state_dir,
+                skip_registry,
+            }) {
+                Ok(res) => {
+                    println!("Hands Return Bridge local mode initialized");
+                    println!("Browser: {}", res.browser);
+                    println!("Extension ID: {}", res.extension_id);
+                    println!("Manifest: {}", res.manifest_path.display());
+                }
+                Err(e) => {
+                    eprintln!("Local init failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         "setup" => {
             let mut browser = "chrome".to_string();
             let mut profile_id = None;
@@ -324,6 +393,184 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Failed to revoke pairing {}: {}", pid, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "target" => {
+            if args.len() < 3 {
+                eprintln!("Error: target requires a subcommand: add, remove, or list");
+                print_help();
+                std::process::exit(1);
+            }
+            match args[2].as_str() {
+                "add" => {
+                    let mut target_path = None;
+                    let mut target_id = None;
+                    let mut pairing_id = None;
+                    let mut state_dir = None;
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--target" if i + 1 < args.len() => {
+                                target_path = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--target-id" if i + 1 < args.len() => {
+                                target_id = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--pairing-id" if i + 1 < args.len() => {
+                                pairing_id = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--state-dir" if i + 1 < args.len() => {
+                                state_dir = Some(PathBuf::from(&args[i + 1]));
+                                i += 1;
+                            }
+                            "--help" | "-h" => {
+                                print_help();
+                                return;
+                            }
+                            other => {
+                                eprintln!("Unknown option for target add: {}", other);
+                                print_help();
+                                std::process::exit(1);
+                            }
+                        }
+                        i += 1;
+                    }
+                    let path = match target_path {
+                        Some(p) if !p.trim().is_empty() => p,
+                        _ => {
+                            eprintln!("Error: --target <path> is required");
+                            std::process::exit(1);
+                        }
+                    };
+                    let opts = TargetAddOptions {
+                        pairing_id,
+                        target_path: path,
+                        target_id,
+                        state_dir,
+                    };
+                    match execute_target_add(&opts) {
+                        Ok(rec) => {
+                            println!("Target added successfully:");
+                            println!("  Target ID:       {}", rec.target_id);
+                            println!("  Canonical Path:  {}", rec.canonical_path);
+                            println!("  Name:            {}", rec.name);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to add target: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "remove" | "rm" => {
+                    let mut target_id = None;
+                    let mut pairing_id = None;
+                    let mut state_dir = None;
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--target-id" if i + 1 < args.len() => {
+                                target_id = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--pairing-id" if i + 1 < args.len() => {
+                                pairing_id = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--state-dir" if i + 1 < args.len() => {
+                                state_dir = Some(PathBuf::from(&args[i + 1]));
+                                i += 1;
+                            }
+                            "--help" | "-h" => {
+                                print_help();
+                                return;
+                            }
+                            other => {
+                                eprintln!("Unknown option for target remove: {}", other);
+                                print_help();
+                                std::process::exit(1);
+                            }
+                        }
+                        i += 1;
+                    }
+                    let tid = match target_id {
+                        Some(id) if !id.trim().is_empty() => id,
+                        _ => {
+                            eprintln!("Error: --target-id <id> is required");
+                            std::process::exit(1);
+                        }
+                    };
+                    let opts = TargetRemoveOptions {
+                        pairing_id,
+                        target_id: tid.clone(),
+                        state_dir,
+                    };
+                    match execute_target_remove(&opts) {
+                        Ok(()) => {
+                            println!("Target '{}' removed successfully.", tid);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to remove target: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "list" | "ls" => {
+                    let mut pairing_id = None;
+                    let mut state_dir = None;
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--pairing-id" if i + 1 < args.len() => {
+                                pairing_id = Some(args[i + 1].clone());
+                                i += 1;
+                            }
+                            "--state-dir" if i + 1 < args.len() => {
+                                state_dir = Some(PathBuf::from(&args[i + 1]));
+                                i += 1;
+                            }
+                            "--help" | "-h" => {
+                                print_help();
+                                return;
+                            }
+                            other => {
+                                eprintln!("Unknown option for target list: {}", other);
+                                print_help();
+                                std::process::exit(1);
+                            }
+                        }
+                        i += 1;
+                    }
+                    let opts = TargetListOptions {
+                        pairing_id,
+                        state_dir,
+                    };
+                    match execute_target_list(&opts) {
+                        Ok(targets) => {
+                            if targets.is_empty() {
+                                println!("No targets registered on active pairing.");
+                            } else {
+                                println!("Registered targets ({}):", targets.len());
+                                for t in targets {
+                                    println!("  - ID:   {}", t.target_id);
+                                    println!("    Path: {}", t.canonical_path);
+                                    println!("    Name: {}", t.name);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to list targets: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("Unknown target subcommand: {}", other);
+                    print_help();
                     std::process::exit(1);
                 }
             }

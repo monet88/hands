@@ -8,7 +8,7 @@ fn live_launcher_tests_enabled() -> bool {
 use hands_return_bridge::journal::{Journal, LaunchRequestParams, PolicyRecord, TargetRecord};
 use hands_return_bridge::launcher::{
     build_omp_startup_command_with_env, build_omp_startup_command_with_env_and_bin,
-    ensure_adapter_file, is_exact_supported_omp_version, split_prompt_for_orca,
+    ensure_adapter_file, is_supported_omp_version, split_prompt_for_orca,
     COMPANION_ADAPTER_REVISION, ORCA_PROMPT_CHUNK_MAX_BYTES, SUPPORTED_OMP_CLI_SHAPE,
     SUPPORTED_OMP_REVISION,
 };
@@ -41,6 +41,73 @@ fn test_native_messaging_framing() {
         .expect("Failed to read message")
         .expect("Unexpected EOF");
     assert_eq!(read_back, msg);
+}
+
+#[test]
+fn test_local_mode_status_returns_read_only_targets_and_rejects_browser_target_mutation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    journal.ensure_local_pairing().unwrap();
+
+    let status = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["pairingId"], "local");
+    assert_eq!(status["profileId"], "local");
+    assert_eq!(status["pairingStatus"], "active");
+    assert_eq!(status["targetsCount"], 0);
+
+    // Browser message attempting target_add must be rejected
+    let add = handle_native_message(
+        &json!({
+            "op": "target_add",
+            "pairingId": "local",
+            "pairingSecret": "local",
+            "profileId": "local",
+            "targetPath": "C:\\some\\path",
+            "targetId": "repo_local"
+        }),
+        &journal,
+    );
+    assert_eq!(add["status"], "error");
+    assert!(
+        add["code"] == "unsupported_operation" || add["code"] == "unauthorized_override",
+        "target_add must not be allowed via native messaging"
+    );
+
+    // Browser message attempting target_remove must be rejected
+    let remove = handle_native_message(
+        &json!({
+            "op": "target_remove",
+            "pairingId": "local",
+            "pairingSecret": "local",
+            "profileId": "local",
+            "targetId": "repo_local"
+        }),
+        &journal,
+    );
+    assert_eq!(remove["status"], "error");
+    assert_eq!(remove["code"], "unsupported_operation");
+
+    // Target administration stays local CLI only via journal/host methods
+    let repo = tempdir().unwrap();
+    init_git_repo(repo.path());
+    let canonical = repo.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let target = TargetRecord {
+        target_id: "repo_local".to_string(),
+        canonical_path: canonical.clone(),
+        name: "repo_local".to_string(),
+    };
+    journal.add_target_admin("local", &target).unwrap();
+
+    let status_after_add = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status_after_add["targetsCount"], 1);
+    assert_eq!(status_after_add["targets"][0]["target_id"], "repo_local");
+    assert_eq!(status_after_add["targets"][0]["canonical_path"], canonical);
+
+    journal.remove_target_admin("local", "repo_local").unwrap();
+    let status_after_remove = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status_after_remove["targetsCount"], 0);
 }
 
 #[test]
@@ -112,7 +179,10 @@ fn test_closed_operation_set_and_security_guards() {
     assert_eq!(status_resp["status"], "ok");
     assert_eq!(status_resp["pairingStatus"], "active");
     assert_eq!(status_resp["taskExecutionAvailable"], true);
-
+    assert_eq!(status_resp["targetsCount"], 1);
+    assert_eq!(status_resp["targets"][0]["target_id"], "target_hands");
+    assert_eq!(status_resp["targets"][0]["name"], "hands");
+    assert_eq!(status_resp["targets"][0]["canonical_path"], "test_target_closed_ops");
     // 4. Boundary guard A1: Unauthorized override attempts fail closed
     let override_targets_msg = json!({
         "op": "connect",
@@ -1295,9 +1365,8 @@ fn test_adapter_v3_generation_and_revision() {
 #[test]
 fn test_launch_preflight_supported_omp_revision_pin() {
     use hands_return_bridge::launcher::verify_launch_preflight;
-    assert_eq!(SUPPORTED_OMP_REVISION, "18.1.16");
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
-
+    assert_eq!(SUPPORTED_OMP_REVISION, ">=18.1.16");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/>=18.1.16");
     if !live_launcher_tests_enabled() {
         eprintln!("SKIP live OMP revision preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
         return;
@@ -1310,37 +1379,52 @@ fn test_launch_preflight_supported_omp_revision_pin() {
     // Preflight against a script that outputs an unsupported version must fail closed
     let dir = tempdir().unwrap();
     let mock_omp = dir.path().join("mock_omp_wrong_ver.bat");
-    std::fs::write(&mock_omp, "@echo off\r\nif \"%1\"==\"--version\" (echo omp/19.0.0 & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n").unwrap();
+    std::fs::write(&mock_omp, "@echo off\r\nif \"%1\"==\"--version\" (echo invalid_tool/1.0.0 & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n").unwrap();
 
     let bad_ver_res = verify_launch_preflight(Some(&mock_omp.to_string_lossy()));
     assert!(bad_ver_res.is_err(), "Preflight must fail closed for unsupported OMP revision");
     let err_msg = bad_ver_res.unwrap_err().to_string();
     assert!(err_msg.contains("Unsupported OMP revision"), "Error should report revision mismatch: {}", err_msg);
-    assert!(err_msg.contains("omp/18.1.16"), "Error should name expected revision omp/18.1.16: {}", err_msg);
 }
 
 #[test]
 fn test_exact_supported_omp_version_matching() {
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/>=18.1.16");
 
-    // Exact match must pass
-    assert!(is_exact_supported_omp_version("omp/18.1.16"));
-    assert!(is_exact_supported_omp_version("omp/18.1.16\n"));
-    assert!(is_exact_supported_omp_version("omp/18.1.16\r\n"));
-    assert!(is_exact_supported_omp_version("  omp/18.1.16  \n"));
+    // OMP version shapes >= 18.1.16 must pass
+    assert!(is_supported_omp_version("omp/18.1.16"));
+    assert!(is_supported_omp_version("omp/18.1.18"));
+    assert!(is_supported_omp_version("omp/19.0.0"));
+    assert!(is_supported_omp_version("omp/118.1.16"));
+    assert!(is_supported_omp_version("omp/18.1.16\n"));
+    assert!(is_supported_omp_version("omp/18.1.16\r\n"));
+    assert!(is_supported_omp_version("  omp/18.1.16  \n"));
 
-    // Lookalikes, prefixes, suffixes, and extra wrapper text MUST BE REJECTED
-    assert!(!is_exact_supported_omp_version("omp/118.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16-beta"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16.1"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16_rc1"));
-    assert!(!is_exact_supported_omp_version("v18.1.16"));
-    assert!(!is_exact_supported_omp_version("18.1.16"));
-    assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16 extra text"));
-    assert!(!is_exact_supported_omp_version("node omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/19.0.0"));
-    assert!(!is_exact_supported_omp_version(""));
+    // Older versions below 18.1.16 floor must be rejected
+    assert!(!is_supported_omp_version("omp/18.1.15"));
+    assert!(!is_supported_omp_version("omp/18.0.99"));
+    assert!(!is_supported_omp_version("omp/17.9.99"));
+
+    // Lookalikes, prefixes, suffixes, non-omp CLI MUST BE REJECTED
+    assert!(!is_supported_omp_version("v18.1.16"));
+    assert!(!is_supported_omp_version("18.1.16"));
+    assert!(!is_supported_omp_version("wrapper: omp/18.1.16"));
+    assert!(!is_supported_omp_version("node omp/18.1.16"));
+    assert!(!is_supported_omp_version("omp/"));
+    assert!(!is_supported_omp_version("omp/abc"));
+    assert!(!is_supported_omp_version("omp/18.1.16 extra"));
+    // Strict core: reject prerelease, extra components, whitespace/garbage;
+    // build metadata accepted only with exact 3-part numeric core.
+    assert!(!is_supported_omp_version("omp/18.1.16-rc.1"));
+    assert!(!is_supported_omp_version("omp/18.1.16-0"));
+    assert!(!is_supported_omp_version("omp/18.1.16.1"));
+    assert!(!is_supported_omp_version("omp/18.1"));
+    assert!(!is_supported_omp_version("omp/18.1.16+"));
+    assert!(!is_supported_omp_version("omp/18.1.16++meta"));
+    assert!(!is_supported_omp_version("omp/18.1.16\nmultiline"));
+    assert!(is_supported_omp_version("omp/18.1.16+build.1"));
+    assert!(is_supported_omp_version("omp/18.1.18+20260912"));
+    assert!(!is_supported_omp_version(""));
 }
 
 #[test]
@@ -1354,11 +1438,13 @@ fn test_launch_preflight_adversarial_lookalike_rejection() {
     let dir = tempdir().unwrap();
 
     let lookalikes = [
-        "omp/118.1.16",
-        "omp/18.1.16-beta",
+        "omp/",
+        "omp/abc",
         "wrapper: omp/18.1.16",
         "18.1.16",
         "omp/18.1.16 extra",
+        "omp/18.1.15",
+        "omp/17.0.0",
     ];
 
     for (idx, lookalike) in lookalikes.iter().enumerate() {
@@ -1495,4 +1581,128 @@ fn test_protocol_drain_and_ack_operations() {
     assert_eq!(drain_again["status"], "ok");
     assert_eq!(drain_again["receipts"].as_array().unwrap().len(), 0);
     assert_eq!(drain_again["summaries"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_protocol_dispatch_fence_and_settlement_messages() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_proto_fence";
+    let bootstrap_token = "boot_proto_fence";
+    let profile_id = "profile_proto_fence";
+    journal.create_bootstrap(
+        pairing_id,
+        bootstrap_token,
+        "chrome",
+        profile_id,
+        &[TargetRecord { target_id: "target_1".into(), canonical_path, name: "target_1".into() }],
+        &PolicyRecord { policy_revision: "v1".into(), tool_policy: "standard".into(), approval_policy: "prompt".into() },
+    ).unwrap();
+    let act_res = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let pairing_secret = act_res.pairing_secret;
+
+    let conv_id = "conv_proto_fence";
+    let conv_url = format!("https://chatgpt.com/c/{}", conv_id);
+    let claim = journal.reserve_or_claim_launch(&LaunchRequestParams {
+        pairing_id: pairing_id.into(),
+        launch_request_id: "req_pf_1".into(),
+        origin_conversation_id: conv_id.into(),
+        origin_conversation_url: conv_url.clone(),
+        transcript_evidence_hash: "hash_t_pf".into(),
+        account_evidence_hash: "hash_a_pf".into(),
+        target_id: "target_1".into(),
+        policy_revision: "v1".into(),
+        prompt_text: "task pf".into(),
+    }).unwrap();
+
+    let rcpt_id = "rcpt_pf_1";
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO completion_receipts VALUES (?1, ?2, ?3, ?4, ?5, 0, 'stop', 'msg_pf', 'pf text', 'digest_pf', 1, 'completed', 1000)",
+            rusqlite::params![rcpt_id, &claim.execution_id, pairing_id, &claim.return_token, conv_id],
+        ).unwrap();
+    }
+
+    // 1. Acquire grant over protocol
+    let fence_msg = json!({
+        "op": "dispatch_fence",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "receiptId": rcpt_id,
+        "executionId": claim.execution_id,
+        "attemptId": "attempt_proto_1",
+        "expectedDeliveryRevision": 1,
+        "payloadDigest": "digest_proto_stable",
+        "receiptMarker": "marker_proto_1",
+        "originConversationId": conv_id,
+        "originConversationUrl": conv_url,
+        "accountEvidenceHash": "hash_a_pf",
+        "transcriptEvidenceHash": "hash_t_pf",
+        "tabId": "tab_123",
+        "documentId": "doc_proto_1"
+    });
+
+    let fence_resp = handle_native_message(&fence_msg, &journal);
+    assert_eq!(fence_resp["status"], "ok", "fence_resp failed: {:?}", fence_resp);
+    assert_eq!(fence_resp["grant"]["granted"], true);
+    assert_eq!(fence_resp["grant"]["attempt_id"], "attempt_proto_1");
+
+
+    // 1b. Invalid conversation URL or mismatch fails closed with invalid_conversation_boundary
+    let mut invalid_url_msg = fence_msg.clone();
+    invalid_url_msg["originConversationUrl"] = json!("https://malicious.example.com/c/conv_proto_fence");
+    let invalid_url_resp = handle_native_message(&invalid_url_msg, &journal);
+    assert_eq!(invalid_url_resp["status"], "error");
+    assert_eq!(invalid_url_resp["code"], "invalid_conversation_boundary");
+
+    let mut mismatch_url_msg = fence_msg.clone();
+    mismatch_url_msg["originConversationUrl"] = json!("https://chatgpt.com/c/different_conv_id");
+    let mismatch_url_resp = handle_native_message(&mismatch_url_msg, &journal);
+    assert_eq!(mismatch_url_resp["status"], "error");
+    assert_eq!(mismatch_url_resp["code"], "invalid_conversation_boundary");
+    // 2. Competing document attempt is rejected over protocol
+    let mut competing_msg = fence_msg.clone();
+    competing_msg["documentId"] = json!("doc_proto_2");
+    competing_msg["attemptId"] = json!("attempt_proto_competing");
+    let competing_resp = handle_native_message(&competing_msg, &journal);
+    assert_eq!(competing_resp["status"], "ok");
+    assert_eq!(competing_resp["grant"]["granted"], false, "Competing document must receive granted=false");
+
+    // 3. Settle fence over protocol with CAS check
+    let settle_msg = json!({
+        "op": "settle_fence",
+        "pairingId": pairing_id,
+        "pairingSecret": pairing_secret,
+        "profileId": profile_id,
+        "receiptId": rcpt_id,
+        "executionId": claim.execution_id,
+        "attemptId": "attempt_proto_1",
+        "expectedDeliveryRevision": 1,
+        "outcome": "submitted-observed",
+        "observedMessageId": "msg_chatgpt_real_888",
+        "transcriptEvidenceHash": "hash_transcript_after_submit"
+    });
+
+    let settle_resp = handle_native_message(&settle_msg, &journal);
+    assert_eq!(settle_resp["status"], "ok");
+    assert_eq!(settle_resp["settlement"]["settled"], true);
+    assert_eq!(settle_resp["settlement"]["slot_released"], true);
+
+    // 4. Verify transcript_evidence_hash was persisted in dispatch_fences
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let hash: String = conn.query_row(
+            "SELECT transcript_evidence_hash FROM dispatch_fences WHERE receipt_id = ?1",
+            rusqlite::params![rcpt_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(hash, "hash_transcript_after_submit");
+    }
 }

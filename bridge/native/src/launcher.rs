@@ -42,16 +42,53 @@ impl std::fmt::Display for LauncherError {
 
 impl std::error::Error for LauncherError {}
 
-/// Pinned supported OMP CLI revision
-pub const SUPPORTED_OMP_REVISION: &str = "18.1.16";
-/// Exact verified OMP CLI version output shape
-pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/18.1.16";
+/// Minimum verified OMP CLI version supported by the embedded companion adapter
+pub const MIN_SUPPORTED_OMP_VERSION: (u64, u64, u64) = (18, 1, 16);
+/// Supported OMP CLI version requirement ("omp/>=18.1.16")
+pub const SUPPORTED_OMP_REVISION: &str = ">=18.1.16";
+/// Verified OMP CLI version output shape
+pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/>=18.1.16";
 /// Keep each Windows CreateProcess argv payload comfortably below the ~32K command-line ceiling.
 pub const ORCA_PROMPT_CHUNK_MAX_BYTES: usize = 8 * 1024;
 
-/// Validates exact verified OMP CLI version output shape ("omp/18.1.16")
-pub fn is_exact_supported_omp_version(output: &str) -> bool {
-    output.trim() == SUPPORTED_OMP_CLI_SHAPE
+/// Validates verified OMP CLI version output shape ("omp/<version>") with minimum version >= 18.1.16
+pub fn is_supported_omp_version(output: &str) -> bool {
+    let trimmed = output.trim();
+    let Some(version_str) = trimmed.strip_prefix("omp/") else {
+        return false;
+    };
+    if version_str.is_empty() || version_str.contains(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    let Some((major, minor, patch)) = parse_omp_version_tuple(version_str) else {
+        return false;
+    };
+    (major, minor, patch) >= MIN_SUPPORTED_OMP_VERSION
+}
+
+fn parse_omp_version_tuple(version_str: &str) -> Option<(u64, u64, u64)> {
+    // Reject prerelease channel outright (e.g. 18.1.16-rc.1). Build metadata
+    // (+...) is tolerated only when the core remains exactly 3 numeric parts.
+    if version_str.contains('-') {
+        return None;
+    }
+    let (core, build) = match version_str.split_once('+') {
+        Some((core, build)) => (core, Some(build)),
+        None => (version_str, None),
+    };
+    if let Some(build) = build {
+        if build.is_empty() || build.contains('+') {
+            return None;
+        }
+    }
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 /// Pinned companion adapter revision identifier
@@ -548,11 +585,10 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
     }
     let ver_text = String::from_utf8_lossy(&omp_version.stdout);
     let trimmed_ver = ver_text.trim();
-    if !is_exact_supported_omp_version(trimmed_ver) {
+    if !is_supported_omp_version(trimmed_ver) {
         return Err(LauncherError::PreflightFailed(format!(
-            "Unsupported OMP revision: '{}'. Return Bridge requires exact supported revision '{}'",
-            trimmed_ver,
-            SUPPORTED_OMP_CLI_SHAPE
+            "Unsupported OMP revision: '{}'. Return Bridge requires OMP CLI ('omp/<version>')",
+            trimmed_ver
         )));
     }
 
