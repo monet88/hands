@@ -120,12 +120,15 @@ fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
     let manifest1 = std::fs::read_to_string(&res1.manifest_path).unwrap();
     assert!(manifest1.contains(ext_initial));
 
-    // 2. Lock the journal with an exclusive transaction
-    let mut conn = rusqlite::Connection::open(&state_dir.join("journal.sqlite")).unwrap();
-    conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive).unwrap();
-
-    // 3. Second init with different extension ID attempts to run, but journal update will fail
+    // 2. Deterministic post-manifest failure seam: inject journal failure AFTER
+    // manifest overwrite so rollback is actually exercised (exclusive-lock
+    // harnesses fail pre-manifest and pass vacuously). Scoped to this test's
+    // canonical state_dir so parallel tests are unaffected.
+    let canonical_state = state_dir.canonicalize().unwrap();
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
     let ext_second = "second_extension_id_xyz123";
     let res2 = execute_local_init(&LocalInitOptions {
         browser: "chrome".to_string(),
@@ -133,12 +136,16 @@ fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
         state_dir: Some(state_dir.clone()),
         skip_registry: true,
     });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
     assert!(res2.is_err(), "Local init must fail when journal cannot be updated");
+    let err_msg = res2.unwrap_err().to_string();
+    assert!(
+        !err_msg.contains("additionally failed to restore previous manifest"),
+        "Rollback restore must succeed on this path, got: {}",
+        err_msg
+    );
 
-    drop(tx);
-    drop(conn);
-
-    // 4. Manifest must be restored to previous manifest containing ext_initial, NOT ext_second
+    // 3. Manifest must be restored to previous manifest containing ext_initial, NOT ext_second
     let manifest_after = std::fs::read_to_string(&res1.manifest_path).unwrap();
     assert!(
         manifest_after.contains(ext_initial),
@@ -148,6 +155,82 @@ fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
         !manifest_after.contains(ext_second),
         "Failed init must not leave partial manifest on disk"
     );
+}
+#[cfg(windows)]
+#[test]
+fn test_local_init_rollback_restores_prior_registry_snapshot() {
+    use hands_return_bridge::host::manifest_registry_keys;
+
+    // Use an isolated test host name so we don't touch live dev.hands.return_bridge or com.hands.return_bridge
+    let test_host_name = "com.hands.return_bridge.test_reg_rollback";
+    std::env::set_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME", test_host_name);
+
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let canonical_state = state_dir.canonicalize().unwrap();
+
+    let chrome_keys = manifest_registry_keys("chrome");
+    let test_key = chrome_keys[0].clone();
+
+    // Ensure test key is clean initially
+    let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+
+    // Scenario A: Test key did not exist prior to init.
+    // When journal update fails, rollback must remove the newly-created registry key.
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
+    let res_a = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: "ext_test_reg_rollback_a".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    assert!(res_a.is_err(), "Local init must fail when fault is armed");
+
+    let query_a = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+    assert!(
+        !query_a.status.success(),
+        "Rollback must remove registry key when it did not exist prior to init"
+    );
+
+    // Scenario B: Test key existed prior to init with a different path.
+    // When journal update fails, rollback must restore the exact prior value.
+    let prior_dummy_path = r"C:\prior\nonexistent\host.json";
+    let setup_prior = Command::new("reg.exe")
+        .args(["add", &test_key, "/ve", "/t", "REG_SZ", "/d", prior_dummy_path, "/f"])
+        .output()
+        .unwrap();
+    assert!(setup_prior.status.success(), "Failed to seed prior registry key");
+
+    std::env::set_var(
+        "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+        canonical_state.to_string_lossy().to_string(),
+    );
+    let res_b = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: "ext_test_reg_rollback_b".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: false,
+    });
+    std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    assert!(res_b.is_err(), "Local init must fail when fault is armed");
+
+    let query_b = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+    assert!(query_b.status.success(), "Prior registry key must still exist after rollback");
+    let stdout_b = String::from_utf8_lossy(&query_b.stdout);
+    assert!(
+        stdout_b.contains(prior_dummy_path),
+        "Rollback must restore prior default value {}, got: {}",
+        prior_dummy_path,
+        stdout_b
+    );
+
+    // Cleanup test registry key and env var
+    let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+    std::env::remove_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME");
 }
 
 #[test]

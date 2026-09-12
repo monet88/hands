@@ -2712,6 +2712,7 @@ async function runTests() {
     routeChangesAfterTicks = 0,
     stopButtonAppearsAfterTicks = 0,
     tamperComposerAfterTicks = 0,
+    tamperComposerText = "Tampered text by human",
     detachButtonOnPreClick = false,
     clickThrows = false,
     replaceComposerAfterTicks = 0,
@@ -2838,7 +2839,7 @@ async function runTests() {
             stopButtonPresent = true;
           }
           if (tamperComposerAfterTicks && buttonTicks >= tamperComposerAfterTicks) {
-            composerObj.value = "Tampered text by human";
+            composerObj.value = tamperComposerText;
           }
           if (accountChangesAfterTicks && buttonTicks >= accountChangesAfterTicks) {
             currentAccount = changedAccount;
@@ -3376,6 +3377,19 @@ async function runTests() {
           }
         }
       }
+      if (msg.op === "settle_fence") {
+        cb({
+          status: "ok",
+          settlement: {
+            settled: true,
+            receipt_id: msg.receiptId,
+            attempt_id: msg.attemptId,
+            outcome: msg.outcome,
+            slot_released: true
+          }
+        });
+        return;
+      }
       cb({ status: "ok" });
     };
 
@@ -3742,6 +3756,374 @@ async function runTests() {
     assert.equal(respC.observedMessageId, "real_msg_id_999", "Real message identity must be returned");
 
     console.log("  [PASS] verify_submitted_message requires real message ID and never synthesizes");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test: clearComposer/raw tamper guard preserves leading/trailing whitespace edits
+  // ---------------------------------------------------------------------------
+  {
+    const csWs = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      tamperComposerAfterTicks: 2,
+      tamperComposerText: "Original bridge payload "
+    });
+    let readRespWs = null;
+    csWs.listener({ action: "check_delivery_readiness", expectedConversationId: "c_test_cs" }, {}, (r) => { readRespWs = r; });
+    let resWs = null;
+    await new Promise((resolve) => {
+      csWs.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_preserve_whitespace",
+        expectedDocumentId: readRespWs.documentId,
+        expectedConversationId: "c_test_cs",
+        continuationText: "Original bridge payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { resWs = r; resolve(); });
+    });
+    assert.equal(resWs.ok, false);
+    assert.equal(resWs.reason, "composer_content_tampered");
+    assert.equal(csWs.composer.value, "Original bridge payload ", "Trailing-space user edit must be preserved untouched (raw compare)");
+    assert.equal(csWs.getClickCount(), 0, "Whitespace-edited composer must never click");
+
+    console.log("  [PASS] Raw composer compare preserves whitespace-only user edits");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test: verify_submitted_message stops after first verified real data-message-id
+  // ---------------------------------------------------------------------------
+  {
+    let queryCount = 0;
+    const trackingTurns = [
+      {
+        innerText: "Here is the result [hands-receipt:rcpt_abc_123]",
+        getAttribute: (attr) => attr === "data-message-id" ? "real_msg_id_first" : null,
+        querySelector: () => null
+      }
+    ];
+    const VERIFY_SELECTORS = [
+      '[data-message-author-role="user"]',
+      'main [data-testid^="conversation-turn"]:has([data-message-author-role="user"])',
+      'div[data-message-author-role="user"]'
+    ];
+    const verifySelectorsQueried = [];
+    const trackingDocument = {
+      readyState: "complete",
+      querySelector: () => null,
+      querySelectorAll: (sel) => {
+        if (VERIFY_SELECTORS.includes(sel)) {
+          verifySelectorsQueried.push(sel);
+          return trackingTurns;
+        }
+        if (sel.includes("conversation-turn") || sel === "article") {
+          return trackingTurns;
+        }
+        return [];
+      }
+    };
+    let trackedListener = null;
+    const trackingChrome = { runtime: { onMessage: { addListener(cb) { trackedListener = cb; } } } };
+    const trackingCtx = vm.createContext({
+      chrome: trackingChrome,
+      document: trackingDocument,
+      window: { location: { pathname: "/c/c_test_verify", href: "https://chatgpt.com/c/c_test_verify" } },
+      console: { log() {}, error() {}, warn() {} },
+      Promise,
+      setTimeout,
+      clearTimeout
+    });
+    vm.runInContext(contentScriptCode, trackingCtx);
+    let trackedResp = null;
+    trackedListener(
+      { action: "verify_submitted_message", receiptMarker: "[hands-receipt:rcpt_abc_123]", expectedConversationId: "c_test_verify" },
+      {},
+      (r) => { trackedResp = r; }
+    );
+    assert.equal(trackedResp.ok, true);
+    assert.equal(trackedResp.observed, true);
+    assert.equal(trackedResp.observedMessageId, "real_msg_id_first");
+    assert.deepEqual(verifySelectorsQueried, [VERIFY_SELECTORS[0]], "Outer break must stop selector scan after first verified ID");
+
+    console.log("  [PASS] verify_submitted_message stops after first verified ID");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test: native conclusive recovery wins over stale local dispatching/uncertain
+  // ---------------------------------------------------------------------------
+  {
+    const rcptId = "rcpt_conclusive_1";
+    const execId = "exec_conclusive_1";
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_conc",
+        pairingSecret: "sec_conc",
+        ["receipt_" + rcptId]: {
+          receiptId: rcptId,
+          executionId: execId,
+          deliveryStatus: "dispatching/uncertain",
+          deliveryRevision: 1,
+          originConversationUrl: "https://chatgpt.com/c/c_conc"
+        }
+      }
+    });
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      harness.nativeMessagesSent.push({ host, msg });
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [
+            {
+              launch_request_id: "launch_conc",
+              execution_id: execId,
+              origin_conversation_id: "c_conc",
+              origin_conversation_url: "https://chatgpt.com/c/c_conc",
+              state: "completed",
+              completion_receipt: {
+                receipt_id: rcptId,
+                execution_id: execId,
+                pairing_id: "pair_conc",
+                return_token: "ret_conc",
+                origin_conversation_id: "c_conc",
+                origin_conversation_url: "https://chatgpt.com/c/c_conc",
+                delivery_status: "submitted-observed",
+                delivery_revision: 2,
+                turn_index: 0,
+                stop_reason: "stop",
+                assistant_text: "done",
+                content_digest: "d_conc",
+                tool_call_count: 1,
+                state: "completed"
+              }
+            }
+          ],
+          receipts: []
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    await harness.sendMessage({ action: "drain" }, trustedSender);
+    const stored = harness.storageStore["receipt_" + rcptId];
+    assert.equal(stored.deliveryStatus, "submitted-observed", "Conclusive native submitted-observed must overwrite stale local uncertain");
+    assert.equal(stored.deliveryRevision, 2, "Newer native revision must be reconciled");
+
+    console.log("  [PASS] Conclusive native recovery overwrites stale local uncertain");
+  }
+  // ---------------------------------------------------------------------------
+  // Test 44: Native settlement storage_error keeps receipt dispatching/uncertain
+  //          and retains conversation slot (authoritative settlement gate)
+  // ---------------------------------------------------------------------------
+  {
+    const rcptId = "rcpt_settle_err";
+    const testReceipt = {
+      receiptId: rcptId,
+      executionId: "exec_settle_err",
+      pairingId: "pair_dispatch",
+      returnToken: "ret_settle_err",
+      originConversationId: "c_settle_err_123",
+      originConversationUrl: "https://chatgpt.com/c/c_settle_err_123",
+      deliveryStatus: "received"
+    };
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        ["receipt_" + rcptId]: testReceipt
+      },
+      mockTabs: {
+        601: { id: 601, url: "https://chatgpt.com/c/c_settle_err_123" }
+      },
+      mockTabMessages: {
+        601: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_settle_err_1",
+              readiness: { ready: true, transcriptText: "t", accountText: "a" }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return { ok: true, clicked: true, documentId: "doc_settle_err_1" };
+          }
+          if (msg.action === "verify_submitted_message") {
+            return { ok: true, observed: true, observedMessageId: "msg_real_123", transcriptText: "t_after" };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        // Simulate native SQLite storage error
+        cb({
+          status: "error",
+          code: "storage_error",
+          message: "Database error: disk I/O failure"
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: rcptId }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "uncertain");
+    assert.equal(res.dispatchResult.outcome, "uncertain");
+    assert.equal(res.dispatchResult.reason, "storage_error");
+
+    const storedRec = harness.storageStore["receipt_" + rcptId];
+    assert.equal(
+      storedRec.deliveryStatus,
+      "dispatching/uncertain",
+      "Local status must stay dispatching/uncertain when native settlement fails with error"
+    );
+
+    console.log("  [PASS] Native settlement storage_error keeps receipt dispatching/uncertain and retains slot");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 45: Failed not-sent settlement keeps receipt dispatching/uncertain
+  //          until native authority confirms the conclusive state
+  // ---------------------------------------------------------------------------
+  {
+    const rcptId = "rcpt_not_sent_settle_err";
+    const testReceipt = {
+      receiptId: rcptId,
+      executionId: "exec_not_sent_settle_err",
+      pairingId: "pair_dispatch",
+      returnToken: "ret_not_sent_settle_err",
+      originConversationId: "c_not_sent_settle_err",
+      originConversationUrl: "https://chatgpt.com/c/c_not_sent_settle_err",
+      deliveryStatus: "received"
+    };
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_dispatch",
+        pairingSecret: "rb_sec_dispatch",
+        ["receipt_" + rcptId]: testReceipt
+      },
+      mockTabs: {
+        602: { id: 602, url: "https://chatgpt.com/c/c_not_sent_settle_err" }
+      },
+      mockTabMessages: {
+        602: (msg) => {
+          if (msg.action === "check_delivery_readiness") {
+            return {
+              ok: true,
+              documentId: "doc_not_sent_settle_err_1",
+              readiness: { ready: true, transcriptText: "t", accountText: "a" }
+            };
+          }
+          if (msg.action === "consume_grant_and_dispatch") {
+            return { ok: false, clicked: false, reason: "send_button_disabled" };
+          }
+          return { ok: false };
+        }
+      }
+    });
+
+    harness.mockChrome.runtime.sendNativeMessage = (host, msg, cb) => {
+      if (msg.op === "dispatch_fence") {
+        cb({
+          status: "ok",
+          grant: {
+            granted: true,
+            receipt_id: msg.receiptId,
+            execution_id: msg.executionId,
+            attempt_id: msg.attemptId,
+            delivery_revision: 1,
+            state: "dispatching/uncertain",
+            owner_document_id: msg.documentId
+          }
+        });
+        return;
+      }
+      if (msg.op === "settle_fence") {
+        assert.equal(msg.outcome, "not-sent", "Synchronous no-click evidence should request not-sent settlement");
+        cb({
+          status: "error",
+          code: "storage_error",
+          message: "Database error: disk I/O failure"
+        });
+        return;
+      }
+      cb({ status: "ok" });
+    };
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const res = await harness.sendMessage({ action: "dispatchReceipt", receiptId: rcptId }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.dispatchResult.status, "uncertain");
+    assert.equal(res.dispatchResult.outcome, "uncertain");
+    assert.equal(res.dispatchResult.reason, "storage_error");
+    assert.equal(
+      harness.storageStore["receipt_" + rcptId].deliveryStatus,
+      "dispatching/uncertain",
+      "Local not-sent state must not be persisted when native settlement fails"
+    );
+
+    console.log("  [PASS] Failed not-sent settlement keeps local receipt dispatching/uncertain");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 46: checkReadinessGuards blocks dispatch on raw whitespace/newline user drafts
+  // ---------------------------------------------------------------------------
+  {
+    // Whitespace-only draft (spaces and newlines) in content script composer
+    const csWsDraft = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_ws_draft",
+      userDraft: "   \n\n  \t  "
+    });
+
+    let readinessResp = null;
+    csWsDraft.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_ws_draft",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_ws_draft"
+    }, {}, (r) => { readinessResp = r; });
+
+    assert.equal(readinessResp.ok, false, "Readiness check must fail when raw whitespace draft is present");
+    assert.equal(readinessResp.readiness.ready, false);
+    assert.equal(readinessResp.readiness.reason, "unrelated_draft_present");
+    assert.equal(
+      csWsDraft.composer.value,
+      "   \n\n  \t  ",
+      "Whitespace-only user draft must remain untouched and un-trimmed"
+    );
+
+    console.log("  [PASS] checkReadinessGuards inspects raw composer text and blocks on whitespace-only user drafts");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");

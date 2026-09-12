@@ -106,10 +106,27 @@ if (-not (Test-Path -LiteralPath $debugBinary -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item -LiteralPath $debugBinary -Destination $installedBinary -Force
 
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$installDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
+try {
+    $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $false)
+    $rawUserPath = $null
+    if ($regKey) {
+        try { $rawUserPath = $regKey.GetValue("Path", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } finally { $regKey.Close() }
+    }
+} catch { $rawUserPath = $null }
+if ([string]::IsNullOrEmpty($rawUserPath)) { $rawUserPath = "" }
+    $pathEntries = @($rawUserPath -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    $alreadyPresent = @($pathEntries | Where-Object { $_.TrimEnd("\").Equals($installDir.TrimEnd("\"), [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+if (-not $alreadyPresent) {
+    $newRawPath = if ($rawUserPath -eq "") { $installDir } else { $rawUserPath.TrimEnd(';', ' ', "`t") + ";" + $installDir }
+    try {
+        $regWrite = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+        try { $regWrite.SetValue("Path", $newRawPath, [Microsoft.Win32.RegistryValueKind]::ExpandString) } finally { $regWrite.Close() }
+    } catch { throw "Failed to update user PATH in registry: $($_.Exception.Message)" }
     $env:Path = "$env:Path;$installDir"
+    Write-Host "Added to user PATH: $installDir"
+    Write-Host "Undo: remove '$installDir' from HKCU:\Environment\Path (User variables)."
+} else {
+    Write-Host "User PATH already contains: $installDir (no change)."
 }
 
 Write-Host "Registering local native host..."

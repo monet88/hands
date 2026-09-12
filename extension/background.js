@@ -158,15 +158,25 @@ async function processDrainResponse(drainResponse, stored, profileId) {
           console.error("Failed to reconstruct receipt " + rcpt.receipt_id + " from summary:", storageErr);
         }
       } else {
-        // Reconcile existing record with native durable fence if native has more recent revision, state, or URL
+        // Reconcile existing record with native durable fence. Conclusive native
+        // states (not-sent/submitted-observed) must not be masked by stale local
+        // dispatching/uncertain. Terminal local state is preserved unless native
+        // reports a newer conclusive revision. No lease, no auto-retry of uncertainty.
+        const NATIVE_CONCLUSIVE = new Set(["not-sent", "submitted-observed"]);
+        const nativeRev = rcpt.delivery_revision || 0;
+        const localRev = existing.deliveryRevision || 0;
+        const nativeConclusive = rcpt.delivery_status && NATIVE_CONCLUSIVE.has(rcpt.delivery_status);
+        const localStaleUncertain = existing.deliveryStatus === "dispatching/uncertain" || existing.deliveryStatus === "dispatching";
         let updated = false;
-        if (rcpt.delivery_revision && (existing.deliveryRevision || 0) < rcpt.delivery_revision) {
+        if (rcpt.delivery_revision && localRev < nativeRev) {
           existing.deliveryRevision = rcpt.delivery_revision;
           updated = true;
         }
         if (rcpt.delivery_status && rcpt.delivery_status !== existing.deliveryStatus) {
-          existing.deliveryStatus = rcpt.delivery_status;
-          updated = true;
+          if (localRev < nativeRev || (nativeConclusive && localStaleUncertain)) {
+            existing.deliveryStatus = rcpt.delivery_status;
+            updated = true;
+          }
         }
         if ((rcpt.origin_conversation_url || summary.origin_conversation_url) && !existing.originConversationUrl) {
           existing.originConversationUrl = rcpt.origin_conversation_url || summary.origin_conversation_url;
@@ -187,11 +197,18 @@ async function processDrainResponse(drainResponse, stored, profileId) {
     const executionReceiptKey = "rcpt_by_exec_" + rcpt.execution_id;
 
     // Prepare durable browser record: status "received" (separate from ChatGPT submission, no send permission)
-    // Preserve existing terminal delivery state if receipt is redelivered before ACK
+    // Preserve existing terminal delivery state, but never let stale local
+    // dispatching/uncertain mask a newer conclusive native state (not-sent/submitted-observed).
     const existing = (await chrome.storage.local.get([receiptStorageKey]))[receiptStorageKey];
     let receiptRecord = buildReceiptRecord(rcpt);
     if (existing && existing.deliveryStatus && existing.deliveryStatus !== "received") {
-      receiptRecord = existing;
+      const conclusiveNative = rcpt.delivery_status === "not-sent" || rcpt.delivery_status === "submitted-observed";
+      const localStale = existing.deliveryStatus === "dispatching/uncertain" || existing.deliveryStatus === "dispatching";
+      const nativeRev = rcpt.delivery_revision || 0;
+      const localRev = existing.deliveryRevision || 0;
+      if (!(conclusiveNative && (localStale || nativeRev > localRev))) {
+        receiptRecord = existing;
+      }
     }
 
     // Hard gate: Storage write MUST succeed BEFORE reporting acknowledgement to native host
@@ -515,8 +532,8 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
     }
 
     // Document definitively rejected grant or guards failed synchronously before click:
-    // Settle conclusively as not-sent so slot can be released
-    await sendNative({
+    // Settle conclusively as not-sent so slot can be released.
+    const settleResp = await sendNative({
       op: "settle_fence",
       pairingId: stored.pairingId,
       pairingSecret: stored.pairingSecret,
@@ -528,9 +545,21 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
       outcome: "not-sent",
       details: clickResp.reason || "synchronous_guard_failed"
     });
-    receiptRecord.deliveryStatus = "not-sent";
+    if (settleResp && settleResp.status === "ok" && settleResp.settlement && settleResp.settlement.settled) {
+      receiptRecord.deliveryStatus = "not-sent";
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+      return { status: "not-sent", reason: clickResp.reason };
+    }
+
+    // Native settlement is authoritative. If storage/CAS fails, retain uncertainty and the slot.
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
     await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
-    return { status: "not-sent", reason: clickResp.reason };
+    return {
+      status: "uncertain",
+      outcome: "uncertain",
+      receiptId,
+      reason: settleResp?.code || "native_settlement_failed"
+    };
   }
 
   // 5. Verify submitted user message in transcript
@@ -575,17 +604,31 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
       transcriptEvidenceHash: await sha256Hex(verifyResp.transcriptText || "")
     });
 
-    receiptRecord.deliveryStatus = "submitted-observed";
-    receiptRecord.observedMessageId = verifyResp.observedMessageId;
-    receiptRecord.settledAt = Date.now();
-    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
+    // Issue #70: Native settlement is authoritative.
+    // Only persist submitted-observed when native settlement succeeds conclusively.
+    if (settleResp && settleResp.status === "ok" && settleResp.settlement && settleResp.settlement.settled) {
+      receiptRecord.deliveryStatus = "submitted-observed";
+      receiptRecord.observedMessageId = verifyResp.observedMessageId;
+      receiptRecord.settledAt = Date.now();
+      await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
 
+      return {
+        status: "ok",
+        outcome: "submitted-observed",
+        receiptId,
+        observedMessageId: verifyResp.observedMessageId,
+        slotReleased: settleResp.settlement.slot_released
+      };
+    }
+
+    // Native storage or fence conflict failure: keep receipt uncertain and retain slot!
+    receiptRecord.deliveryStatus = "dispatching/uncertain";
+    await chrome.storage.local.set({ [receiptStorageKey]: receiptRecord });
     return {
-      status: "ok",
-      outcome: "submitted-observed",
+      status: "uncertain",
+      outcome: "uncertain",
       receiptId,
-      observedMessageId: verifyResp.observedMessageId,
-      slotReleased: settleResp?.settlement?.slot_released
+      reason: settleResp?.code || "native_settlement_failed"
     };
   } else {
     // Inconclusive outcome: retain uncertain! CAS settlement records uncertainty without releasing slot

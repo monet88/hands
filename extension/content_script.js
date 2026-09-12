@@ -19,10 +19,10 @@
   function clearComposer(composer, expectedText) {
     if (!composer) return;
     try {
-      const currentText = (composer.tagName === "TEXTAREA" ? (composer.value || "") : (composer.innerText || "")).trim();
+      const currentText = composer.tagName === "TEXTAREA" ? (composer.value || "") : (composer.innerText || "");
       // Only clear bridge-authored text if the composer still exactly equals the bridge continuation payload
-      // If the composer differs (user-edited/tampered), preserve it untouched
-      if (expectedText === undefined || currentText !== expectedText.trim()) {
+      // Raw comparison: any user edit (including leading/trailing whitespace) must be preserved untouched
+      if (typeof expectedText !== "string" || currentText !== expectedText) {
         return;
       }
       if (composer.tagName === "TEXTAREA") {
@@ -144,8 +144,8 @@
       '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
     );
     if (promptTextarea) {
-      const draftText = (promptTextarea.value !== undefined ? promptTextarea.value : promptTextarea.innerText || "").trim();
-      if (draftText.length > 0) {
+      const rawDraftText = promptTextarea.value !== undefined ? promptTextarea.value : (promptTextarea.innerText || "");
+      if (rawDraftText.length > 0) {
         return { ready: false, reason: "unrelated_draft_present", message: "User draft present in composer; preserving draft without overwrite" };
       }
     } else {
@@ -445,8 +445,8 @@
           return true;
         }
 
-        const currentComposerText = (currentComposer.tagName === "TEXTAREA" ? (currentComposer.value || "") : (currentComposer.innerText || "")).trim();
-        if (!currentComposerText || currentComposerText !== continuationText.trim()) {
+        const currentComposerText = currentComposer.tagName === "TEXTAREA" ? (currentComposer.value || "") : (currentComposer.innerText || "");
+        if (typeof continuationText !== "string" || !currentComposerText || currentComposerText !== continuationText) {
           clearComposer(currentComposer, continuationText);
           sendResponse({
             ok: false,
@@ -532,6 +532,7 @@
               }
             }
           }
+          if (found) break;
         }
 
         const transcriptText = getRenderedTranscriptText();

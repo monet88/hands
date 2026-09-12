@@ -331,6 +331,13 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
     });
     write_manifest_atomic(&manifest_path, &serde_json::to_vec_pretty(&manifest_json)?)?;
 
+    #[cfg(windows)]
+    let prior_reg_snapshot = if !opts.skip_registry {
+        Some(snapshot_manifest_registry(&browser)?)
+    } else {
+        None
+    };
+
     if !opts.skip_registry {
         #[cfg(windows)]
         {
@@ -343,19 +350,48 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
                         Err(remove_err) => Err(HostError::Io(remove_err)),
                     },
                 };
-                if let Err(restore_err) = restore_result {
-                    return Err(HostError::Registry(format!(
-                        "{}; additionally failed to restore previous manifest: {}",
-                        e, restore_err
-                    )));
+                let reg_restore = if let Some(snapshot) = &prior_reg_snapshot {
+                    restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+                } else {
+                    Ok(())
+                };
+                match (restore_result, reg_restore) {
+                    (Err(restore_err), Ok(())) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}",
+                            e, restore_err
+                        )));
+                    }
+                    (Ok(()), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to rollback registry registration: {}",
+                            e, reg_err
+                        )));
+                    }
+                    (Err(restore_err), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                            e, restore_err, reg_err
+                        )));
+                    }
+                    (Ok(()), Ok(())) => return Err(e),
                 }
-                return Err(e);
             }
         }
     }
 
-    if let Err(e) = journal.set_local_extension_id(extension_id) {
-        let _ = match previous_manifest.as_deref() {
+    // Deterministic test seam: fail after manifest/registry write to exercise rollback.
+    // Scoped to the calling state_dir so parallel tests with other temp dirs are unaffected.
+    let fault_armed = std::env::var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL")
+        .map(|v| v == "1" || v == state_dir.to_string_lossy())
+        .unwrap_or(false);
+    let journal_update_result = if fault_armed {
+        Err(HostError::Storage("injected journal update failure".to_string()))
+    } else {
+        journal.set_local_extension_id(extension_id).map_err(|e| HostError::Storage(e.to_string()))
+    };
+    if let Err(e) = journal_update_result {
+        let restore_result = match previous_manifest.as_deref() {
             Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
             None => match std::fs::remove_file(&manifest_path) {
                 Ok(()) => Ok(()),
@@ -363,7 +399,35 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
                 Err(remove_err) => Err(HostError::Io(remove_err)),
             },
         };
-        return Err(HostError::Storage(e.to_string()));
+        #[cfg(windows)]
+        let registry_rollback: Result<(), String> = if let Some(snapshot) = &prior_reg_snapshot {
+            restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+        } else {
+            Ok(())
+        };
+        #[cfg(not(windows))]
+        let registry_rollback: Result<(), String> = Ok(());
+        match (restore_result, registry_rollback) {
+            (Ok(()), Ok(())) => return Err(e),
+            (Err(restore_err), Ok(())) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}",
+                    e, restore_err
+                )))
+            }
+            (Ok(()), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to rollback registry registration: {}",
+                    e, reg_err
+                )))
+            }
+            (Err(restore_err), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                    e, restore_err, reg_err
+                )))
+            }
+        }
     }
     Ok(LocalInitResult {
         browser,
@@ -557,31 +621,105 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 }
 
 #[cfg(windows)]
-pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
-    let reg_keys = match browser.to_lowercase().as_str() {
+pub fn manifest_registry_keys(browser: &str) -> Vec<String> {
+    let host_name = std::env::var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST_NAME.to_string());
+
+    match browser.to_lowercase().as_str() {
         "edge" => vec![format!(
             r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "chrome" => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "all" | "both" => vec![
             format!(
                 r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
             format!(
                 r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
         ],
         _ => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
-    };
+    }
+}
+
+#[cfg(windows)]
+pub fn snapshot_manifest_registry(browser: &str) -> Result<Vec<(String, Option<String>)>, HostError> {
+    let keys = manifest_registry_keys(browser);
+    let mut snapshot = Vec::new();
+    for key in keys {
+        let output = Command::new("reg.exe").args(["query", &key, "/ve"]).output()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut val_opt = Some(String::new());
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains("REG_SZ") {
+                    if let Some(pos) = trimmed.find("REG_SZ") {
+                        let raw_val = trimmed[pos + "REG_SZ".len()..].trim();
+                        val_opt = Some(raw_val.to_string());
+                        break;
+                    }
+                }
+            }
+            snapshot.push((key, val_opt));
+        } else {
+            // Key does not exist prior to registration
+            snapshot.push((key, None));
+        }
+    }
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+pub fn restore_manifest_registry_snapshot(snapshot: &[(String, Option<String>)]) -> Result<(), HostError> {
+    for (key, val_opt) in snapshot {
+        match val_opt {
+            Some(prev_val) => {
+                // Key existed before: restore its prior default value
+                let output = Command::new("reg.exe")
+                    .args(["add", key, "/ve", "/t", "REG_SZ", "/d", prev_val, "/f"])
+                    .output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr);
+                    return Err(HostError::Registry(format!(
+                        "reg.exe add restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+            None => {
+                // Key did not exist before: delete the newly created key
+                let output = Command::new("reg.exe").args(["delete", key, "/f"]).output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if err_msg.contains("unable to find") || err_msg.contains("was not found") {
+                        continue;
+                    }
+                    return Err(HostError::Registry(format!(
+                        "reg.exe delete restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
+    let reg_keys = manifest_registry_keys(browser);
 
     for key in reg_keys {
         let manifest_str = manifest_path.to_string_lossy();
@@ -600,6 +738,7 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 
     Ok(())
 }
+
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
     let state_dir = resolve_state_dir(state_dir_opt)?;

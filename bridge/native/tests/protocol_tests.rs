@@ -1413,6 +1413,17 @@ fn test_exact_supported_omp_version_matching() {
     assert!(!is_supported_omp_version("omp/"));
     assert!(!is_supported_omp_version("omp/abc"));
     assert!(!is_supported_omp_version("omp/18.1.16 extra"));
+    // Strict core: reject prerelease, extra components, whitespace/garbage;
+    // build metadata accepted only with exact 3-part numeric core.
+    assert!(!is_supported_omp_version("omp/18.1.16-rc.1"));
+    assert!(!is_supported_omp_version("omp/18.1.16-0"));
+    assert!(!is_supported_omp_version("omp/18.1.16.1"));
+    assert!(!is_supported_omp_version("omp/18.1"));
+    assert!(!is_supported_omp_version("omp/18.1.16+"));
+    assert!(!is_supported_omp_version("omp/18.1.16++meta"));
+    assert!(!is_supported_omp_version("omp/18.1.16\nmultiline"));
+    assert!(is_supported_omp_version("omp/18.1.16+build.1"));
+    assert!(is_supported_omp_version("omp/18.1.18+20260912"));
     assert!(!is_supported_omp_version(""));
 }
 

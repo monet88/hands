@@ -67,11 +67,27 @@ pub fn is_supported_omp_version(output: &str) -> bool {
 }
 
 fn parse_omp_version_tuple(version_str: &str) -> Option<(u64, u64, u64)> {
-    let base_ver = version_str.split('-').next()?.split('+').next()?;
-    let mut parts = base_ver.split('.');
+    // Reject prerelease channel outright (e.g. 18.1.16-rc.1). Build metadata
+    // (+...) is tolerated only when the core remains exactly 3 numeric parts.
+    if version_str.contains('-') {
+        return None;
+    }
+    let (core, build) = match version_str.split_once('+') {
+        Some((core, build)) => (core, Some(build)),
+        None => (version_str, None),
+    };
+    if let Some(build) = build {
+        if build.is_empty() || build.contains('+') {
+            return None;
+        }
+    }
+    let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next()?.parse::<u64>().ok()?;
     let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some((major, minor, patch))
 }
 
