@@ -27,7 +27,7 @@
 
   function getRenderedTranscriptText() {
     const turnSelectors = [
-      'main div[data-testid^="conversation-turn"]',
+      'main [data-testid^="conversation-turn"]',
       'article',
       '[data-message-author-role]'
     ];
@@ -54,31 +54,48 @@
   }
 
   function getAccountContextText() {
-    const accountNodes = document.querySelectorAll(
-      '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]'
-    );
+    const accountSelectors = [
+      '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]',
+      '[aria-label*="profile menu" i]'
+    ];
+
     let accountText = "";
-    for (const node of accountNodes) {
-      const candidate = (node?.innerText || "").trim();
-      if (candidate) {
-        accountText = candidate;
-        break;
+    for (const selector of accountSelectors) {
+      const accountNodes = document.querySelectorAll(selector);
+      for (const node of accountNodes) {
+        const visibleText = (node?.innerText || "").trim();
+        if (visibleText) {
+          accountText = visibleText;
+          break;
+        }
+        const rawAriaLabel = (node?.getAttribute?.("aria-label") || "").trim();
+        const cleanedAriaLabel = rawAriaLabel
+          .replace(/\s*,\s*open profile menu\s*$/i, "")
+          .trim();
+        if (cleanedAriaLabel && !/^open profile menu$/i.test(cleanedAriaLabel)) {
+          accountText = cleanedAriaLabel;
+          break;
+        }
       }
+      if (accountText) break;
     }
+
     return accountText;
   }
 
   function checkReadinessGuards(expectedConversationId, expectedConversationUrl) {
     // 1. Navigation / Route change check
     const currentUrl = window.location.href.split("#")[0].split("?")[0];
-    if (currentUrl !== SCRIPT_LOADED_URL || currentUrl !== expectedConversationUrl) {
-      return { ready: false, reason: "navigation_invalidated", message: "Document URL or route changed since script load" };
+    if (currentUrl !== SCRIPT_LOADED_URL) {
+      return { ready: false, reason: "navigation_invalidated", message: "Document URL changed since script load" };
     }
     const currentConvId = getCanonicalConversationId();
     if (!currentConvId || currentConvId !== expectedConversationId) {
       return { ready: false, reason: "conversation_mismatch", message: "Page is not the expected canonical conversation" };
     }
-
+    if (expectedConversationUrl && currentUrl !== expectedConversationUrl && !currentUrl.endsWith(`/c/${expectedConversationId}`)) {
+      return { ready: false, reason: "conversation_mismatch", message: "Page URL does not match expected conversation" };
+    }
     // 2. Loading / Login / Error page check
     if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
       return { ready: false, reason: "login_or_error_page", message: "Page shows login or error state" };
@@ -196,8 +213,9 @@
 
     // Op 3: Consume Grant and Synchronous Guard-and-Click
     if (request.action === "consume_grant_and_dispatch") {
-      try {
-        const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, continuationText, receiptMarker } = request;
+      (async () => {
+        try {
+          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, continuationText, receiptMarker } = request;
 
         // Document Identity Check: grant is bound to this specific document
         if (expectedDocumentId !== DOCUMENT_ID) {
@@ -236,37 +254,63 @@
           return true;
         }
 
-        // Locate composer and send button
+        // Locate composer
         const composer = document.querySelector(
           '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
         );
-        const sendBtn = document.querySelector(
-          'button[data-testid="send-button"], button[aria-label*="Send prompt"], button[data-testid="fruitjuice-send-button"]'
-        );
-
-        if (!composer || !sendBtn) {
+        if (!composer) {
           sendResponse({
             ok: false,
             clicked: false,
             reason: "composer_elements_missing",
-            message: "Composer or send button missing at dispatch moment"
+            message: "Composer element missing at dispatch moment"
           });
           return true;
         }
 
-        // Synchronously populate continuation payload into composer
+        // Populate continuation payload into composer
         if (composer.tagName === "TEXTAREA") {
           composer.value = continuationText;
           composer.dispatchEvent(new Event("input", { bubbles: true }));
           composer.dispatchEvent(new Event("change", { bubbles: true }));
         } else if (composer.isContentEditable) {
-          composer.innerText = continuationText;
-          composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: continuationText }));
+          composer.focus();
+          try {
+            composer.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: continuationText }));
+          } catch {}
+          let inserted = false;
+          try {
+            inserted = document.execCommand("insertText", false, continuationText);
+          } catch {}
+          if (!inserted || !composer.innerText.trim()) {
+            composer.innerText = continuationText;
+          }
+          try {
+            composer.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: continuationText }));
+          } catch {}
         }
 
-        // Synchronously click send button
-        sendBtn.click();
+        // Locate send button (mounted/enabled upon text input)
+        const sendBtnSelector = 'button[data-testid="send-button"], button[aria-label*="Send prompt" i], button[data-testid="fruitjuice-send-button"], #composer-submit-button';
+        let sendBtn = document.querySelector(sendBtnSelector);
+        if (!sendBtn) {
+          for (let i = 0; i < 5 && !sendBtn; i++) {
+            await new Promise((res) => setTimeout(res, 60));
+            sendBtn = document.querySelector(sendBtnSelector);
+          }
+        }
 
+        if (!sendBtn) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "composer_elements_missing",
+            message: "Send button missing or not mounted after text insertion"
+          });
+          return true;
+        }
+
+        sendBtn.click();
         sendResponse({
           ok: true,
           clicked: true,
@@ -274,14 +318,15 @@
           attemptId,
           receiptMarker
         });
-      } catch (err) {
-        sendResponse({
-          ok: false,
-          clicked: false,
-          reason: "click_execution_failed",
-          message: String(err)
-        });
-      }
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            clicked: false,
+            reason: "click_execution_failed",
+            message: String(err)
+          });
+        }
+      })();
       return true;
     }
 
@@ -302,7 +347,7 @@
         // Look for user messages containing the stable receiptMarker
         const userMessageSelectors = [
           '[data-message-author-role="user"]',
-          'main div[data-testid^="conversation-turn"]:has([data-message-author-role="user"])',
+          'main [data-testid^="conversation-turn"]:has([data-message-author-role="user"])',
           'div[data-message-author-role="user"]'
         ];
         let found = null;

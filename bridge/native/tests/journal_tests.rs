@@ -1264,7 +1264,7 @@ fn test_journal_drain_and_ack_completion_receipts() {
         policy_revision: "v1".into(),
         prompt_text: "task 2".into(),
     };
-    let claim_2 = journal.reserve_or_claim_launch(&params_2).unwrap();
+    let _claim_2 = journal.reserve_or_claim_launch(&params_2).unwrap();
 
     // Before receipt commit: drain for pairing 1 returns summaries but 0 receipts
     let (summaries_pre, receipts_pre) = journal.drain_records(pairing_id_1, None).unwrap();
@@ -1638,4 +1638,131 @@ fn test_concurrent_dual_native_hosts_competing_on_same_receipt_and_conversation(
         assert!(res2.granted);
         assert_eq!(res1.owner_document_id, "doc_host_2");
     }
+}
+
+#[test]
+fn test_dynamic_targets_add_remove_list() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).expect("Failed to open journal");
+
+    let pairing_id = "pair_dynamic_targets";
+    let bootstrap_token = "boot_dyn_123";
+    let browser = "chrome";
+    let profile_id = "profile_dyn";
+
+    let target1_dir = tempdir().unwrap();
+    init_git_repo(target1_dir.path());
+    let target1_path = target1_dir.path().canonicalize().unwrap().to_str().unwrap().to_string();
+
+    let targets = vec![TargetRecord {
+        target_id: "target_1".to_string(),
+        canonical_path: target1_path.clone(),
+        name: "repo1".to_string(),
+    }];
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, browser, profile_id, &targets, &policy)
+        .unwrap();
+
+    // Adding target to non-existent or inactive pairing fails
+    let target2_dir = tempdir().unwrap();
+    init_git_repo(target2_dir.path());
+    let target2_path = target2_dir.path().canonicalize().unwrap().to_str().unwrap().to_string();
+    let target2 = TargetRecord {
+        target_id: "target_2".to_string(),
+        canonical_path: target2_path.clone(),
+        name: "repo2".to_string(),
+    };
+
+    let err_add_inactive = journal.add_target_admin(pairing_id, &target2);
+    assert_eq!(err_add_inactive.unwrap_err(), PairingError::NotActive);
+
+    // Activate pairing
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    let secret = activated.pairing_secret;
+
+    // Now add target2 succeeds
+    journal.add_target_admin(pairing_id, &target2).unwrap();
+
+    // Listing targets returns both target_1 and target_2
+    let cur_targets = journal.get_targets(pairing_id).unwrap();
+    assert_eq!(cur_targets.len(), 2);
+    assert_eq!(cur_targets[0].target_id, "target_1");
+    assert_eq!(cur_targets[1].target_id, "target_2");
+
+    // Adding third target
+    let target3_dir = tempdir().unwrap();
+    init_git_repo(target3_dir.path());
+    let target3_path = target3_dir.path().canonicalize().unwrap().to_str().unwrap().to_string();
+    let target3 = TargetRecord {
+        target_id: "target_3".to_string(),
+        canonical_path: target3_path.clone(),
+        name: "repo3".to_string(),
+    };
+    journal.add_target_admin(pairing_id, &target3).unwrap();
+    assert_eq!(journal.get_targets(pairing_id).unwrap().len(), 3);
+
+    // Remove target_2
+    journal.remove_target_admin(pairing_id, "target_2").unwrap();
+    let cur_after_remove = journal.get_targets(pairing_id).unwrap();
+    assert_eq!(cur_after_remove.len(), 2);
+    assert!(!cur_after_remove.iter().any(|t| t.target_id == "target_2"));
+
+    // Removing non-existent target fails with TargetNotFound
+    let err_remove = journal.remove_target_admin(pairing_id, "target_nonexistent");
+    assert_eq!(err_remove.unwrap_err(), PairingError::TargetNotFound);
+
+    // Invariant: Allow removing the last target without revoking pairing
+    journal.remove_target_admin(pairing_id, "target_1").unwrap();
+    journal.remove_target_admin(pairing_id, "target_3").unwrap();
+    let empty_targets = journal.get_targets(pairing_id).unwrap();
+    assert_eq!(empty_targets.len(), 0);
+
+    // Pairing is still active!
+    let auth = journal.authenticate_pairing(pairing_id, &secret, profile_id).unwrap();
+    assert_eq!(auth.status, PairingStatus::Active);
+    assert_eq!(auth.targets.len(), 0);
+}
+#[test]
+fn test_local_mode_pairing_is_idempotent_and_preserves_targets() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    journal.ensure_local_pairing().unwrap();
+    let ctx = journal
+        .authenticate_pairing("local", "local", "local")
+        .unwrap();
+    assert_eq!(ctx.status, PairingStatus::Active);
+    assert_eq!(ctx.policy_revision, "v1");
+    assert_eq!(ctx.policy.tool_policy, "standard");
+    assert_eq!(ctx.policy.approval_policy, "prompt");
+    assert!(ctx.targets.is_empty());
+
+    let target = TargetRecord {
+        target_id: "repo_a".to_string(),
+        canonical_path: "C:\\repo_a".to_string(),
+        name: "repo_a".to_string(),
+    };
+    journal.add_target_admin("local", &target).unwrap();
+
+    journal.ensure_local_pairing().unwrap();
+    let ctx2 = journal
+        .authenticate_pairing("local", "local", "local")
+        .unwrap();
+    assert_eq!(ctx2.targets.len(), 1);
+    assert_eq!(ctx2.targets[0].target_id, "repo_a");
+
+    journal.set_local_extension_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    journal.set_local_extension_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
 }

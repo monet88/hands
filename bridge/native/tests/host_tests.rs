@@ -2,9 +2,10 @@ use std::process::Command;
 use tempfile::tempdir;
 
 use hands_return_bridge::host::{
-    HostError, SetupOptions, execute_setup, resolve_state_dir, run_native_host,
+    HostError, LocalInitOptions, SetupOptions, execute_local_init, execute_setup, resolve_state_dir,
+    run_native_host,
 };
-use hands_return_bridge::journal::{Journal, PairingStatus};
+use hands_return_bridge::journal::{Journal, PairingStatus, LOCAL_PAIRING_ID};
 use hands_return_bridge::protocol::TRUST_NOTICE;
 
 fn init_git_repo(path: &std::path::Path) {
@@ -66,6 +67,39 @@ fn test_setup_flow_with_isolated_state_dir() {
     let manifest_content = std::fs::read_to_string(&manifest_path).unwrap();
     assert!(manifest_content.contains("com.hands.return_bridge"));
     assert!(manifest_content.contains("test_ext_id_123"));
+}
+
+#[test]
+fn test_local_init_creates_active_local_host_without_bootstrap() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let extension_id = "abcdefghijklmnopabcdefghijklmnop";
+
+    let result = execute_local_init(&LocalInitOptions {
+        browser: "chrome".to_string(),
+        extension_id: extension_id.to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    })
+    .expect("local init failed");
+
+    assert_eq!(result.browser, "chrome");
+    assert_eq!(result.extension_id, extension_id);
+    assert_eq!(result.pairing_id, LOCAL_PAIRING_ID);
+
+    let journal = Journal::open(&state_dir.join("journal.sqlite")).unwrap();
+    assert_eq!(
+        journal.get_pairing_status(LOCAL_PAIRING_ID).unwrap(),
+        PairingStatus::Active
+    );
+    assert_eq!(
+        journal.get_expected_extension_id().unwrap().as_deref(),
+        Some(extension_id)
+    );
+
+    let manifest = std::fs::read_to_string(&result.manifest_path).unwrap();
+    assert!(manifest.contains("com.hands.return_bridge"));
+    assert!(manifest.contains(extension_id));
 }
 
 #[test]
@@ -598,4 +632,150 @@ fn test_failed_setup_does_not_clear_sticky_extension_authority() {
     let _ = std::fs::remove_dir_all(&manifest_path);
     let res_retry = execute_setup(&opts_failing);
     assert!(res_retry.is_ok(), "Retry with same extension ID must succeed");
+}
+
+#[test]
+fn test_host_target_add_remove_list_flow() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+
+    let target1_dir = tempdir().unwrap();
+    init_git_repo(target1_dir.path());
+    let target1_path = target1_dir.path().to_str().unwrap().to_string();
+
+    // Setup active pairing
+    let opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_host_t".to_string(),
+        target_path: target1_path,
+        target_id: Some("target_1".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_host_t".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+    let setup_res = execute_setup(&opts).unwrap();
+
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    // Target CLI on pending pairing fails with NotActive
+    let target2_dir = tempdir().unwrap();
+    init_git_repo(target2_dir.path());
+    let target2_path = target2_dir.path().to_str().unwrap().to_string();
+
+    use hands_return_bridge::host::{
+        TargetAddOptions, TargetListOptions, TargetRemoveOptions,
+        execute_target_add, execute_target_list, execute_target_remove,
+    };
+
+    let add_opts = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target2_path.clone(),
+        target_id: Some("target_2".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let add_pending_err = execute_target_add(&add_opts);
+    assert!(add_pending_err.is_err());
+
+    // Activate pairing
+    journal.activate_bootstrap(&setup_res.bootstrap_token, "profile_host_t").unwrap();
+
+    let blank_target_id = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target2_path.clone(),
+        target_id: Some("   \t".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let blank_target_err = execute_target_add(&blank_target_id)
+        .expect_err("Explicit whitespace target ID must be rejected");
+    assert!(blank_target_err.to_string().contains("--target-id"));
+
+    let blank_pairing_id = TargetListOptions {
+        pairing_id: Some("   \t".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let blank_pairing_err = execute_target_list(&blank_pairing_id)
+        .expect_err("Explicit whitespace pairing ID must be rejected");
+    assert!(blank_pairing_err.to_string().contains("--pairing-id"));
+
+    // Now add target_2 succeeds
+    let added = execute_target_add(&add_opts).expect("execute_target_add failed");
+    assert_eq!(added.target_id, "target_2");
+
+    // A target ID is a stable workspace identity. Reusing it for another repo must not
+    // silently redirect existing browser conversation bindings to the new path.
+    let target3_dir = tempdir().unwrap();
+    init_git_repo(target3_dir.path());
+    let retarget_opts = TargetAddOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        target_path: target3_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("target_2".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let retarget_err = execute_target_add(&retarget_opts)
+        .expect_err("Existing target_id must not be rebound to a different workspace");
+    assert!(retarget_err.to_string().contains("target_id_conflict"));
+
+    // List targets
+    let list_opts = TargetListOptions {
+        pairing_id: Some(setup_res.pairing_id.clone()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let list = execute_target_list(&list_opts).expect("execute_target_list failed");
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].target_id, "target_1");
+    assert_eq!(list[1].target_id, "target_2");
+    assert_eq!(list[1].canonical_path, added.canonical_path);
+
+    // Add target with invalid non-git path fails
+    let non_git_dir = tempdir().unwrap();
+    let add_invalid = TargetAddOptions {
+        pairing_id: None, // Auto-resolves the single active pairing
+        target_path: non_git_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("invalid_target".to_string()),
+        state_dir: Some(state_dir.clone()),
+    };
+    let invalid_err = execute_target_add(&add_invalid);
+    assert!(invalid_err.is_err());
+
+    // Remove target_1
+    let rm_opts = TargetRemoveOptions {
+        pairing_id: None,
+        target_id: "target_1".to_string(),
+        state_dir: Some(state_dir.clone()),
+    };
+    execute_target_remove(&rm_opts).expect("execute_target_remove failed");
+
+    let list_after_rm = execute_target_list(&list_opts).expect("execute_target_list failed");
+    assert_eq!(list_after_rm.len(), 1);
+    assert_eq!(list_after_rm[0].target_id, "target_2");
+
+    // Once more than one pairing is active, local target administration must not guess.
+    let second_setup = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "profile_host_t_2".to_string(),
+        target_path: target3_dir.path().to_str().unwrap().to_string(),
+        target_id: Some("target_other_pairing".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_host_t".to_string(),
+        state_dir: Some(state_dir.clone()),
+        skip_registry: true,
+    };
+    let second_setup_res = execute_setup(&second_setup).expect("second setup failed");
+    journal
+        .activate_bootstrap(&second_setup_res.bootstrap_token, "profile_host_t_2")
+        .unwrap();
+
+    let ambiguous_list = TargetListOptions {
+        pairing_id: None,
+        state_dir: Some(state_dir.clone()),
+    };
+    let ambiguous_err = execute_target_list(&ambiguous_list)
+        .expect_err("Multiple active pairings must require an explicit --pairing-id");
+    assert!(ambiguous_err.to_string().contains("Multiple active pairings"));
 }

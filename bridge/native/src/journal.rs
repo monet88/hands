@@ -6,6 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub const LOCAL_PAIRING_ID: &str = "local";
+pub const LOCAL_PAIRING_SECRET: &str = "local";
+pub const LOCAL_PROFILE_ID: &str = "local";
+pub const LOCAL_POLICY_REVISION: &str = "v1";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetRecord {
     pub target_id: String,
@@ -570,6 +575,78 @@ impl Journal {
         Ok(res)
     }
 
+    pub fn set_local_extension_id(&self, extension_id: &str) -> Result<(), PairingError> {
+        let extension_id = extension_id.trim();
+        if extension_id.is_empty() {
+            return Err(PairingError::StorageError(
+                "extension_id must not be empty".to_string(),
+            ));
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+            INSERT INTO host_config (key, value)
+            VALUES ('expected_extension_id', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![extension_id],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn ensure_local_pairing(&self) -> Result<(), PairingError> {
+        let now = now_epoch_secs();
+        let secret_hash = hash_secret(LOCAL_PAIRING_SECRET);
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.execute(
+            r#"
+            INSERT INTO pairings (
+                pairing_id, bootstrap_token_hash, pairing_secret_hash,
+                browser, profile_id, status, policy_revision,
+                created_at, updated_at
+            ) VALUES (?1, NULL, ?2, 'chrome', ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(pairing_id) DO UPDATE SET
+                bootstrap_token_hash = NULL,
+                pairing_secret_hash = excluded.pairing_secret_hash,
+                browser = excluded.browser,
+                profile_id = excluded.profile_id,
+                status = excluded.status,
+                policy_revision = excluded.policy_revision,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                LOCAL_PAIRING_ID,
+                secret_hash,
+                LOCAL_PROFILE_ID,
+                PairingStatus::Active.as_str(),
+                LOCAL_POLICY_REVISION,
+                now,
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.execute(
+            r#"
+            INSERT INTO policies (pairing_id, policy_revision, tool_policy, approval_policy)
+            VALUES (?1, ?2, 'standard', 'prompt')
+            ON CONFLICT(pairing_id, policy_revision) DO UPDATE SET
+                tool_policy = excluded.tool_policy,
+                approval_policy = excluded.approval_policy
+            "#,
+            params![LOCAL_PAIRING_ID, LOCAL_POLICY_REVISION],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn create_bootstrap(
         &self,
         pairing_id: &str,
@@ -647,6 +724,13 @@ impl Journal {
 
     pub fn get_pairing_status(&self, pairing_id: &str) -> Result<PairingStatus, PairingError> {
         let conn = self.conn.lock();
+        Self::get_pairing_status_inner(&conn, pairing_id)
+    }
+
+    fn get_pairing_status_inner(
+        conn: &Connection,
+        pairing_id: &str,
+    ) -> Result<PairingStatus, PairingError> {
         let status_str: Option<String> = conn
             .query_row(
                 "SELECT status FROM pairings WHERE pairing_id = ?1",
@@ -864,6 +948,99 @@ impl Journal {
 
         if affected == 0 {
             Err(PairingError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn get_active_pairing_ids(&self) -> Result<Vec<String>, PairingError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT pairing_id
+                FROM pairings
+                WHERE status = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![PairingStatus::Active.as_str()], |r| r.get(0))
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|e| PairingError::StorageError(e.to_string()))?);
+        }
+        Ok(ids)
+    }
+
+    pub fn add_target_admin(
+        &self,
+        pairing_id: &str,
+        target: &TargetRecord,
+    ) -> Result<(), PairingError> {
+        let conn = self.conn.lock();
+        let status = Self::get_pairing_status_inner(&conn, pairing_id)?;
+        if status != PairingStatus::Active {
+            return Err(PairingError::NotActive);
+        }
+
+        let existing_path: Option<String> = conn
+            .query_row(
+                "SELECT canonical_path FROM targets WHERE pairing_id = ?1 AND target_id = ?2",
+                params![pairing_id, &target.target_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if let Some(existing_path) = existing_path {
+            if existing_path == target.canonical_path {
+                return Ok(());
+            }
+            return Err(PairingError::StorageError(format!(
+                "target_id_conflict: '{}' is already bound to '{}'",
+                target.target_id, existing_path
+            )));
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO targets (pairing_id, target_id, canonical_path, name)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                pairing_id,
+                target.target_id,
+                target.canonical_path,
+                target.name
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn remove_target_admin(
+        &self,
+        pairing_id: &str,
+        target_id: &str,
+    ) -> Result<(), PairingError> {
+        let conn = self.conn.lock();
+        let status = Self::get_pairing_status_inner(&conn, pairing_id)?;
+        if status != PairingStatus::Active {
+            return Err(PairingError::NotActive);
+        }
+        let affected = conn
+            .execute(
+                r#"
+                DELETE FROM targets
+                WHERE pairing_id = ?1 AND target_id = ?2
+                "#,
+                params![pairing_id, target_id],
+            )
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        if affected == 0 {
+            Err(PairingError::TargetNotFound)
         } else {
             Ok(())
         }

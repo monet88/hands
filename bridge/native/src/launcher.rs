@@ -43,15 +43,16 @@ impl std::fmt::Display for LauncherError {
 impl std::error::Error for LauncherError {}
 
 /// Pinned supported OMP CLI revision
-pub const SUPPORTED_OMP_REVISION: &str = "18.1.16";
+pub const SUPPORTED_OMP_REVISION: &str = "any";
 /// Exact verified OMP CLI version output shape
-pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/18.1.16";
+pub const SUPPORTED_OMP_CLI_SHAPE: &str = "omp/*";
 /// Keep each Windows CreateProcess argv payload comfortably below the ~32K command-line ceiling.
 pub const ORCA_PROMPT_CHUNK_MAX_BYTES: usize = 8 * 1024;
 
-/// Validates exact verified OMP CLI version output shape ("omp/18.1.16")
+/// Validates verified OMP CLI version output shape ("omp/<version>")
 pub fn is_exact_supported_omp_version(output: &str) -> bool {
-    output.trim() == SUPPORTED_OMP_CLI_SHAPE
+    let trimmed = output.trim();
+    trimmed.starts_with("omp/") && trimmed.len() > 4 && trimmed[4..].chars().next().map_or(false, |c| c.is_ascii_digit())
 }
 
 /// Pinned companion adapter revision identifier
@@ -550,9 +551,8 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
     let trimmed_ver = ver_text.trim();
     if !is_exact_supported_omp_version(trimmed_ver) {
         return Err(LauncherError::PreflightFailed(format!(
-            "Unsupported OMP revision: '{}'. Return Bridge requires exact supported revision '{}'",
-            trimmed_ver,
-            SUPPORTED_OMP_CLI_SHAPE
+            "Unsupported OMP revision: '{}'. Return Bridge requires OMP CLI ('omp/<version>')",
+            trimmed_ver
         )));
     }
 

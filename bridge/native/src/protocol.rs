@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 
 use crate::host::resolve_state_dir;
 use crate::journal::{
-    Journal, LaunchRequestParams, PairingError,
+    Journal, LaunchRequestParams, PairingError, LOCAL_PAIRING_ID,
+    LOCAL_PAIRING_SECRET, LOCAL_PROFILE_ID,
 };
 use crate::launcher::{
     build_omp_startup_command_with_env, ensure_adapter_file, launch_orca_terminal,
@@ -180,11 +181,12 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
         }
     };
 
-    // Check for unauthorized browser overrides:
-    // Browser messages cannot register or replace targets, policy, executable, adapter, argv, environment, or extra providers.
+    // Keep execution/runtime and target overrides unavailable.
+    // The browser must never register arbitrary filesystem paths or mutate the target registry.
     const FORBIDDEN_FIELDS: &[&str] = &[
         "targets",
         "target",
+        "targetPath",
         "canonicalPath",
         "policy",
         "policyRevision",
@@ -223,6 +225,7 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
 
     // Strict per-op field allowlists: reject unknown, unapproved, or filesystem/command fields
     let allowed_fields: &[&str] = match op {
+        "local_status" => &["op"],
         "setup" => &["op", "bootstrapToken", "profileId"],
         "connect" | "status" | "revoke" => &["op", "pairingId", "pairingSecret", "profileId"],
         "launch" => &[
@@ -314,6 +317,23 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
     }
 
     match op {
+        "local_status" => match journal.authenticate_pairing(
+            LOCAL_PAIRING_ID,
+            LOCAL_PAIRING_SECRET,
+            LOCAL_PROFILE_ID,
+        ) {
+            Ok(ctx) => json!({
+                "status": "ok",
+                "pairingId": ctx.pairing_id,
+                "profileId": ctx.profile_id,
+                "pairingStatus": ctx.status.as_str(),
+                "taskExecutionAvailable": true,
+                "targetsCount": ctx.targets.len(),
+                "targets": ctx.targets,
+                "policyRevision": ctx.policy_revision,
+            }),
+            Err(e) => map_pairing_error(e),
+        },
         "setup" => {
             let bootstrap_token = match obj.get("bootstrapToken").and_then(|v| v.as_str()) {
                 Some(t) if !t.trim().is_empty() => t.trim(),
@@ -384,6 +404,7 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                     "pairingStatus": ctx.status.as_str(),
                     "taskExecutionAvailable": true,
                     "targetsCount": ctx.targets.len(),
+                    "targets": ctx.targets,
                     "policyRevision": ctx.policy_revision,
                     "trustNotice": TRUST_NOTICE
                 }),

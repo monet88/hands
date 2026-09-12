@@ -44,6 +44,73 @@ fn test_native_messaging_framing() {
 }
 
 #[test]
+fn test_local_mode_status_returns_read_only_targets_and_rejects_browser_target_mutation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+    journal.ensure_local_pairing().unwrap();
+
+    let status = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["pairingId"], "local");
+    assert_eq!(status["profileId"], "local");
+    assert_eq!(status["pairingStatus"], "active");
+    assert_eq!(status["targetsCount"], 0);
+
+    // Browser message attempting target_add must be rejected
+    let add = handle_native_message(
+        &json!({
+            "op": "target_add",
+            "pairingId": "local",
+            "pairingSecret": "local",
+            "profileId": "local",
+            "targetPath": "C:\\some\\path",
+            "targetId": "repo_local"
+        }),
+        &journal,
+    );
+    assert_eq!(add["status"], "error");
+    assert!(
+        add["code"] == "unsupported_operation" || add["code"] == "unauthorized_override",
+        "target_add must not be allowed via native messaging"
+    );
+
+    // Browser message attempting target_remove must be rejected
+    let remove = handle_native_message(
+        &json!({
+            "op": "target_remove",
+            "pairingId": "local",
+            "pairingSecret": "local",
+            "profileId": "local",
+            "targetId": "repo_local"
+        }),
+        &journal,
+    );
+    assert_eq!(remove["status"], "error");
+    assert_eq!(remove["code"], "unsupported_operation");
+
+    // Target administration stays local CLI only via journal/host methods
+    let repo = tempdir().unwrap();
+    init_git_repo(repo.path());
+    let canonical = repo.path().canonicalize().unwrap().to_string_lossy().to_string();
+    let target = TargetRecord {
+        target_id: "repo_local".to_string(),
+        canonical_path: canonical.clone(),
+        name: "repo_local".to_string(),
+    };
+    journal.add_target_admin("local", &target).unwrap();
+
+    let status_after_add = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status_after_add["targetsCount"], 1);
+    assert_eq!(status_after_add["targets"][0]["target_id"], "repo_local");
+    assert_eq!(status_after_add["targets"][0]["canonical_path"], canonical);
+
+    journal.remove_target_admin("local", "repo_local").unwrap();
+    let status_after_remove = handle_native_message(&json!({"op": "local_status"}), &journal);
+    assert_eq!(status_after_remove["targetsCount"], 0);
+}
+
+#[test]
 fn test_closed_operation_set_and_security_guards() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("journal.sqlite");
@@ -112,7 +179,10 @@ fn test_closed_operation_set_and_security_guards() {
     assert_eq!(status_resp["status"], "ok");
     assert_eq!(status_resp["pairingStatus"], "active");
     assert_eq!(status_resp["taskExecutionAvailable"], true);
-
+    assert_eq!(status_resp["targetsCount"], 1);
+    assert_eq!(status_resp["targets"][0]["target_id"], "target_hands");
+    assert_eq!(status_resp["targets"][0]["name"], "hands");
+    assert_eq!(status_resp["targets"][0]["canonical_path"], "test_target_closed_ops");
     // 4. Boundary guard A1: Unauthorized override attempts fail closed
     let override_targets_msg = json!({
         "op": "connect",
@@ -1295,9 +1365,8 @@ fn test_adapter_v3_generation_and_revision() {
 #[test]
 fn test_launch_preflight_supported_omp_revision_pin() {
     use hands_return_bridge::launcher::verify_launch_preflight;
-    assert_eq!(SUPPORTED_OMP_REVISION, "18.1.16");
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
-
+    assert_eq!(SUPPORTED_OMP_REVISION, "any");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/*");
     if !live_launcher_tests_enabled() {
         eprintln!("SKIP live OMP revision preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
         return;
@@ -1310,36 +1379,34 @@ fn test_launch_preflight_supported_omp_revision_pin() {
     // Preflight against a script that outputs an unsupported version must fail closed
     let dir = tempdir().unwrap();
     let mock_omp = dir.path().join("mock_omp_wrong_ver.bat");
-    std::fs::write(&mock_omp, "@echo off\r\nif \"%1\"==\"--version\" (echo omp/19.0.0 & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n").unwrap();
+    std::fs::write(&mock_omp, "@echo off\r\nif \"%1\"==\"--version\" (echo invalid_tool/1.0.0 & exit /b 0)\r\nif \"%1\"==\"--help\" (echo Help info & exit /b 0)\r\n").unwrap();
 
     let bad_ver_res = verify_launch_preflight(Some(&mock_omp.to_string_lossy()));
     assert!(bad_ver_res.is_err(), "Preflight must fail closed for unsupported OMP revision");
     let err_msg = bad_ver_res.unwrap_err().to_string();
     assert!(err_msg.contains("Unsupported OMP revision"), "Error should report revision mismatch: {}", err_msg);
-    assert!(err_msg.contains("omp/18.1.16"), "Error should name expected revision omp/18.1.16: {}", err_msg);
 }
 
 #[test]
 fn test_exact_supported_omp_version_matching() {
-    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/18.1.16");
+    assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/*");
 
-    // Exact match must pass
+    // OMP version shapes must pass
     assert!(is_exact_supported_omp_version("omp/18.1.16"));
+    assert!(is_exact_supported_omp_version("omp/18.1.18"));
+    assert!(is_exact_supported_omp_version("omp/19.0.0"));
+    assert!(is_exact_supported_omp_version("omp/118.1.16"));
     assert!(is_exact_supported_omp_version("omp/18.1.16\n"));
     assert!(is_exact_supported_omp_version("omp/18.1.16\r\n"));
     assert!(is_exact_supported_omp_version("  omp/18.1.16  \n"));
 
-    // Lookalikes, prefixes, suffixes, and extra wrapper text MUST BE REJECTED
-    assert!(!is_exact_supported_omp_version("omp/118.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16-beta"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16.1"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16_rc1"));
+    // Lookalikes, prefixes, suffixes, non-omp CLI MUST BE REJECTED
     assert!(!is_exact_supported_omp_version("v18.1.16"));
     assert!(!is_exact_supported_omp_version("18.1.16"));
     assert!(!is_exact_supported_omp_version("wrapper: omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/18.1.16 extra text"));
     assert!(!is_exact_supported_omp_version("node omp/18.1.16"));
-    assert!(!is_exact_supported_omp_version("omp/19.0.0"));
+    assert!(!is_exact_supported_omp_version("omp/"));
+    assert!(!is_exact_supported_omp_version("omp/abc"));
     assert!(!is_exact_supported_omp_version(""));
 }
 

@@ -6,9 +6,11 @@ import assert from "node:assert/strict";
 const BACKGROUND_JS_PATH = path.resolve("extension/background.js");
 const CONTENT_SCRIPT_JS_PATH = path.resolve("extension/content_script.js");
 const OPTIONS_JS_PATH = path.resolve("extension/options.js");
+const POPUP_JS_PATH = path.resolve("extension/popup.js");
 const backgroundCode = fs.readFileSync(BACKGROUND_JS_PATH, "utf8");
 const contentScriptCode = fs.readFileSync(CONTENT_SCRIPT_JS_PATH, "utf8");
 const optionsCode = fs.readFileSync(OPTIONS_JS_PATH, "utf8");
+const popupCode = fs.readFileSync(POPUP_JS_PATH, "utf8");
 
 function createTestHarness({
   extensionId = "mkkajdpmlmliildflmnnmfndboldnnfa",
@@ -45,7 +47,8 @@ function createTestHarness({
           mockChrome.runtime.lastError = null;
           return;
         }
-        cb(nativeResponse);
+        const resp = typeof nativeResponse === "function" ? nativeResponse(msg) : nativeResponse;
+        cb(resp);
       }
     },
     alarms: {
@@ -827,9 +830,13 @@ async function runTests() {
       pathname = "/c/c_123",
       turns = [],
       conversationTurns = null,
+      turnContainerTag = "DIV",
       roleTurns = null,
       userMenu = null,
-      accountCandidates = null
+      accountCandidates = null,
+      modernProfileMenu = null,
+      modernProfileMenuTag = "BUTTON",
+      modernProfileMenuText = ""
     } = {}) {
       let capturedListener = null;
       const mockChrome = {
@@ -844,6 +851,8 @@ async function runTests() {
       const mockDocument = {
         querySelectorAll(selector) {
           if (selector.includes('conversation-turn')) {
+            const isDivQualified = selector.includes("main div");
+            if (isDivQualified && (turnContainerTag || "").toUpperCase() !== "DIV") return [];
             return (conversationTurns || []).map(t => ({ innerText: t }));
           }
           if (selector === "article") {
@@ -855,6 +864,11 @@ async function runTests() {
           if (selector.includes("user-profile") || selector.includes("workspace") || selector.includes("user-menu")) {
             const candidates = accountCandidates || (userMenu ? [userMenu] : []);
             return candidates.map(t => ({ innerText: t }));
+          }
+          if (selector.includes('aria-label*="profile menu"') && modernProfileMenu) {
+            const isButtonQualified = selector.trim().toLowerCase().startsWith("button");
+            if (isButtonQualified && (modernProfileMenuTag || "").toUpperCase() !== "BUTTON") return [];
+            return [{ tagName: modernProfileMenuTag, innerText: modernProfileMenuText, getAttribute: (name) => name === "aria-label" ? modernProfileMenu : null }];
           }
           return [];
         },
@@ -940,6 +954,60 @@ async function runTests() {
     assert.equal(laterAccountRes.ok, true);
     assert.equal(laterAccountRes.accountText, "Workspace Later Candidate");
 
+    // Case G: current ChatGPT exposes account/workspace identity through an accessible
+    // profile-menu label and project link instead of the legacy data-testid/id selectors.
+    const modernAccountRes = runContentScriptInVm({
+      pathname: "/g/g-p-project/c/c_123",
+      turns: ["Turn 1"],
+      modernProfileMenu: "Example Business, open profile menu"
+    });
+    assert.equal(modernAccountRes.ok, true);
+    assert.equal(modernAccountRes.accountText, "Example Business");
+
+    // Case H: generic label without identity (only "Open profile menu") must fail closed
+    const genericLabelRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: ["Turn 1"],
+      modernProfileMenu: "Open profile menu"
+    });
+    assert.equal(genericLabelRes.ok, false);
+    assert.equal(genericLabelRes.error, "missing_account_context");
+
+    // Case I: whitespace / case tolerant stripping of ", open profile menu"
+    const caseTolerantRes = runContentScriptInVm({
+      pathname: "/c/c_123",
+      turns: ["Turn 1"],
+      modernProfileMenu: "Acme Corp ,  OPEN PROFILE MENU  "
+    });
+    assert.equal(caseTolerantRes.ok, true);
+    assert.equal(caseTolerantRes.accountText, "Acme Corp");
+    // Case J: live ChatGPT 2026-09-12 exposes profile menu as DIV role=button
+    // (aria "Monet Business, open profile menu", visible "Monet\nBusiness").
+    const liveDivRes = runContentScriptInVm({
+      pathname: "/g/g-p-6a8e8fcbb0248191af6a77a554c62e31/c/6aa19a1f-34a0-83ec-8453-739b915a288b",
+      turns: ["Turn 1"],
+      modernProfileMenu: "Monet Business, open profile menu",
+      modernProfileMenuTag: "DIV",
+      modernProfileMenuText: "Monet\nBusiness"
+    });
+    assert.equal(liveDivRes.ok, true);
+    assert.equal(liveDivRes.accountText, "Monet\nBusiness");
+    // Case K: live ChatGPT 2026-09-12 renders turn containers as SECTION,
+    // not DIV. Tier-1 must stay tag-generic to prefer canonical turns.
+    const liveSectionRes = runContentScriptInVm({
+      pathname: "/g/g-p-6a8e8fcbb0248191af6a77a554c62e31/c/6aa19a1f-34a0-83ec-8453-739b915a288b",
+      conversationTurns: ["Canonical live turn one", "Canonical live turn two"],
+      turnContainerTag: "SECTION",
+      turns: ["Wrapper duplicate one"],
+      roleTurns: ["Nested duplicate one"],
+      modernProfileMenu: "Monet Business, open profile menu",
+      modernProfileMenuTag: "DIV",
+      modernProfileMenuText: "Monet\nBusiness"
+    });
+    assert.equal(liveSectionRes.ok, true);
+    assert.ok(liveSectionRes.transcriptText.includes("Canonical live turn one"));
+    assert.equal(liveSectionRes.transcriptText.includes("Wrapper duplicate one"), false);
+    assert.equal(liveSectionRes.transcriptText.includes("Nested duplicate one"), false);
     console.log("  [PASS] Content script evidence avoids duplicate turns and scans account candidates fail-closed");
   }
 
@@ -1205,18 +1273,69 @@ async function runTests() {
   }
   console.log("  [PASS] Recovery reconciles pending_native/unknown/native-response-uncertain states");
 
-  // Setup guidance must quote the workspace placeholder so paths with spaces are safe when pasted.
-  assert.ok(optionsCode.includes('--target "<path>"'));
-  assert.equal(optionsCode.includes("--target <path>"), false);
-  console.log("  [PASS] Options setup command quotes the target path placeholder");
+  // Local mode UX must not expose pairing/bootstrap/policy ceremony or browser path registration.
+  assert.ok(optionsCode.includes('action: "ensureLocalMode"'));
+  assert.equal(optionsCode.includes('action: "addWorkspace"'), false);
+  assert.equal(optionsCode.includes('action: "removeWorkspace"'), false);
+  assert.equal(optionsCode.includes("bootstrapToken"), false);
+  assert.equal(optionsCode.includes("pairingId"), false);
+  assert.equal(optionsCode.includes("policyRevision"), false);
+  assert.ok(popupCode.includes('action: "ensureLocalMode"'));
+  console.log("  [PASS] Extension UI uses local mode without pairing ceremony or browser path registration");
 
-  // Non-Windows setup guidance must skip Windows Registry registration explicitly.
-  assert.ok(optionsCode.includes("chrome.runtime.getPlatformInfo()"));
-  assert.ok(optionsCode.includes('platformInfo?.os === "win"'));
-  assert.ok(optionsCode.includes('" --skip-registry"'));
-  console.log("  [PASS] Options setup command is platform-aware for registry registration");
+  // Test 25: local mode seeds fixed internal credentials and current targets.
+  {
+    const harness = createTestHarness({
+      nativeResponse: (msg) => {
+        assert.equal(msg.op, "local_status");
+        return {
+          status: "ok",
+          pairingId: "local",
+          profileId: "local",
+          pairingStatus: "active",
+          policyRevision: "v1",
+          targets: [{ target_id: "hands", canonical_path: "F:\\CodeBase\\hands", name: "hands" }]
+        };
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };
+    const res = await harness.sendMessage({ action: "ensureLocalMode" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(res.isPaired, true);
+    assert.equal(harness.storageStore.profileId, "local");
+    assert.equal(harness.storageStore.pairingId, "local");
+    assert.equal(harness.storageStore.pairingSecret, "local");
+    assert.equal(harness.storageStore.policyRevision, "v1");
+    assert.equal(harness.storageStore.targets[0].target_id, "hands");
+    console.log("  [PASS] Local mode seeds internal credentials and targets automatically");
+  }
 
-  // Test 25: concurrent identical launches coalesce to one native request.
+  // Test 26: browser rejects addWorkspace/removeWorkspace actions (trust boundary preserved).
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        profileId: "local",
+        isPaired: true,
+        pairingId: "local",
+        pairingSecret: "local",
+        policyRevision: "v1",
+        targets: [{ target_id: "old", canonical_path: "F:\\old", name: "old" }],
+        conv_target_local_conv_old: "old"
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };
+    const add = await harness.sendMessage({ action: "addWorkspace", targetPath: "F:\\CodeBase\\flowkit" }, trustedSender);
+    assert.equal(add.status, "error");
+    assert.equal(add.code, "unsupported_action");
+
+    const remove = await harness.sendMessage({ action: "removeWorkspace", targetId: "old" }, trustedSender);
+    assert.equal(remove.status, "error");
+    assert.equal(remove.code, "unsupported_action");
+    assert.equal(harness.nativeMessagesSent.length, 0, "No native messages sent for removed browser workspace actions");
+    console.log("  [PASS] Browser addWorkspace/removeWorkspace actions rejected, preserving trust boundary");
+  }
+
+  // Test 27: concurrent identical launches coalesce to one native request.
   {
     const harness = createTestHarness({
       nativeResponse: { status: "ok", executionId: "exec_coalesced", returnToken: "ret_coalesced", state: "started" },
@@ -2041,6 +2160,315 @@ async function runTests() {
     assert.equal(clickCount, 1, "Must NOT perform second click after N3 state loss!");
 
     console.log("  [PASS] N3 State Loss: Loss of extension local state does not click Send again");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 38: Multi-workspace targets sync on status and per-conversation binding
+  // ---------------------------------------------------------------------------
+  {
+    const targetsList = [
+      { target_id: "target_alpha", canonical_path: "/path/to/alpha", name: "alpha" },
+      { target_id: "target_beta", canonical_path: "/path/to/beta", name: "beta" }
+    ];
+    const sharedTabs = {
+      201: { id: 201, url: "https://chatgpt.com/c/c_conv_alpha" },
+      202: { id: 202, url: "https://chatgpt.com/c/c_conv_beta" }
+    };
+    const sharedTabMessages = {
+      201: (msg) => ({
+        ok: true,
+        originConversationId: "c_conv_alpha",
+        originConversationUrl: "https://chatgpt.com/c/c_conv_alpha",
+        transcriptText: "Turn 1: Alpha",
+        accountText: "Personal"
+      }),
+      202: (msg) => ({
+        ok: true,
+        originConversationId: "c_conv_beta",
+        originConversationUrl: "https://chatgpt.com/c/c_conv_beta",
+        transcriptText: "Turn 1: Beta",
+        accountText: "Personal"
+      })
+    };
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_multi",
+        pairingSecret: "rb_sec_multi",
+        targets: [{ target_id: "target_old", canonical_path: "/old", name: "old" }]
+      },
+      nativeResponse: (msg) => {
+        if (msg.op === "status") {
+          return {
+            status: "ok",
+            pairingId: "pair_multi",
+            pairingStatus: "active",
+            taskExecutionAvailable: true,
+            targetsCount: 2,
+            targets: targetsList,
+            policyRevision: "v1"
+          };
+        }
+        if (msg.op === "launch") {
+          return {
+            status: "ok",
+            executionId: "exec_" + msg.targetId,
+            returnToken: "ret_" + msg.targetId,
+            state: "started"
+          };
+        }
+        return { status: "ok" };
+      },
+      mockTabs: sharedTabs,
+      mockTabMessages: sharedTabMessages
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    // 1. Status syncs targets to local storage
+    const statusRes = await harness.sendMessage({ action: "status" }, trustedSender);
+    assert.equal(statusRes.status, "ok");
+    assert.equal(statusRes.targetsCount, 2);
+    assert.equal(harness.storageStore.targets.length, 2);
+    assert.equal(harness.storageStore.targets[0].target_id, "target_alpha");
+    assert.equal(harness.storageStore.targets[1].target_id, "target_beta");
+
+    // 2. Bind conversation alpha to target_alpha, and beta to target_beta
+    const setAlpha = await harness.sendMessage({
+      action: "setConversationTarget",
+      conversationId: "c_conv_alpha",
+      targetId: "target_alpha"
+    }, trustedSender);
+    assert.equal(setAlpha.status, "ok");
+
+    const setBeta = await harness.sendMessage({
+      action: "setConversationTarget",
+      conversationId: "c_conv_beta",
+      targetId: "target_beta"
+    }, trustedSender);
+    assert.equal(setBeta.status, "ok");
+
+    // Verify getConversationTarget returns bound target
+    const getAlpha = await harness.sendMessage({
+      action: "getConversationTarget",
+      conversationId: "c_conv_alpha"
+    }, trustedSender);
+    assert.equal(getAlpha.targetId, "target_alpha");
+
+    const getBeta = await harness.sendMessage({
+      action: "getConversationTarget",
+      conversationId: "c_conv_beta"
+    }, trustedSender);
+    assert.equal(getBeta.targetId, "target_beta");
+
+    // 3. Launch without explicit targetId uses per-conversation bound target
+    // Conv alpha:
+    harness.nativeMessagesSent.length = 0;
+    const launchAlpha = await harness.sendMessage({
+      action: "launch",
+      tabId: 201,
+      promptText: "Task in alpha"
+    }, trustedSender);
+    assert.equal(launchAlpha.status, "ok");
+    assert.equal(harness.nativeMessagesSent.length, 1);
+    assert.equal(harness.nativeMessagesSent[0].msg.targetId, "target_alpha");
+
+    // Conv beta:
+    harness.nativeMessagesSent.length = 0;
+    const launchBeta = await harness.sendMessage({
+      action: "launch",
+      tabId: 202,
+      promptText: "Task in beta"
+    }, trustedSender);
+    assert.equal(launchBeta.status, "ok");
+    assert.equal(harness.nativeMessagesSent.length, 1);
+    assert.equal(harness.nativeMessagesSent[0].msg.targetId, "target_beta");
+
+    // Authoritative binding check: supplying a differing targetId must fail closed with conversation_target_mismatch
+    harness.nativeMessagesSent.length = 0;
+    const launchMismatch = await harness.sendMessage({
+      action: "launch",
+      tabId: 201, // bound to target_alpha
+      targetId: "target_beta", // conflicting targetId
+      promptText: "Conflicting target override attempt"
+    }, trustedSender);
+    assert.equal(launchMismatch.status, "error");
+    assert.equal(launchMismatch.code, "conversation_target_mismatch");
+    assert.equal(harness.nativeMessagesSent.length, 0, "Must not send native message on binding mismatch");
+
+    // Matching targetId succeeds
+    const launchMatch = await harness.sendMessage({
+      action: "launch",
+      tabId: 201,
+      targetId: "target_alpha",
+      promptText: "Matching explicit target"
+    }, trustedSender);
+    assert.equal(launchMatch.status, "ok");
+
+    // Unbound conversation binds on first explicit registered targetId
+    sharedTabs[203] = { id: 203, url: "https://chatgpt.com/c/c_conv_gamma" };
+    sharedTabMessages[203] = () => ({
+      ok: true,
+      originConversationId: "c_conv_gamma",
+      originConversationUrl: "https://chatgpt.com/c/c_conv_gamma",
+      transcriptText: "Turn 1: Gamma",
+      accountText: "Personal"
+    });
+    harness.nativeMessagesSent.length = 0;
+    const launchGammaFirst = await harness.sendMessage({
+      action: "launch",
+      tabId: 203,
+      targetId: "target_beta",
+      promptText: "First launch establishing binding"
+    }, trustedSender);
+    assert.equal(launchGammaFirst.status, "ok");
+    assert.equal(harness.storageStore["conv_target_pair_multi_c_conv_gamma"], "target_beta");
+
+    // Subsequent launch on gamma without targetId uses newly established binding
+    harness.nativeMessagesSent.length = 0;
+    const launchGammaSecond = await harness.sendMessage({
+      action: "launch",
+      tabId: 203,
+      promptText: "Second launch using established binding"
+    }, trustedSender);
+    assert.equal(launchGammaSecond.status, "ok");
+    assert.equal(harness.nativeMessagesSent[0].msg.targetId, "target_beta");
+    // 4. Stale/removed target binding fails closed and prunes binding
+    // Simulate target_beta was removed from pairing
+    harness.storageStore.targets = [targetsList[0]]; // Only target_alpha remains
+    harness.nativeMessagesSent.length = 0;
+
+    const launchStale = await harness.sendMessage({
+      action: "launch",
+      tabId: 202, // bound to target_beta
+      promptText: "Task with stale target"
+    }, trustedSender);
+    assert.equal(launchStale.status, "error");
+    assert.equal(launchStale.code, "target_not_found");
+    assert.equal(harness.nativeMessagesSent.length, 0, "Must not send native message for removed target");
+
+    // Binding was pruned
+    const bindingKeyBeta = "conv_target_pair_multi_c_conv_beta";
+    assert.equal(harness.storageStore[bindingKeyBeta], undefined);
+
+    // Single target fallback: now that only target_alpha exists, a conversation without binding uses it
+    harness.nativeMessagesSent.length = 0;
+    const launchFallback = await harness.sendMessage({
+      action: "launch",
+      tabId: 202,
+      promptText: "Task with single target fallback"
+    }, trustedSender);
+    assert.equal(launchFallback.status, "ok");
+    assert.equal(harness.nativeMessagesSent[0].msg.targetId, "target_alpha");
+    assert.equal(
+      harness.storageStore["conv_target_pair_multi_c_conv_beta"],
+      "target_alpha",
+      "Single-target fallback must persist the conversation binding before more targets are added"
+    );
+
+    console.log("  [PASS] Multi-workspace targets sync on status and per-conversation binding");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 39: Removed targets are pruned from stale conversation bindings
+  // ---------------------------------------------------------------------------
+  {
+    const emptyHarness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_empty",
+        pairingSecret: "rb_sec_empty",
+        targets: [],
+        conv_target_pair_empty_c_conv_empty: "target_gone"
+      },
+      nativeResponse: (msg) => msg.op === "launch"
+        ? { status: "ok", executionId: "exec_should_not_launch", returnToken: "ret_should_not_launch", state: "started" }
+        : { status: "ok" },
+      mockTabs: {
+        301: { id: 301, url: "https://chatgpt.com/c/c_conv_empty" }
+      },
+      mockTabMessages: {
+        301: () => ({
+          ok: true,
+          originConversationId: "c_conv_empty",
+          originConversationUrl: "https://chatgpt.com/c/c_conv_empty",
+          transcriptText: "Turn 1: Empty target registry",
+          accountText: "Personal"
+        })
+      }
+    });
+    const emptySender = {
+      id: emptyHarness.extensionId,
+      url: `chrome-extension://${emptyHarness.extensionId}/popup.html`
+    };
+
+    const emptyLaunch = await emptyHarness.sendMessage({
+      action: "launch",
+      tabId: 301,
+      promptText: "Do not launch against a removed target"
+    }, emptySender);
+    assert.equal(emptyLaunch.status, "error");
+    assert.equal(emptyLaunch.code, "target_not_found");
+    assert.equal(emptyHarness.nativeMessagesSent.length, 0, "Authoritative empty target registry must fail locally");
+    assert.equal(emptyHarness.storageStore.conv_target_pair_empty_c_conv_empty, undefined);
+
+    const nativeHarness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_native_stale",
+        pairingSecret: "rb_sec_native_stale",
+        targets: [{ target_id: "target_gone", canonical_path: "/gone", name: "gone" }],
+        conv_target_pair_native_stale_c_conv_native_stale: "target_gone"
+      },
+      nativeResponse: (msg) => {
+        if (msg.op === "launch") {
+          return { status: "error", code: "target_not_found", message: "Target was removed locally" };
+        }
+        return { status: "ok" };
+      },
+      mockTabs: {
+        302: { id: 302, url: "https://chatgpt.com/c/c_conv_native_stale" }
+      },
+      mockTabMessages: {
+        302: () => ({
+          ok: true,
+          originConversationId: "c_conv_native_stale",
+          originConversationUrl: "https://chatgpt.com/c/c_conv_native_stale",
+          transcriptText: "Turn 1: Native stale target",
+          accountText: "Personal"
+        })
+      }
+    });
+    const nativeSender = {
+      id: nativeHarness.extensionId,
+      url: `chrome-extension://${nativeHarness.extensionId}/popup.html`
+    };
+
+    const rejectedLaunch = await nativeHarness.sendMessage({
+      action: "launch",
+      tabId: 302,
+      promptText: "Native should reject stale target"
+    }, nativeSender);
+    assert.equal(rejectedLaunch.status, "error");
+    assert.equal(rejectedLaunch.code, "target_not_found");
+    assert.equal(nativeHarness.nativeMessagesSent.length, 1);
+    assert.equal(nativeHarness.storageStore.conv_target_pair_native_stale_c_conv_native_stale, undefined);
+    assert.deepEqual(nativeHarness.storageStore.targets, []);
+
+    const retryLaunch = await nativeHarness.sendMessage({
+      action: "launch",
+      tabId: 302,
+      promptText: "Retry must fail locally after pruning"
+    }, nativeSender);
+    assert.equal(retryLaunch.status, "error");
+    assert.equal(retryLaunch.code, "missing_target_id");
+    assert.equal(nativeHarness.nativeMessagesSent.length, 1, "Pruned stale target must not be retried against native");
+
+    console.log("  [PASS] Removed targets prune stale bindings on cached and native rejection paths");
   }
 
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");
