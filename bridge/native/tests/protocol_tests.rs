@@ -1024,7 +1024,7 @@ fn test_resolve_omp_binary_shapes() {
 
     // 1. Wrapper token shape ("omp") is always checked as a pure command builder.
     let cmd_wrapper = build_omp_startup_command_with_env_and_bin(
-        &adapter_path, None, None, Some("omp")
+        &adapter_path, None, None, None, Some("omp")
     ).unwrap();
     assert!(cmd_wrapper.contains("& 'omp' -e '"));
 
@@ -1032,6 +1032,7 @@ fn test_resolve_omp_binary_shapes() {
     let dummy_adapter = Path::new("C:/temp/adapter.ts");
     let cmd = build_omp_startup_command_with_env_and_bin(
         dummy_adapter,
+        None,
         None,
         None,
         Some("C:\\Program Files\\OMP Tools\\omp.exe"),
@@ -1043,10 +1044,13 @@ fn test_resolve_omp_binary_shapes() {
         Path::new("C:/tmp/$adapter/O'Brien/adapter.ts"),
         Some("exec_$literal'O"),
         Some(Path::new("C:/state/$literal/O'Brien")),
+        Some("task_$literal'O"),
         Some("C:/Program Files/OMP $Tools/O'Brien/omp.exe"),
     ).unwrap();
     assert!(quoted_cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID='exec_$literal''O';"));
+    assert!(quoted_cmd.contains("$env:HANDS_TASK_ID='task_$literal''O';"));
     assert!(quoted_cmd.contains("$env:HANDS_RETURN_BRIDGE_STATE_DIR='C:/state/$literal/O''Brien';"));
+    assert!(quoted_cmd.contains("$env:Path='C:/state/$literal/O''Brien' + ';' + $env:Path;"));
     assert!(quoted_cmd.contains("& 'C:/Program Files/OMP $Tools/O''Brien/omp.exe'"));
     assert!(quoted_cmd.contains("-e 'C:/tmp/$adapter/O''Brien/adapter.ts'"));
 
@@ -1355,8 +1359,10 @@ fn test_adapter_v3_generation_and_revision() {
         &adapter_path,
         Some("exec_test_rev3"),
         Some(dir.path()),
+        Some("task_test_rev3"),
     ).unwrap();
     assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_EXECUTION_ID='exec_test_rev3';"));
+    assert!(cmd.contains("$env:HANDS_TASK_ID='task_test_rev3';"));
     assert!(cmd.contains("$env:HANDS_RETURN_BRIDGE_STATE_DIR="));
     assert!(cmd.contains("-e '"));
     assert!(cmd.contains("adapter.ts'"));

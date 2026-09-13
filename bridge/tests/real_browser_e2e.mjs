@@ -252,28 +252,28 @@ async function main() {
   }
   const chromePath = resolveChromePath();
 
-  // 1. Build companion binary
-  console.log("[1/6] Building hands-return-bridge.exe...");
-  execSync("cargo build --manifest-path bridge/native/Cargo.toml", {
-    cwd: REPO_ROOT,
-    stdio: "inherit"
-  });
-
-  const exePath = path.join(REPO_ROOT, "bridge", "native", "target", "debug", "hands-return-bridge.exe");
-  if (!fs.existsSync(exePath)) {
-    throw new Error(`Binary not found at ${exePath}`);
-  }
-
-  // 2. Prepare isolated test environment
+  // 1. Prepare an isolated test/build environment before compiling either binary.
   const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "hands-rb-e2e-"));
   const stateDir = path.join(testDir, "state");
   const profileAlphaDir = path.join(testDir, "profile_alpha");
   const profileBetaDir = path.join(testDir, "profile_beta");
+  const bridgeTargetDir = path.join(testDir, "bridge-target");
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(profileAlphaDir, { recursive: true });
   fs.mkdirSync(profileBetaDir, { recursive: true });
 
-  // Prepare test extension directory with isolated test fixture
+  console.log("[1/6] Building isolated Return Bridge companion...");
+  execFileSync("cargo", [
+    "build",
+    "--manifest-path", path.join(REPO_ROOT, "bridge", "native", "Cargo.toml"),
+    "--target-dir", bridgeTargetDir
+  ], { cwd: REPO_ROOT, stdio: "inherit" });
+  const exePath = path.join(bridgeTargetDir, "debug", "hands-return-bridge.exe");
+  if (!fs.existsSync(exePath)) {
+    throw new Error(`Isolated hands-return-bridge.exe not found at ${exePath}`);
+  }
+
+  // 2. Prepare the isolated test extension fixture.
   const testExtDir = path.join(testDir, "test_extension");
   fs.cpSync(EXTENSION_DIR, testExtDir, { recursive: true });
   fs.copyFileSync(path.join(FIXTURES_DIR, "test_runner.html"), path.join(testExtDir, "test_runner.html"));
@@ -484,13 +484,6 @@ async function main() {
       console.log(`      [PASS] Verified exact literal prompt delivered into current-run OMP session: ${matchedFile}`);
       console.log(`             Leading --flag, @some_file, "quotes", semicolon, pipe, Unicode, and newline preserved verbatim.`);
 
-      console.log(`      Cleaning up test-owned Orca terminal: ${termHandle}`);
-      try {
-        execSync(`orca terminal close --terminal "${termHandle}" --json`, { stdio: "ignore" });
-        console.log(`      Closed test terminal: ${termHandle}`);
-      } catch (err) {
-        console.warn(`      Warning: failed to close test terminal ${termHandle}`);
-      }
     }
     pairingSecret = alphaResult.results.pairingSecret;
     if (!pairingSecret || !pairingSecret.startsWith("rb_sec_")) {
@@ -506,33 +499,54 @@ async function main() {
     // -------------------------------------------------------------
     // Phase 1b: AC1/AC4/AC6 Real Chrome Drain & Restart Recovery (N1/N2/S3)
     // -------------------------------------------------------------
-    console.log("      Phase 1b: Seeding committed Completion Receipt into real journal and testing browser recovery...");
-    const execId = alphaResult?.results?.executionId || "exec_e2e_seed";
-    const rcptId = "rcpt_e2e_" + Date.now();
+    console.log("      Phase 1b: Recording real done/failed notifications through Return Bridge CLI and testing browser recovery...");
+    const doneTaskId = alphaResult?.results?.launchRequestId;
+    const doneExecutionId = alphaResult?.results?.executionId;
+    const failedTaskId = alphaResult?.results?.failedLaunchRequestId;
+    const failedExecutionId = alphaResult?.results?.failedExecutionId;
+    const failureMessage = "E2E worker failure: explicit notify path";
+    if (!doneTaskId || !doneExecutionId || !failedTaskId || !failedExecutionId) {
+      throw new Error(`Missing notification correlation IDs from Profile Alpha result: ${JSON.stringify(alphaResult?.results)}`);
+    }
 
-    // Use sqlite3 CLI or python script to seed a real completion receipt directly into SQLite journal
-    const seedSql = `
-      INSERT OR REPLACE INTO completion_receipts (
-        receipt_id, execution_id, pairing_id, return_token,
-        origin_conversation_id, turn_index, stop_reason,
-        assistant_message_id, assistant_text, content_digest,
-        tool_call_count, state, committed_at
-      ) VALUES (
-        '${rcptId}', '${execId}', '${pairingId}', 'ret_e2e_token',
-        'conv_e2e_123', 0, 'stop',
-        'msg_e2e_1', 'E2E Turn completed successfully', 'sha256:e2e_digest',
-        1, 'completed', strftime('%s','now')
-      );
-    `;
+    const notifyBaseEnv = {
+      ...process.env,
+      HANDS_RETURN_BRIDGE_STATE_DIR: stateDir
+    };
+    const doneOut = execFileSync(exePath, ["notify", "done"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: {
+        ...notifyBaseEnv,
+        HANDS_TASK_ID: doneTaskId,
+        HANDS_RETURN_BRIDGE_EXECUTION_ID: doneExecutionId
+      }
+    });
+    if (!doneOut.includes(`task: ${doneTaskId}`) || !doneOut.includes(`execution: ${doneExecutionId}`) || !doneOut.includes("status: completed")) {
+      throw new Error(`Unexpected Return Bridge notify done output: ${doneOut}`);
+    }
 
-    const seedScript = `import sqlite3
-conn = sqlite3.connect(r'''${dbPath}''')
-conn.execute('''${seedSql}''')
-conn.commit()
-conn.close()
-`;
-    execFileSync("python", ["-c", seedScript], { stdio: "pipe" });
-    console.log(`      Seeded real Completion Receipt ${rcptId} for execution ${execId} into ${dbPath}`);
+    const failedOut = execFileSync(exePath, ["notify", "failed", "--message", failureMessage, "--task", failedTaskId], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: notifyBaseEnv
+    });
+    if (!failedOut.includes(`task: ${failedTaskId}`) || !failedOut.includes(`execution: ${failedExecutionId}`) || !failedOut.includes("status: failed")) {
+      throw new Error(`Unexpected Return Bridge notify failed output: ${failedOut}`);
+    }
+    console.log(`      [PASS] Return Bridge notify done correlated ${doneTaskId} -> ${doneExecutionId}`);
+    console.log(`      [PASS] Return Bridge notify failed correlated ${failedTaskId} -> ${failedExecutionId}`);
+
+    // Closing the owned OMP terminals after explicit notification exercises agent_end fallback convergence.
+    for (const termHandle of [alphaResult?.results?.terminalHandle, alphaResult?.results?.failedTerminalHandle].filter(Boolean)) {
+      console.log(`      Cleaning up test-owned Orca terminal after explicit notification: ${termHandle}`);
+      try {
+        execFileSync("orca", ["terminal", "close", "--terminal", termHandle, "--json"], { stdio: "ignore" });
+        console.log(`      Closed test terminal: ${termHandle}`);
+      } catch (err) {
+        console.warn(`      Warning: failed to close test terminal ${termHandle}: ${err.message}`);
+      }
+    }
 
     // Relaunch Profile Alpha (real Chrome MV3 worker restart) to exercise recovery & drain over real native host
     console.log("      Relaunching Chrome (Profile Alpha) to test startup drain & recovery over real native host...");
@@ -548,7 +562,17 @@ conn.close()
 
       drainResult = await evalInTab(
         targetTabDrain.webSocketDebuggerUrl,
-        `window.startTest(${JSON.stringify({ mode: "profile_alpha", profileId: "profile_alpha", pairingId, pairingSecret })})`
+        `window.startTest(${JSON.stringify({
+          mode: "profile_alpha",
+          profileId: "profile_alpha",
+          pairingId,
+          pairingSecret,
+          skipLaunch: true,
+          expectedNotifications: [
+            { taskId: doneTaskId, executionId: doneExecutionId, state: "completed" },
+            { taskId: failedTaskId, executionId: failedExecutionId, state: "failed", message: failureMessage }
+          ]
+        })})`
       );
     } finally {
       chromeAlphaDrain.kill();

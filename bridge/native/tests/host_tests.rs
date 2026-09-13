@@ -780,3 +780,132 @@ fn test_host_target_add_remove_list_flow() {
         .expect_err("Multiple active pairings must require an explicit --pairing-id");
     assert!(ambiguous_err.to_string().contains("Multiple active pairings"));
 }
+
+#[test]
+fn test_notify_cli_done_and_failed_flow() {
+    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let state_dir = tempdir().unwrap();
+    let db_path = state_dir.path().join("journal.sqlite");
+    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+
+    let target_dir = tempdir().unwrap();
+    let output = Command::new("git")
+        .args(["init", &target_dir.path().to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let canonical_target = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let setup_opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "prof_cli_notify".to_string(),
+        target_path: canonical_target,
+        target_id: Some("target_cli".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_notify".to_string(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        skip_registry: true,
+    };
+    let setup_res = execute_setup(&setup_opts).unwrap();
+    journal.activate_bootstrap(&setup_res.bootstrap_token, "prof_cli_notify").unwrap();
+
+    let task_id_1 = "task_cli_1";
+    let launch_params_1 = hands_return_bridge::journal::LaunchRequestParams {
+        pairing_id: setup_res.pairing_id.clone(),
+        launch_request_id: task_id_1.to_string(),
+        origin_conversation_id: "conv_cli_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_cli_1".to_string(),
+        transcript_evidence_hash: "hash_t_cli".to_string(),
+        account_evidence_hash: "hash_a_cli".to_string(),
+        target_id: "target_cli".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "CLI notify test prompt".to_string(),
+    };
+    let claim_1 = journal.reserve_or_claim_launch(&launch_params_1).unwrap();
+    journal.mark_launch_attempt(&claim_1.execution_id, &setup_res.pairing_id).unwrap();
+
+    // 1. Run notify done with environment variables
+    let out_done = Command::new(bin)
+        .args(["notify", "done"])
+        .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
+        .env("HANDS_RETURN_BRIDGE_EXECUTION_ID", &claim_1.execution_id)
+        .env("HANDS_TASK_ID", task_id_1)
+        .output()
+        .unwrap();
+    assert!(out_done.status.success(), "notify done failed: {}", String::from_utf8_lossy(&out_done.stderr));
+    let stdout_done = String::from_utf8_lossy(&out_done.stdout);
+    assert!(stdout_done.contains("Notification recorded"));
+    assert!(stdout_done.contains("status: completed"));
+
+    // 2. Repeated notify done is idempotent
+    let out_done_repeat = Command::new(bin)
+        .args(["notify", "done"])
+        .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
+        .env("HANDS_RETURN_BRIDGE_EXECUTION_ID", &claim_1.execution_id)
+        .env("HANDS_TASK_ID", task_id_1)
+        .output()
+        .unwrap();
+    assert!(out_done_repeat.status.success());
+    let stdout_repeat = String::from_utf8_lossy(&out_done_repeat.stdout);
+    assert!(stdout_repeat.contains("Notification already recorded"));
+
+    // 3. Notify failed on already completed execution rejects with conflict
+    let out_conflict = Command::new(bin)
+        .args(["notify", "failed", "--message", "Late failure"])
+        .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
+        .env("HANDS_RETURN_BRIDGE_EXECUTION_ID", &claim_1.execution_id)
+        .env("HANDS_TASK_ID", task_id_1)
+        .output()
+        .unwrap();
+    assert!(!out_conflict.status.success());
+
+    // 4. Fresh launch for notify failed with explicit --task and --execution-id flags
+    let task_id_2 = "task_cli_2";
+    let launch_params_2 = hands_return_bridge::journal::LaunchRequestParams {
+        pairing_id: setup_res.pairing_id.clone(),
+        launch_request_id: task_id_2.to_string(),
+        origin_conversation_id: "conv_cli_2".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_cli_2".to_string(),
+        transcript_evidence_hash: "hash_t_cli_2".to_string(),
+        account_evidence_hash: "hash_a_cli_2".to_string(),
+        target_id: "target_cli".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "CLI notify failed prompt".to_string(),
+    };
+    let claim_2 = journal.reserve_or_claim_launch(&launch_params_2).unwrap();
+    journal.mark_launch_attempt(&claim_2.execution_id, &setup_res.pairing_id).unwrap();
+
+    let out_failed = Command::new(bin)
+        .args([
+            "notify", "failed",
+            "--message", "Build failed on cargo check",
+            "--task", task_id_2,
+            "--execution-id", &claim_2.execution_id,
+            "--state-dir", &state_dir.path().to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out_failed.status.success(), "notify failed failed: {}", String::from_utf8_lossy(&out_failed.stderr));
+    let stdout_failed = String::from_utf8_lossy(&out_failed.stdout);
+    assert!(stdout_failed.contains("Notification recorded"));
+    assert!(stdout_failed.contains("status: failed"));
+
+    let rcpt2 = journal.get_completion_receipt(&claim_2.execution_id).unwrap().unwrap();
+    assert_eq!(rcpt2.state, "failed");
+    assert_eq!(rcpt2.assistant_text, "Build failed on cargo check");
+
+    // 5. Validation errors
+    let out_missing_msg = Command::new(bin)
+        .args(["notify", "failed"])
+        .output()
+        .unwrap();
+    assert_eq!(out_missing_msg.status.code(), Some(2));
+
+    let out_unknown_opt = Command::new(bin)
+        .args(["notify", "done", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out_unknown_opt.status.code(), Some(2));
+}

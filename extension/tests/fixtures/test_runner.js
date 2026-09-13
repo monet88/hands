@@ -136,85 +136,107 @@ window.startTest = async function(config = {}) {
       logResult("reject_launch_unauthorized_field", launchBadRejected, launchBadResp);
       results.steps.push({ step: "reject_launch_unauthorized_field", pass: launchBadRejected });
 
-      // Step 7b: Valid launch request through extension internal messaging with exact bound ChatGPT tab
-      const storedConfig = await chrome.storage.local.get(["targets"]);
-      const targetList = (setupResp && setupResp.targets) || storedConfig.targets || [];
-      const validTargetId = targetList.length > 0 ? targetList[0].target_id : "hands";
-      const launchReqId = "e2e_req_" + Date.now();
+      if (!config.skipLaunch) {
+        // Step 7b: Valid launch request through extension internal messaging with exact bound ChatGPT tab
+        const storedConfig = await chrome.storage.local.get(["targets"]);
+        const targetList = (setupResp && setupResp.targets) || storedConfig.targets || [];
+        const validTargetId = targetList.length > 0 ? targetList[0].target_id : "hands";
+        const launchReqId = "e2e_req_" + Date.now();
 
-      // Find or create bound ChatGPT tab
-      const existingTabs = await chrome.tabs.query({ url: "https://chatgpt.com/c/*" });
-      let chatTab = existingTabs[0];
-      if (!chatTab || !chatTab.id) {
-        chatTab = await chrome.tabs.create({ url: "https://chatgpt.com/c/conv_e2e_123" });
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      } else {
-        // Ensure existing tab is reloaded/ready after browser restart
-        try {
-          const tabDetail = await chrome.tabs.get(chatTab.id);
-          if (tabDetail.status === "loading") {
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-          }
-        } catch {}
-      }
+        // Find or create bound ChatGPT tab
+        const existingTabs = await chrome.tabs.query({ url: "https://chatgpt.com/c/*" });
+        let chatTab = existingTabs[0];
+        if (!chatTab || !chatTab.id) {
+          chatTab = await chrome.tabs.create({ url: "https://chatgpt.com/c/conv_e2e_123" });
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        } else {
+          // Ensure existing tab is reloaded/ready after browser restart
+          try {
+            const tabDetail = await chrome.tabs.get(chatTab.id);
+            if (tabDetail.status === "loading") {
+              await new Promise((resolve) => setTimeout(resolve, 1500));
+            }
+          } catch {}
+        }
 
-      // Initialize the mock page once. Re-injecting content_script.js would register
-      // duplicate listeners and make replay assertions timing-dependent.
-      async function ensureMockChatGptDom() {
+        // Initialize the mock page once. Re-injecting content_script.js would register
+        // duplicate listeners and make replay assertions timing-dependent.
+        async function ensureMockChatGptDom() {
+          await chrome.scripting.executeScript({
+            target: { tabId: chatTab.id },
+            func: () => {
+              if (!document.querySelector('article[data-testid="conversation-turn-1"]')) {
+                document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
+              }
+            }
+          });
+        }
+
         await chrome.scripting.executeScript({
           target: { tabId: chatTab.id },
           func: () => {
-            if (!document.querySelector('article[data-testid="conversation-turn-1"]')) {
-              document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
-            }
+            document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
           }
         });
+        await chrome.scripting.executeScript({
+          target: { tabId: chatTab.id },
+          files: ["content_script.js"]
+        });
+
+
+        const runNonce = Date.now().toString(36);
+        const testPrompt = `--flag @some_file "quotes" ; echo pipe | unicode: Đại Ca ${runNonce}\nsecond_line_preserved`;
+        const launchPayload = {
+          action: "launch",
+          launchRequestId: launchReqId,
+          tabId: chatTab.id,
+          targetId: validTargetId,
+          requestedPolicyRevision: "v1",
+          promptText: testPrompt
+        };
+
+        const internalLaunchResp = await chrome.runtime.sendMessage(launchPayload);
+        const launchOk = internalLaunchResp && internalLaunchResp.status === "ok" && internalLaunchResp.executionId && internalLaunchResp.state === "started";
+        logResult("launch_owned_execution", launchOk, internalLaunchResp);
+        results.steps.push({ step: "launch_owned_execution", pass: launchOk });
+        results.launchRequestId = launchReqId;
+        results.executionId = internalLaunchResp ? internalLaunchResp.executionId : null;
+        results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
+        results.promptSent = launchPayload.promptText;
+        // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
+        await ensureMockChatGptDom();
+        const replayResp = await chrome.runtime.sendMessage(launchPayload);
+        const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
+        logResult("launch_idempotent_replay", replayOk, replayResp);
+        results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
+
+        // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
+        await ensureMockChatGptDom();
+        const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
+        const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
+        const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";
+        logResult("launch_payload_conflict", conflictOk, conflictResp);
+        results.steps.push({ step: "launch_payload_conflict", pass: conflictOk });
+
+        // Step 7d.1: Create a second owned execution used by the real failed-notification E2E path.
+        const failedLaunchReqId = "e2e_req_failed_" + Date.now();
+        const failedLaunchPayload = {
+          action: "launch",
+          launchRequestId: failedLaunchReqId,
+          tabId: chatTab.id,
+          targetId: validTargetId,
+          requestedPolicyRevision: "v1",
+          promptText: `Return Bridge explicit failure notification probe ${runNonce}`
+        };
+        await ensureMockChatGptDom();
+        const failedLaunchResp = await chrome.runtime.sendMessage(failedLaunchPayload);
+        const failedLaunchOk = failedLaunchResp && failedLaunchResp.status === "ok" && failedLaunchResp.executionId && failedLaunchResp.state === "started";
+        logResult("launch_owned_failure_execution", failedLaunchOk, failedLaunchResp);
+        results.steps.push({ step: "launch_owned_failure_execution", pass: failedLaunchOk });
+        results.failedLaunchRequestId = failedLaunchReqId;
+        results.failedExecutionId = failedLaunchResp ? failedLaunchResp.executionId : null;
+        results.failedTerminalHandle = failedLaunchResp && failedLaunchResp.terminalEvidence ? failedLaunchResp.terminalEvidence.orcaTerminalHandle : null;
       }
-
-      await chrome.scripting.executeScript({
-        target: { tabId: chatTab.id },
-        func: () => {
-          document.body.innerHTML = '<main><article data-testid="conversation-turn-1">Turn 1: Fix bug in parser</article><article data-testid="conversation-turn-2">Turn 2: Done</article><button id="user-menu" data-testid="user-profile">Workspace Alpha User</button></main>';
-        }
-      });
-      await chrome.scripting.executeScript({
-        target: { tabId: chatTab.id },
-        files: ["content_script.js"]
-      });
-
-
-      const runNonce = Date.now().toString(36);
-      const testPrompt = `--flag @some_file "quotes" ; echo pipe | unicode: Đại Ca ${runNonce}\nsecond_line_preserved`;
-      const launchPayload = {
-        action: "launch",
-        launchRequestId: launchReqId,
-        tabId: chatTab.id,
-        targetId: validTargetId,
-        requestedPolicyRevision: "v1",
-        promptText: testPrompt
-      };
-
-      const internalLaunchResp = await chrome.runtime.sendMessage(launchPayload);
-      const launchOk = internalLaunchResp && internalLaunchResp.status === "ok" && internalLaunchResp.executionId && internalLaunchResp.state === "started";
-      logResult("launch_owned_execution", launchOk, internalLaunchResp);
-      results.steps.push({ step: "launch_owned_execution", pass: launchOk });
-      results.executionId = internalLaunchResp ? internalLaunchResp.executionId : null;
-      results.terminalHandle = internalLaunchResp && internalLaunchResp.terminalEvidence ? internalLaunchResp.terminalEvidence.orcaTerminalHandle : null;
-      results.promptSent = launchPayload.promptText;
-      // Step 7c: Idempotent replay with identical payload returns existing execution without re-launching
-      await ensureMockChatGptDom();
-      const replayResp = await chrome.runtime.sendMessage(launchPayload);
-      const replayOk = replayResp && replayResp.status === "ok" && replayResp.isReplayed === true && replayResp.executionId === internalLaunchResp.executionId;
-      logResult("launch_idempotent_replay", replayOk, replayResp);
-      results.steps.push({ step: "launch_idempotent_replay", pass: replayOk });
-
-      // Step 7d: Replay conflict: same launchRequestId with changed prompt fails closed with payload_conflict
-      await ensureMockChatGptDom();
-      const conflictPayload = Object.assign({}, launchPayload, { promptText: "Changed prompt text!" });
-      const conflictResp = await chrome.runtime.sendMessage(conflictPayload);
-      const conflictOk = conflictResp && conflictResp.status === "error" && conflictResp.code === "payload_conflict";
-      logResult("launch_payload_conflict", conflictOk, conflictResp);
-      results.steps.push({ step: "launch_payload_conflict", pass: conflictOk });
 
       // Step 7e: Recover summaries verification
       const recoverResp = await chrome.runtime.sendMessage({ action: "recover" });
@@ -233,6 +255,21 @@ window.startTest = async function(config = {}) {
       const drainOk = drainResp && drainResp.status === "ok" && Array.isArray(drainResp.summaries);
       logResult("drain_real_native_host", drainOk, drainResp);
       results.steps.push({ step: "drain_real_native_host", pass: drainOk });
+
+      if (Array.isArray(config.expectedNotifications) && config.expectedNotifications.length > 0) {
+        const storedAfterDrain = await chrome.storage.local.get(null);
+        const receiptRecords = Object.entries(storedAfterDrain)
+          .filter(([key, value]) => key.startsWith("receipt_") && value && value.executionId)
+          .map(([, value]) => value);
+        for (const expected of config.expectedNotifications) {
+          const actual = receiptRecords.find((receipt) => receipt.executionId === expected.executionId);
+          const correlated = actual && actual.taskId === expected.taskId && actual.state === expected.state;
+          const messageOk = expected.message === undefined || (actual && actual.assistantText === expected.message);
+          const notificationOk = Boolean(correlated && messageOk);
+          logResult(`notification_${expected.state}_${expected.executionId}`, notificationOk, actual || null);
+          results.steps.push({ step: `notification_${expected.state}_${expected.executionId}`, pass: notificationOk });
+        }
+      }
 
       // Step 7h: AC4 Local storage loss and durable reconstruction verification
       // If any receipt was drained, delete local receipt storage, re-drain, and verify reconstructed

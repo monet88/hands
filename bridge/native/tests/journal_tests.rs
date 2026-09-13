@@ -5,6 +5,7 @@ use tempfile::tempdir;
 use hands_return_bridge::journal::{
     compute_payload_digest, AttemptEvidence, LaunchRequestParams,
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
+    ExplicitNotificationParams, ExplicitNotificationStatus,
 };
 
 fn init_git_repo(path: &std::path::Path) {
@@ -2290,4 +2291,323 @@ fn test_acquire_dispatch_fence_rejects_launch_binding_drift() {
     let grant = journal.acquire_dispatch_fence(&valid_params).unwrap();
     assert!(grant.granted, "Valid account evidence matching launch binding must be granted");
     assert_eq!(grant.state, "dispatching/uncertain");
+}
+
+fn setup_test_journal_with_launch() -> (tempfile::TempDir, tempfile::TempDir, Journal, String, String, String) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_path = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let pairing_id = "pair_test_notify";
+    let bootstrap_token = "tok_test_notify";
+    let profile_id = "prof_test_notify";
+
+    let targets = vec![TargetRecord {
+        target_id: "target_1".to_string(),
+        canonical_path: canonical_path.clone(),
+        name: "test-workspace".to_string(),
+    }];
+
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &targets, &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    let launch_request_id = "task_notify_1";
+    let params = LaunchRequestParams {
+        pairing_id: pairing_id.to_string(),
+        launch_request_id: launch_request_id.to_string(),
+        origin_conversation_id: "conv_notify_1".to_string(),
+        origin_conversation_url: "https://chatgpt.com/c/conv_notify_1".to_string(),
+        transcript_evidence_hash: "hash_transcript_1".to_string(),
+        account_evidence_hash: "hash_account_1".to_string(),
+        target_id: "target_1".to_string(),
+        policy_revision: "v1".to_string(),
+        prompt_text: "Test worker task".to_string(),
+    };
+
+    let claim = journal.reserve_or_claim_launch(&params).unwrap();
+    journal.mark_launch_attempt(&claim.execution_id, pairing_id).unwrap();
+
+    (temp_dir, target_dir, journal, pairing_id.to_string(), launch_request_id.to_string(), claim.execution_id)
+}
+
+#[test]
+fn test_record_explicit_notification_done() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    let res = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .expect("Explicit notify done must succeed");
+
+    assert_eq!(res.state, "completed");
+    assert_eq!(res.execution_id, execution_id);
+    assert_eq!(res.task_id, task_id);
+    assert!(!res.is_idempotent);
+
+    let rcpt = journal
+        .get_completion_receipt(&execution_id)
+        .unwrap()
+        .expect("Receipt must exist");
+    assert_eq!(rcpt.state, "completed");
+    assert_eq!(rcpt.stop_reason, "explicit_done");
+    assert_eq!(rcpt.task_id.as_deref(), Some(task_id.as_str()));
+}
+
+#[test]
+fn test_record_explicit_notification_failed_with_message() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+    let failure_msg = "Compilation failed: type mismatch on line 42".to_string();
+
+    let res = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Failed {
+                message: failure_msg.clone(),
+            },
+        })
+        .expect("Explicit notify failed must succeed");
+
+    assert_eq!(res.state, "failed");
+    assert_eq!(res.execution_id, execution_id);
+    assert_eq!(res.task_id, task_id);
+    assert!(!res.is_idempotent);
+
+    let rcpt = journal
+        .get_completion_receipt(&execution_id)
+        .unwrap()
+        .expect("Receipt must exist");
+    assert_eq!(rcpt.state, "failed");
+    assert_eq!(rcpt.stop_reason, "explicit_failed");
+    assert_eq!(rcpt.assistant_text, failure_msg);
+    assert_eq!(rcpt.task_id.as_deref(), Some(task_id.as_str()));
+}
+
+#[test]
+fn test_record_explicit_notification_bounds_utf8_failure_message_safely() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+    let failure_msg = format!("{}ế", "a".repeat(8191));
+
+    journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Failed {
+                message: failure_msg,
+            },
+        })
+        .expect("UTF-8 failure message must be bounded without panicking");
+
+    let rcpt = journal
+        .get_completion_receipt(&execution_id)
+        .unwrap()
+        .expect("Receipt must exist");
+    assert!(rcpt.assistant_text.len() <= 8192);
+    assert_eq!(rcpt.assistant_text, "a".repeat(8191));
+}
+
+#[test]
+fn test_record_explicit_notification_idempotent_done_retry() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    let res1 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap();
+    assert!(!res1.is_idempotent);
+
+    let res2 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id),
+            execution_id: Some(execution_id),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap();
+    assert!(res2.is_idempotent);
+    assert_eq!(res1.receipt_id, res2.receipt_id);
+}
+
+#[test]
+fn test_record_explicit_notification_idempotent_failed_retry() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    let res1 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Failed {
+                message: "Err 1".into(),
+            },
+        })
+        .unwrap();
+    assert!(!res1.is_idempotent);
+
+    let res2 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id),
+            execution_id: Some(execution_id),
+            status: ExplicitNotificationStatus::Failed {
+                message: "Err 1".into(),
+            },
+        })
+        .unwrap();
+    assert!(res2.is_idempotent);
+    assert_eq!(res1.receipt_id, res2.receipt_id);
+}
+
+#[test]
+fn test_record_explicit_notification_conflicting_state_rejected() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap();
+
+    let err = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Failed {
+                message: "Attempted failure after done".into(),
+            },
+        })
+        .unwrap_err();
+    assert_eq!(err, PairingError::PayloadConflict);
+
+    let rcpt = journal
+        .get_completion_receipt(&execution_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rcpt.state, "completed");
+    assert_eq!(rcpt.stop_reason, "explicit_done");
+}
+
+#[test]
+fn test_record_explicit_notification_unknown_task_and_mismatch() {
+    let (_dir, _target_dir, journal, _pairing_id, _task_id, execution_id) = setup_test_journal_with_launch();
+
+    // Unknown task only
+    let err1 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some("unknown_task_id".into()),
+            execution_id: None,
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap_err();
+    assert_eq!(err1, PairingError::NotFound);
+
+    // Unknown execution only
+    let err2 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: None,
+            execution_id: Some("exec_non_existent".into()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap_err();
+    assert_eq!(err2, PairingError::NotFound);
+
+    // Mismatched task and execution
+    let err3 = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some("mismatched_task_id".into()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap_err();
+    assert_eq!(err3, PairingError::ExecutionMismatch);
+
+    // Zero receipts created
+    assert!(journal.get_completion_receipt(&execution_id).unwrap().is_none());
+}
+
+#[test]
+fn test_record_explicit_notification_after_adapter_completion() {
+    let (dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    // Simulate adapter completion receipt (stop_reason: "stop", state: "completed")
+    {
+        let db_path = dir.path().join("journal.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO completion_receipts (
+                receipt_id, execution_id, pairing_id, return_token,
+                origin_conversation_id, turn_index, stop_reason,
+                assistant_message_id, assistant_text, content_digest,
+                tool_call_count, state, committed_at
+            ) VALUES ('rcpt_adapter_1', ?1, 'pair_test_notify', 'ret_adapter_1',
+                      'conv_notify_1', 1, 'stop', 'msg_1', 'Done by adapter', 'digest_adapter_1', 1, 'completed', 1000)
+            "#,
+            rusqlite::params![&execution_id],
+        ).unwrap();
+    }
+
+    // Agreeing explicit done: converges idempotently
+    let res = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .expect("Agreeing explicit done after adapter completion must succeed idempotently");
+    assert!(res.is_idempotent);
+    assert_eq!(res.receipt_id, "rcpt_adapter_1");
+
+    // Disagreeing explicit failed: rejects with PayloadConflict
+    let err = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id),
+            execution_id: Some(execution_id),
+            status: ExplicitNotificationStatus::Failed {
+                message: "Disagreeing failure".into(),
+            },
+        })
+        .unwrap_err();
+    assert_eq!(err, PairingError::PayloadConflict);
+}
+
+#[test]
+fn test_completion_receipt_projection_includes_task_id() {
+    let (_dir, _target_dir, journal, pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(task_id.clone()),
+            execution_id: Some(execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap();
+
+    let (summaries, receipts) = journal.drain_records(&pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].task_id.as_deref(), Some(task_id.as_str()));
+
+    let summary = summaries
+        .iter()
+        .find(|s| s.execution_id == execution_id)
+        .expect("Summary must exist");
+    let summary_rcpt = summary.completion_receipt.as_ref().expect("Receipt in summary");
+    assert_eq!(summary_rcpt.task_id.as_deref(), Some(task_id.as_str()));
 }

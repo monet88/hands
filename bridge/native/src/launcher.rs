@@ -424,11 +424,15 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
         // 2. Check existing receipt for deterministic duplicate or conflict
         const existing = db
           .query(
-            "SELECT receipt_id, content_digest FROM completion_receipts WHERE execution_id = ?"
+            "SELECT receipt_id, content_digest, stop_reason, state FROM completion_receipts WHERE execution_id = ?"
           )
-          .get(executionId) as { receipt_id: string; content_digest: string } | undefined;
+          .get(executionId) as { receipt_id: string; content_digest: string; stop_reason?: string; state?: string } | undefined;
 
         if (existing) {
+          if (existing.stop_reason === "explicit_done" || existing.stop_reason === "explicit_failed") {
+            // Authoritative explicit terminal notification exists: exit silently without writing or raising payload_conflict
+            return;
+          }
           if (existing.content_digest === digest) {
             return;
           } else {
@@ -439,7 +443,6 @@ export default function (pi: { on: (event: string, handler: (event: unknown, ctx
             throw new Error(`payload_conflict: conflicting completion digest for execution ${executionId}`);
           }
         }
-
         const receiptId = "rcpt_" + generateRandomHex(16);
         const nowSecs = Math.floor(Date.now() / 1000);
 
@@ -614,7 +617,7 @@ pub fn verify_launch_preflight(omp_bin_override: Option<&str>) -> Result<(), Lau
 pub fn build_omp_startup_command(
     adapter_path: &Path,
 ) -> Result<String, LauncherError> {
-    build_omp_startup_command_with_env(adapter_path, None, None)
+    build_omp_startup_command_with_env(adapter_path, None, None, None)
 }
 
 /// Builds native-owned OMP startup command for normal OMP execution with Return Bridge companion adapter and optional execution environment
@@ -622,8 +625,9 @@ pub fn build_omp_startup_command_with_env(
     adapter_path: &Path,
     execution_id: Option<&str>,
     state_dir: Option<&Path>,
+    task_id: Option<&str>,
 ) -> Result<String, LauncherError> {
-    build_omp_startup_command_with_env_and_bin(adapter_path, execution_id, state_dir, None)
+    build_omp_startup_command_with_env_and_bin(adapter_path, execution_id, state_dir, task_id, None)
 }
 
 /// Pure builder variant used by tests and callers that already resolved an OMP binary.
@@ -631,6 +635,7 @@ pub fn build_omp_startup_command_with_env_and_bin(
     adapter_path: &Path,
     execution_id: Option<&str>,
     state_dir: Option<&Path>,
+    task_id: Option<&str>,
     omp_bin_override: Option<&str>,
 ) -> Result<String, LauncherError> {
     let omp_bin = omp_bin_override
@@ -639,15 +644,24 @@ pub fn build_omp_startup_command_with_env_and_bin(
     let mut parts = Vec::new();
 
     if let Some(dir) = state_dir {
+        let state_dir_literal =
+            powershell_single_quoted(&dir.to_string_lossy().replace('\\', "/"));
         parts.push(format!(
             "$env:HANDS_RETURN_BRIDGE_STATE_DIR={};",
-            powershell_single_quoted(&dir.to_string_lossy().replace('\\', "/"))
+            state_dir_literal
         ));
+        parts.push(format!("$env:Path={} + ';' + $env:Path;", state_dir_literal));
     }
     if let Some(exec_id) = execution_id {
         parts.push(format!(
             "$env:HANDS_RETURN_BRIDGE_EXECUTION_ID={};",
             powershell_single_quoted(exec_id)
+        ));
+    }
+    if let Some(tid) = task_id {
+        parts.push(format!(
+            "$env:HANDS_TASK_ID={};",
+            powershell_single_quoted(tid)
         ));
     }
 

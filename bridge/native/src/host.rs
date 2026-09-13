@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::journal::{
     is_supported_approval_policy, is_supported_tool_policy, Journal, PolicyRecord, TargetRecord,
+    ExplicitNotificationParams, ExplicitNotificationResult, ExplicitNotificationStatus,
     LOCAL_PAIRING_ID,
 };
 use crate::protocol::{
@@ -24,6 +25,7 @@ pub enum HostError {
     Protocol(ProtocolError),
     InvalidTarget(String),
     Registry(String),
+    Notification(String),
 }
 
 impl From<std::io::Error> for HostError {
@@ -53,6 +55,7 @@ impl std::fmt::Display for HostError {
             HostError::Protocol(p) => write!(f, "Protocol error: {}", p),
             HostError::InvalidTarget(t) => write!(f, "Invalid target path: {}", t),
             HostError::Registry(r) => write!(f, "Registry error: {}", r),
+            HostError::Notification(n) => write!(f, "{}", n),
         }
     }
 }
@@ -986,6 +989,48 @@ pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>
         .get_targets(&pairing_id)
         .map_err(|e| HostError::Storage(e.to_string()))?;
     Ok(targets)
+}
+
+#[derive(Debug, Clone)]
+pub struct NotifyOptions {
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub status: ExplicitNotificationStatus,
+    pub state_dir: Option<PathBuf>,
+}
+
+pub fn execute_notify(options: NotifyOptions) -> Result<ExplicitNotificationResult, HostError> {
+    let state_dir = resolve_state_dir(options.state_dir.as_deref())?;
+    let db_path = state_dir.join("journal.sqlite");
+    if !db_path.exists() {
+        return Err(HostError::Storage(format!(
+            "Return Bridge journal database not found at {}",
+            db_path.display()
+        )));
+    }
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+    let task_id = options.task_id.or_else(|| {
+        std::env::var("HANDS_TASK_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let execution_id = options.execution_id.or_else(|| {
+        std::env::var("HANDS_RETURN_BRIDGE_EXECUTION_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
+    let params = ExplicitNotificationParams {
+        task_id,
+        execution_id,
+        status: options.status,
+    };
+    journal.record_explicit_notification(&params).map_err(|e| match e {
+        crate::journal::PairingError::StorageError(s) => HostError::Storage(s),
+        other => HostError::Notification(other.to_string()),
+    })
 }
 
 #[cfg(test)]

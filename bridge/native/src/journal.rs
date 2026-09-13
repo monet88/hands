@@ -193,6 +193,28 @@ pub struct LaunchClaimResult {
     pub state: String,
     pub is_replayed: bool,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExplicitNotificationStatus {
+    Done,
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicitNotificationParams {
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub status: ExplicitNotificationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicitNotificationResult {
+    pub receipt_id: String,
+    pub execution_id: String,
+    pub task_id: String,
+    pub state: String,
+    pub is_idempotent: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionReceipt {
@@ -203,6 +225,8 @@ pub struct CompletionReceipt {
     pub origin_conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_conversation_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +249,7 @@ impl CompletionReceipt {
         let delivery_revision: Option<i64> = r.get::<_, Option<i64>>(14).ok().flatten();
         let delivery_status: Option<String> = r.get::<_, Option<String>>(15).ok().flatten();
         let active_attempt_id: Option<String> = r.get::<_, Option<String>>(16).ok().flatten();
+        let task_id: Option<String> = r.get::<_, Option<String>>(17).ok().flatten();
 
         Ok(Self {
             receipt_id: r.get(0)?,
@@ -233,6 +258,7 @@ impl CompletionReceipt {
             return_token: r.get(3)?,
             origin_conversation_id: r.get(4)?,
             origin_conversation_url,
+            task_id,
             delivery_revision,
             delivery_status,
             active_attempt_id,
@@ -1723,7 +1749,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                            cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                            cr.assistant_message_id, cr.assistant_text, cr.content_digest,
                            cr.tool_call_count, cr.state, cr.committed_at,
-                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id, lr.launch_request_id
                     FROM completion_receipts cr
                     LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
                     LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
@@ -1783,7 +1809,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                            cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                            cr.assistant_message_id, cr.assistant_text, cr.content_digest,
                            cr.tool_call_count, cr.state, cr.committed_at,
-                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id, lr.launch_request_id
                     FROM completion_receipts cr
                     LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
                     LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
@@ -1811,7 +1837,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                        cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                        cr.assistant_message_id, cr.assistant_text, cr.content_digest,
                        cr.tool_call_count, cr.state, cr.committed_at,
-                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id, lr.launch_request_id
                 FROM completion_receipts cr
                 LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
                 LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
@@ -1878,7 +1904,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                            cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                            cr.assistant_message_id, cr.assistant_text, cr.content_digest,
                            cr.tool_call_count, cr.state, cr.committed_at,
-                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                           lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id, lr.launch_request_id
                     FROM completion_receipts cr
                     LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
                     LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
@@ -1902,7 +1928,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                        cr.origin_conversation_id, cr.turn_index, cr.stop_reason,
                        cr.assistant_message_id, cr.assistant_text, cr.content_digest,
                        cr.tool_call_count, cr.state, cr.committed_at,
-                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id
+                       lr.origin_conversation_url, df.delivery_revision, df.state, df.attempt_id, lr.launch_request_id
                 FROM completion_receipts cr
                 LEFT JOIN launch_requests lr ON cr.execution_id = lr.execution_id
                 LEFT JOIN dispatch_fences df ON cr.receipt_id = df.receipt_id
@@ -2598,5 +2624,210 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
         Ok(row)
+    }
+    pub fn record_explicit_notification(
+        &self,
+        params: &ExplicitNotificationParams,
+    ) -> Result<ExplicitNotificationResult, PairingError> {
+        let mut conn = self.conn.lock();
+
+        let has_task = params.task_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let has_exec = params.execution_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+
+        if !has_task && !has_exec {
+            return Err(PairingError::ExecutionMismatch);
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        struct LaunchRow {
+            pairing_id: String,
+            launch_request_id: String,
+            execution_id: String,
+            return_token: String,
+            origin_conversation_id: String,
+        }
+
+        let launch: LaunchRow = if let Some(exec_id) = params.execution_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            let row_opt: Option<(String, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT pairing_id, launch_request_id, execution_id, return_token, origin_conversation_id FROM launch_requests WHERE execution_id = ?1",
+                    params![exec_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+            let row = row_opt.ok_or(PairingError::NotFound)?;
+
+            if let Some(expected_task) = params.task_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                if row.1 != expected_task {
+                    return Err(PairingError::ExecutionMismatch);
+                }
+            }
+
+            LaunchRow {
+                pairing_id: row.0,
+                launch_request_id: row.1,
+                execution_id: row.2,
+                return_token: row.3,
+                origin_conversation_id: row.4,
+            }
+        } else {
+            let task_id = params.task_id.as_deref().unwrap().trim();
+            let mut stmt = tx
+                .prepare("SELECT pairing_id, launch_request_id, execution_id, return_token, origin_conversation_id FROM launch_requests WHERE launch_request_id = ?1")
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![task_id], |r| {
+                    Ok(LaunchRow {
+                        pairing_id: r.get(0)?,
+                        launch_request_id: r.get(1)?,
+                        execution_id: r.get(2)?,
+                        return_token: r.get(3)?,
+                        origin_conversation_id: r.get(4)?,
+                    })
+                })
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+            let mut matches = Vec::new();
+            for r in rows {
+                matches.push(r.map_err(|e| PairingError::StorageError(e.to_string()))?);
+            }
+
+            if matches.is_empty() {
+                return Err(PairingError::NotFound);
+            }
+            if matches.len() == 1 {
+                matches.remove(0)
+            } else {
+                let mut active_matches = Vec::new();
+                for m in matches {
+                    if let Ok(st) = Self::get_pairing_status_inner(&tx, &m.pairing_id) {
+                        if st == PairingStatus::Active {
+                            active_matches.push(m);
+                        }
+                    }
+                }
+                if active_matches.len() == 1 {
+                    active_matches.remove(0)
+                } else {
+                    return Err(PairingError::NotFound);
+                }
+            }
+        };
+
+        let pairing_status = Self::get_pairing_status_inner(&tx, &launch.pairing_id)?;
+        if pairing_status != PairingStatus::Active {
+            return Err(if pairing_status == PairingStatus::Revoked {
+                PairingError::Retired
+            } else {
+                PairingError::NotActive
+            });
+        }
+
+        let (target_state, stop_reason, assistant_text) = match &params.status {
+            ExplicitNotificationStatus::Done => ("completed", "explicit_done", String::new()),
+            ExplicitNotificationStatus::Failed { message } => {
+                let bounded_msg = if message.len() > 8192 {
+                    let mut end = 8192;
+                    while !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    message[..end].to_string()
+                } else {
+                    message.clone()
+                };
+                ("failed", "explicit_failed", bounded_msg)
+            }
+        };
+
+        let existing_receipt: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT receipt_id, state, stop_reason FROM completion_receipts WHERE execution_id = ?1",
+                params![&launch.execution_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        if let Some((existing_id, existing_state, _existing_stop_reason)) = existing_receipt {
+            if existing_state == target_state {
+                return Ok(ExplicitNotificationResult {
+                    receipt_id: existing_id,
+                    execution_id: launch.execution_id,
+                    task_id: launch.launch_request_id,
+                    state: existing_state,
+                    is_idempotent: true,
+                });
+            } else {
+                return Err(PairingError::PayloadConflict);
+            }
+        }
+
+        let receipt_id = generate_random_secret("rcpt", 16)?;
+        let now = now_epoch_secs();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"hands_rb_explicit_v1:");
+        hasher.update(target_state.as_bytes());
+        hasher.update(b":");
+        hasher.update(assistant_text.as_bytes());
+        let content_digest = hex::encode(hasher.finalize());
+
+        tx.execute(
+            r#"
+            INSERT INTO completion_receipts (
+                receipt_id, execution_id, pairing_id, return_token,
+                origin_conversation_id, turn_index, stop_reason,
+                assistant_message_id, assistant_text, content_digest,
+                tool_call_count, state, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7, ?8, 0, ?9, ?10)
+            "#,
+            params![
+                &receipt_id,
+                &launch.execution_id,
+                &launch.pairing_id,
+                &launch.return_token,
+                &launch.origin_conversation_id,
+                stop_reason,
+                &assistant_text,
+                &content_digest,
+                target_state,
+                now,
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.execute(
+            "UPDATE launch_requests SET state = ?1, updated_at = ?2 WHERE execution_id = ?3",
+            params![target_state, now, &launch.execution_id],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let failure_reason_opt = if target_state == "failed" {
+            Some(assistant_text.as_str())
+        } else {
+            None
+        };
+
+        tx.execute(
+            "UPDATE launch_attempts SET state = ?1, failure_reason = ?2 WHERE execution_id = ?3",
+            params![target_state, failure_reason_opt, &launch.execution_id],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(ExplicitNotificationResult {
+            receipt_id,
+            execution_id: launch.execution_id,
+            task_id: launch.launch_request_id,
+            state: target_state.to_string(),
+            is_idempotent: false,
+        })
     }
 }

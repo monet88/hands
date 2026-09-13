@@ -102,10 +102,11 @@ async function performScheduledDrain() {
   }
 }
 
-function buildReceiptRecord(rcpt, fallbackOriginConversationUrl) {
+function buildReceiptRecord(rcpt, fallbackOriginConversationUrl, fallbackTaskId) {
   return {
     receiptId: rcpt.receipt_id,
     executionId: rcpt.execution_id,
+    taskId: rcpt.task_id || fallbackTaskId || undefined,
     pairingId: rcpt.pairing_id,
     returnToken: rcpt.return_token,
     originConversationId: rcpt.origin_conversation_id,
@@ -148,7 +149,7 @@ async function processDrainResponse(drainResponse, stored, profileId) {
       if (!existing) {
         // Local storage was lost or missing: reconstruct from native durable authority
         // Retain durable deliveryStatus, deliveryRevision, and originConversationUrl from native (Findings 1, 3)
-        const reconstructedRecord = buildReceiptRecord(rcpt, summary.origin_conversation_url);
+        const reconstructedRecord = buildReceiptRecord(rcpt, summary.origin_conversation_url, summary.launch_request_id);
         try {
           await chrome.storage.local.set({
             [receiptStorageKey]: reconstructedRecord,
@@ -180,6 +181,10 @@ async function processDrainResponse(drainResponse, stored, profileId) {
         }
         if ((rcpt.origin_conversation_url || summary.origin_conversation_url) && !existing.originConversationUrl) {
           existing.originConversationUrl = rcpt.origin_conversation_url || summary.origin_conversation_url;
+          updated = true;
+        }
+        if ((rcpt.task_id || summary.launch_request_id) && !existing.taskId) {
+          existing.taskId = rcpt.task_id || summary.launch_request_id;
           updated = true;
         }
         if (updated) {
@@ -314,7 +319,19 @@ function sendNative(msg) {
 
 function buildContinuationPayload(rcpt) {
   const receiptMarker = `[hands-return-bridge:receipt=${rcpt.receiptId}]`;
-  const continuationText = `[Hands Return Bridge] Local agent execution completed (receipt: ${rcpt.receiptId}, execution: ${rcpt.executionId}). Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+  const taskId = rcpt.taskId || rcpt.task_id || rcpt.executionId;
+  const executionId = rcpt.executionId || rcpt.execution_id;
+  const terminalStatus = rcpt.state || "completed";
+
+  let continuationText;
+  if (terminalStatus === "failed") {
+    const rawMsg = rcpt.assistantText || rcpt.assistant_text || "";
+    const boundedMsg = typeof rawMsg === "string" && rawMsg.trim() ? rawMsg.trim().slice(0, 1024) : "";
+    const failureDetail = boundedMsg ? `: ${boundedMsg}` : "";
+    continuationText = `[Hands Return Bridge] Local agent execution failed (task: ${taskId}, execution: ${executionId}, receipt: ${rcpt.receiptId}, status: ${terminalStatus})${failureDetail}. Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+  } else {
+    continuationText = `[Hands Return Bridge] Local agent execution completed (task: ${taskId}, execution: ${executionId}, receipt: ${rcpt.receiptId}, status: ${terminalStatus}). Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+  }
   return { receiptMarker, continuationText };
 }
 

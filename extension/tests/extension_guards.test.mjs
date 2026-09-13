@@ -196,6 +196,7 @@ function createTestHarness({
     sendMessage,
     storageStore,
     nativeMessagesSent,
+    context,
     mockChrome
   };
 }
@@ -4594,6 +4595,77 @@ async function runTests() {
     );
 
     console.log("  [PASS] checkReadinessGuards inspects raw composer text and blocks on whitespace-only user drafts");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 47: buildContinuationPayload formats task_id, execution_id, terminal status, and bounded failure
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness();
+
+    // Completed status includes task, execution, receipt, and status completed
+    const payloadDone = harness.context.buildContinuationPayload({
+      receiptId: "rcpt_done_1",
+      executionId: "exec_done_1",
+      taskId: "task_done_1",
+      state: "completed"
+    });
+    assert.ok(payloadDone.continuationText.includes("task: task_done_1"));
+    assert.ok(payloadDone.continuationText.includes("execution: exec_done_1"));
+    assert.ok(payloadDone.continuationText.includes("receipt: rcpt_done_1"));
+    assert.ok(payloadDone.continuationText.includes("status: completed"));
+    assert.ok(payloadDone.continuationText.includes("[Hands Return Bridge] Local agent execution completed"));
+    assert.equal(payloadDone.receiptMarker, "[hands-return-bridge:receipt=rcpt_done_1]");
+
+    // Failed status with message includes failure details
+    const payloadFailed = harness.context.buildContinuationPayload({
+      receiptId: "rcpt_fail_1",
+      executionId: "exec_fail_1",
+      taskId: "task_fail_1",
+      state: "failed",
+      assistantText: "Fatal: out of memory on build"
+    });
+    assert.ok(payloadFailed.continuationText.includes("task: task_fail_1"));
+    assert.ok(payloadFailed.continuationText.includes("execution: exec_fail_1"));
+    assert.ok(payloadFailed.continuationText.includes("receipt: rcpt_fail_1"));
+    assert.ok(payloadFailed.continuationText.includes("status: failed"));
+    assert.ok(payloadFailed.continuationText.includes("Fatal: out of memory on build"));
+    assert.ok(payloadFailed.continuationText.includes("[Hands Return Bridge] Local agent execution failed"));
+    assert.equal(payloadFailed.receiptMarker, "[hands-return-bridge:receipt=rcpt_fail_1]");
+
+    // Drain reconciles task_id into storage record
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };
+    harness.storageStore.isPaired = true;
+    harness.storageStore.pairingId = "pair_1";
+    harness.storageStore.pairingSecret = "sec_1";
+
+    harness.mockChrome.runtime.sendNativeMessage = (_host, msg, cb) => {
+      if (msg.op === "drain") {
+        cb({
+          status: "ok",
+          summaries: [],
+          receipts: [{
+            receipt_id: "rcpt_drain_task_1",
+            execution_id: "exec_drain_1",
+            task_id: "task_drain_99",
+            pairing_id: "pair_1",
+            return_token: "tok_1",
+            origin_conversation_id: "c_1",
+            state: "completed"
+          }]
+        });
+      } else if (msg.op === "ack") {
+        cb({ status: "ok", acknowledged: true });
+      }
+    };
+
+    const drainResp = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(drainResp.status, "ok");
+    const storedRcpt = harness.storageStore["receipt_rcpt_drain_task_1"];
+    assert.ok(storedRcpt, "Drained receipt must be persisted in storage");
+    assert.equal(storedRcpt.taskId, "task_drain_99", "Drained receipt must retain taskId from native task_id");
+
+    console.log("  [PASS] buildContinuationPayload and drain preserve task_id, execution_id, and terminal status fields");
   }
 
   clearInterval(keepAlive);

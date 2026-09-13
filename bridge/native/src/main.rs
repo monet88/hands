@@ -2,11 +2,11 @@ use std::env;
 use std::path::PathBuf;
 
 use hands_return_bridge::host::{
-    LocalInitOptions, SetupOptions, TargetAddOptions, TargetListOptions, TargetRemoveOptions,
-    execute_local_init, execute_setup, execute_target_add, execute_target_list,
+    LocalInitOptions, NotifyOptions, SetupOptions, TargetAddOptions, TargetListOptions, TargetRemoveOptions,
+    execute_local_init, execute_notify, execute_setup, execute_target_add, execute_target_list,
     execute_target_remove, resolve_state_dir, run_native_host,
 };
-use hands_return_bridge::journal::Journal;
+use hands_return_bridge::journal::{ExplicitNotificationStatus, Journal};
 use hands_return_bridge::protocol::TRUST_NOTICE;
 
 fn print_help() {
@@ -21,6 +21,8 @@ Usage:
   hands-return-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
   hands-return-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
   hands-return-bridge target list [--pairing-id <id>] [--state-dir <dir>]
+  hands-return-bridge notify done [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-return-bridge notify failed --message <text> [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
@@ -571,6 +573,95 @@ fn main() {
                 other => {
                     eprintln!("Unknown target subcommand: {}", other);
                     print_help();
+                    std::process::exit(1);
+                }
+            }
+        }
+        "notify" => {
+            if args.len() < 3 {
+                eprintln!("Usage: hands-return-bridge notify done [--task <task_id>] | failed --message <text> [--task <task_id>]");
+                std::process::exit(2);
+            }
+            let sub = args[2].as_str();
+            let mut task_id = None;
+            let mut execution_id = None;
+            let mut state_dir = None;
+            let mut message = None;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--task" if i + 1 < args.len() => {
+                        task_id = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--execution-id" if i + 1 < args.len() => {
+                        execution_id = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--message" if i + 1 < args.len() => {
+                        message = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let status = match sub {
+                "done" => {
+                    if message.is_some() {
+                        eprintln!("error: --message is not supported for 'notify done'");
+                        std::process::exit(2);
+                    }
+                    ExplicitNotificationStatus::Done
+                }
+                "failed" => {
+                    let msg = match message {
+                        Some(m) if !m.trim().is_empty() => m,
+                        _ => {
+                            eprintln!("error: --message is required for 'notify failed'");
+                            std::process::exit(2);
+                        }
+                    };
+                    ExplicitNotificationStatus::Failed { message: msg }
+                }
+                other => {
+                    eprintln!("error: unknown notify subcommand '{}'", other);
+                    std::process::exit(2);
+                }
+            };
+
+            let options = NotifyOptions {
+                task_id,
+                execution_id,
+                status,
+                state_dir,
+            };
+
+            match execute_notify(options) {
+                Ok(res) => {
+                    if res.is_idempotent {
+                        println!(
+                            "Notification already recorded (receipt: {}, task: {}, execution: {}, status: {}).",
+                            res.receipt_id, res.task_id, res.execution_id, res.state
+                        );
+                    } else {
+                        println!(
+                            "Notification recorded (receipt: {}, task: {}, execution: {}, status: {}).",
+                            res.receipt_id, res.task_id, res.execution_id, res.state
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
             }
