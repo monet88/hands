@@ -512,7 +512,7 @@ async function main() {
 
     // Use sqlite3 CLI or python script to seed a real completion receipt directly into SQLite journal
     const seedSql = `
-      INSERT INTO completion_receipts (
+      INSERT OR REPLACE INTO completion_receipts (
         receipt_id, execution_id, pairing_id, return_token,
         origin_conversation_id, turn_index, stop_reason,
         assistant_message_id, assistant_text, content_digest,

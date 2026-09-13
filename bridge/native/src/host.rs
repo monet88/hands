@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::journal::{
     is_supported_approval_policy, is_supported_tool_policy, Journal, PolicyRecord, TargetRecord,
+    LOCAL_PAIRING_ID,
 };
 use crate::protocol::{
     ProtocolError, TRUST_NOTICE, handle_native_message, read_native_message, write_native_message,
@@ -256,6 +257,193 @@ pub struct SetupResult {
     pub trust_notice: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalInitOptions {
+    pub browser: String,
+    pub extension_id: String,
+    pub state_dir: Option<PathBuf>,
+    pub skip_registry: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalInitResult {
+    pub browser: String,
+    pub extension_id: String,
+    pub pairing_id: String,
+    pub manifest_path: PathBuf,
+}
+
+pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, HostError> {
+    if !opts.skip_registry {
+        #[cfg(not(windows))]
+        {
+            return Err(HostError::Registry(
+                "Native messaging host automatic registration is only supported on Windows. Use --skip-registry for manual host manifest setup on non-Windows platforms.".to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        if opts.state_dir.is_some() {
+            return Err(HostError::Storage(
+                "--state-dir is only supported with --skip-registry".to_string(),
+            ));
+        }
+    }
+
+    let browser = opts.browser.trim().to_lowercase();
+    if browser != "chrome" && browser != "edge" {
+        return Err(HostError::Storage(format!(
+            "Invalid browser '{}': only 'chrome' and 'edge' are supported",
+            opts.browser
+        )));
+    }
+    let extension_id = opts.extension_id.trim();
+    if extension_id.is_empty() {
+        return Err(HostError::Storage("Missing required --extension-id".to_string()));
+    }
+
+    let state_dir = if opts.skip_registry {
+        resolve_state_dir(opts.state_dir.as_deref())?
+    } else {
+        resolve_default_state_dir()?
+    };
+    std::fs::create_dir_all(&state_dir)?;
+    let state_dir = state_dir.canonicalize()?;
+    let journal = Journal::open(&state_dir.join("journal.sqlite"))
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    journal
+        .ensure_local_pairing()
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let manifest_path = state_dir.join(format!("{}.json", DEFAULT_HOST_NAME));
+    let previous_manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(HostError::Io(e)),
+    };
+
+    let current_exe = std::env::current_exe()?;
+    // Snapshot the pre-existing registry state BEFORE any manifest side effect, so a
+    // snapshot failure (reg.exe spawn/read) aborts before the manifest is replaced
+    // instead of leaving the manifest and journal inconsistent.
+    #[cfg(windows)]
+    let prior_reg_snapshot = if !opts.skip_registry {
+        Some(snapshot_manifest_registry(&browser)?)
+    } else {
+        None
+    };
+
+    let manifest_json = json!({
+        "name": DEFAULT_HOST_NAME,
+        "description": "Hands Return Bridge Native Companion Host",
+        "path": current_exe.to_string_lossy(),
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{}/", extension_id)]
+    });
+    write_manifest_atomic(&manifest_path, &serde_json::to_vec_pretty(&manifest_json)?)?;
+
+    if !opts.skip_registry {
+        #[cfg(windows)]
+        {
+            if let Err(e) = register_manifest_registry(&browser, &manifest_path) {
+                let restore_result = match previous_manifest.as_deref() {
+                    Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+                    None => match std::fs::remove_file(&manifest_path) {
+                        Ok(()) => Ok(()),
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(remove_err) => Err(HostError::Io(remove_err)),
+                    },
+                };
+                let reg_restore = if let Some(snapshot) = &prior_reg_snapshot {
+                    restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+                } else {
+                    Ok(())
+                };
+                match (restore_result, reg_restore) {
+                    (Err(restore_err), Ok(())) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}",
+                            e, restore_err
+                        )));
+                    }
+                    (Ok(()), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to rollback registry registration: {}",
+                            e, reg_err
+                        )));
+                    }
+                    (Err(restore_err), Err(reg_err)) => {
+                        return Err(HostError::Registry(format!(
+                            "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                            e, restore_err, reg_err
+                        )));
+                    }
+                    (Ok(()), Ok(())) => return Err(e),
+                }
+            }
+        }
+    }
+
+    // Deterministic test-only seam: fail after manifest/registry write to exercise rollback.
+    // Gated behind cfg(test) so it is compiled out of production builds, and scoped to the
+    // injected state_dir so parallel tests using other temp dirs are unaffected.
+    #[cfg(test)]
+    let fault_armed = std::env::var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL")
+        .map(|v| v == "1" || v == state_dir.to_string_lossy())
+        .unwrap_or(false);
+    #[cfg(not(test))]
+    let fault_armed = false;
+    let journal_update_result = if fault_armed {
+        Err(HostError::Storage("injected journal update failure".to_string()))
+    } else {
+        journal.set_local_extension_id(extension_id).map_err(|e| HostError::Storage(e.to_string()))
+    };
+    if let Err(e) = journal_update_result {
+        let restore_result = match previous_manifest.as_deref() {
+            Some(bytes) => write_manifest_atomic(&manifest_path, bytes),
+            None => match std::fs::remove_file(&manifest_path) {
+                Ok(()) => Ok(()),
+                Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove_err) => Err(HostError::Io(remove_err)),
+            },
+        };
+        #[cfg(windows)]
+        let registry_rollback: Result<(), String> = if let Some(snapshot) = &prior_reg_snapshot {
+            restore_manifest_registry_snapshot(snapshot).map_err(|re| re.to_string())
+        } else {
+            Ok(())
+        };
+        #[cfg(not(windows))]
+        let registry_rollback: Result<(), String> = Ok(());
+        match (restore_result, registry_rollback) {
+            (Ok(()), Ok(())) => return Err(e),
+            (Err(restore_err), Ok(())) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}",
+                    e, restore_err
+                )))
+            }
+            (Ok(()), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to rollback registry registration: {}",
+                    e, reg_err
+                )))
+            }
+            (Err(restore_err), Err(reg_err)) => {
+                return Err(HostError::Storage(format!(
+                    "{}; additionally failed to restore previous manifest: {}; additionally failed to rollback registry registration: {}",
+                    e, restore_err, reg_err
+                )))
+            }
+        }
+    }
+    Ok(LocalInitResult {
+        browser,
+        extension_id: extension_id.to_string(),
+        pairing_id: LOCAL_PAIRING_ID.to_string(),
+        manifest_path,
+    })
+}
+
 pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
     // Fail-closed explicitly on unsupported platforms before any durable setup side effects
     if !opts.skip_registry {
@@ -440,31 +628,142 @@ pub fn execute_setup(opts: &SetupOptions) -> Result<SetupResult, HostError> {
 }
 
 #[cfg(windows)]
-pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
-    let reg_keys = match browser.to_lowercase().as_str() {
+pub fn manifest_registry_keys(browser: &str) -> Vec<String> {
+    let host_name = std::env::var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST_NAME.to_string());
+
+    match browser.to_lowercase().as_str() {
         "edge" => vec![format!(
             r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "chrome" => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
         "all" | "both" => vec![
             format!(
                 r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
             format!(
                 r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\{}",
-                DEFAULT_HOST_NAME
+                host_name
             ),
         ],
         _ => vec![format!(
             r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
-            DEFAULT_HOST_NAME
+            host_name
         )],
-    };
+    }
+}
+
+/// Snapshot of the pre-registration registry state for rollback.
+///
+/// Per key: `None` = key did not exist; `Some(None)` = key existed but had no
+/// (usable) default value; `Some(Some(value))` = key existed with that default
+/// value. Key existence is probed separately from the default value because
+/// `reg.exe query <key> /ve` renders an unset default inconsistently (empty field
+/// or "(value not set)") across key shapes; treating that as "key absent" would
+/// delete a pre-existing key and its named values during rollback.
+#[cfg(windows)]
+pub fn snapshot_manifest_registry(browser: &str) -> Result<Vec<(String, Option<Option<String>>)>, HostError> {
+    let keys = manifest_registry_keys(browser);
+    let mut snapshot = Vec::new();
+    for key in keys {
+        let key_query = Command::new("reg.exe").args(["query", &key]).output()?;
+        if !key_query.status.success() {
+            // Key does not exist prior to registration
+            snapshot.push((key, None));
+            continue;
+        }
+        let default_query = Command::new("reg.exe").args(["query", &key, "/ve"]).output()?;
+        if !default_query.status.success() {
+            // Key exists but has no default value at all
+            snapshot.push((key, Some(None)));
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&default_query.stdout);
+        let mut prior_default: Option<String> = None;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("REG_SZ") {
+                if let Some(pos) = trimmed.find("REG_SZ") {
+                    let raw_val = trimmed[pos + "REG_SZ".len()..].trim();
+                    // `reg query /ve` renders an unset default both as an empty field and as
+                    // "(value not set)"; neither is a usable prior manifest path, so both
+                    // collapse to the same state (key exists, no default value).
+                    if !raw_val.is_empty() && !raw_val.eq_ignore_ascii_case("(value not set)") {
+                        prior_default = Some(raw_val.to_string());
+                    }
+                }
+                break;
+            }
+        }
+        snapshot.push((key, Some(prior_default)));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+pub fn restore_manifest_registry_snapshot(
+    snapshot: &[(String, Option<Option<String>>)],
+) -> Result<(), HostError> {
+    for (key, prior_state) in snapshot {
+        match prior_state {
+            Some(Some(prev_val)) => {
+                // Key existed before: restore its prior default value
+                let output = Command::new("reg.exe")
+                    .args(["add", key, "/ve", "/t", "REG_SZ", "/d", prev_val, "/f"])
+                    .output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr);
+                    return Err(HostError::Registry(format!(
+                        "reg.exe add restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+            Some(None) => {
+                // Key existed before without a default value: delete only the value
+                // registration added, preserving the key and its named values.
+                let output = Command::new("reg.exe")
+                    .args(["delete", key, "/ve", "/f"])
+                    .output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if !(err_msg.contains("unable to find") || err_msg.contains("was not found")) {
+                        return Err(HostError::Registry(format!(
+                            "reg.exe delete restore failed for {}: {}",
+                            key, err_msg
+                        )));
+                    }
+                }
+            }
+            None => {
+                // Key did not exist before: delete the newly created key
+                let output = Command::new("reg.exe").args(["delete", key, "/f"]).output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if err_msg.contains("unable to find") || err_msg.contains("was not found") {
+                        continue;
+                    }
+                    return Err(HostError::Registry(format!(
+                        "reg.exe delete restore failed for {}: {}",
+                        key, err_msg
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result<(), HostError> {
+    let reg_keys = manifest_registry_keys(browser);
 
     for key in reg_keys {
         let manifest_str = manifest_path.to_string_lossy();
@@ -483,6 +782,7 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
 
     Ok(())
 }
+
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
     let state_dir = resolve_state_dir(state_dir_opt)?;
@@ -557,4 +857,355 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetAddOptions {
+    pub pairing_id: Option<String>,
+    pub target_path: String,
+    pub target_id: Option<String>,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetRemoveOptions {
+    pub pairing_id: Option<String>,
+    pub target_id: String,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetListOptions {
+    pub pairing_id: Option<String>,
+    pub state_dir: Option<PathBuf>,
+}
+
+fn resolve_pairing_id_for_target_cmd(
+    journal: &Journal,
+    explicit_pairing_id: Option<&str>,
+) -> Result<String, HostError> {
+    if let Some(pid) = explicit_pairing_id {
+        let trimmed = pid.trim();
+        if trimmed.is_empty() {
+            return Err(HostError::Storage(
+                "--pairing-id must not be empty or whitespace".to_string(),
+            ));
+        }
+        return Ok(trimmed.to_string());
+    }
+    let active_ids = journal
+        .get_active_pairing_ids()
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    match active_ids.len() {
+        0 => Err(HostError::Storage(
+            "No active pairing found. Please run setup first or provide --pairing-id.".to_string(),
+        )),
+        1 => Ok(active_ids[0].clone()),
+        _ => Err(HostError::Storage(format!(
+            "Multiple active pairings found ({:?}). Please specify --pairing-id <id> explicitly.",
+            active_ids
+        ))),
+    }
+}
+
+pub fn execute_target_add(opts: &TargetAddOptions) -> Result<TargetRecord, HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    std::fs::create_dir_all(&state_dir)?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let raw_path = Path::new(&opts.target_path);
+    let canonical_path = verify_and_canonicalize_git_target(raw_path)?;
+    let canonical_path_str = canonical_path.to_string_lossy().to_string();
+
+    let derived_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let target_id = match opts.target_id.as_deref() {
+        Some(id) if id.trim().is_empty() => {
+            return Err(HostError::Storage(
+                "--target-id must not be empty or whitespace".to_string(),
+            ));
+        }
+        Some(id) => id.trim().to_string(),
+        None => derived_name.clone(),
+    };
+
+    let target = TargetRecord {
+        target_id,
+        canonical_path: canonical_path_str,
+        name: derived_name,
+    };
+
+    journal
+        .add_target_admin(&pairing_id, &target)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    Ok(target)
+}
+
+pub fn execute_target_remove(opts: &TargetRemoveOptions) -> Result<(), HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let target_id = opts.target_id.trim();
+    if target_id.is_empty() {
+        return Err(HostError::Storage(
+            "--target-id must not be empty or whitespace".to_string(),
+        ));
+    }
+
+    journal
+        .remove_target_admin(&pairing_id, target_id)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+
+    Ok(())
+}
+
+pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>, HostError> {
+    let state_dir = resolve_state_dir(opts.state_dir.as_deref())?;
+    let db_path = state_dir.join("journal.sqlite");
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+
+    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+
+    let status = journal.get_pairing_status(&pairing_id).map_err(|e| HostError::Storage(e.to_string()))?;
+    if status != crate::journal::PairingStatus::Active {
+        return Err(HostError::Storage(format!("Pairing '{}' is not active ({:?})", pairing_id, status)));
+    }
+
+    let targets = journal
+        .get_targets(&pairing_id)
+        .map_err(|e| HostError::Storage(e.to_string()))?;
+    Ok(targets)
+}
+
+#[cfg(test)]
+mod local_init_rollback_tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    /// Serializes tests that mutate process-global environment variables used by the
+    /// local-init rollback seam (`LOCALAPPDATA`, `HANDS_RETURN_BRIDGE_TEST_HOST_NAME`).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn arm_fault(state_dir: &Path) {
+        std::env::set_var(
+            "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+            state_dir.to_string_lossy().to_string(),
+        );
+    }
+
+    fn clear_fault() {
+        std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    }
+
+    /// `reg query /ve` cannot distinguish "no default value" from a default value set to
+    /// the literal string "(value not set)"; `reg export` can, because it emits an `@=`
+    /// assignment only when a default value actually exists.
+    #[cfg(windows)]
+    fn export_key_text(key: &str, dir: &Path) -> String {
+        let export_path = dir.join("registry_default_probe.reg");
+        let output = Command::new("reg.exe")
+            .args(["export", key, &export_path.to_string_lossy(), "/y"])
+            .output()
+            .expect("reg.exe export must run");
+        assert!(
+            output.status.success(),
+            "reg.exe export failed for {}: {}",
+            key,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&export_path).unwrap();
+        // reg.exe export writes UTF-16LE; fall back to UTF-8 if the file is not.
+        let text = if bytes.len() % 2 == 0 && bytes.len() >= 2 {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+        text
+    }
+
+    #[test]
+    fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        let ext_initial = "initial_extension_id_abcdef";
+
+        // 1. First init succeeds
+        let res1 = execute_local_init(&LocalInitOptions {
+            browser: "chrome".to_string(),
+            extension_id: ext_initial.to_string(),
+            state_dir: Some(state_dir.clone()),
+            skip_registry: true,
+        })
+        .expect("first local init failed");
+        assert!(std::fs::read_to_string(&res1.manifest_path)
+            .unwrap()
+            .contains(ext_initial));
+
+        // 2. Deterministic post-manifest failure: arm the seam with the canonical state
+        // dir the host itself resolves, so the injected journal failure actually triggers
+        // rollback instead of leaving the call a vacuous success.
+        let canonical_state = state_dir.canonicalize().unwrap();
+        arm_fault(&canonical_state);
+        let res2 = execute_local_init(&LocalInitOptions {
+            browser: "chrome".to_string(),
+            extension_id: "second_extension_id_xyz123".to_string(),
+            state_dir: Some(state_dir.clone()),
+            skip_registry: true,
+        });
+        clear_fault();
+        assert!(res2.is_err(), "Local init must fail when journal cannot be updated");
+        let err_msg = res2.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("additionally failed to restore previous manifest"),
+            "Rollback restore must succeed on this path, got: {}",
+            err_msg
+        );
+
+        // 3. Manifest must be restored to the previous valid manifest
+        let manifest_after = std::fs::read_to_string(&res1.manifest_path).unwrap();
+        assert!(
+            manifest_after.contains(ext_initial),
+            "Manifest must be restored to previous valid manifest on failure"
+        );
+        assert!(
+            !manifest_after.contains("second_extension_id_xyz123"),
+            "Failed init must not leave partial manifest on disk"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_local_init_rollback_restores_prior_registry_snapshot() {
+        let _guard = lock_env();
+
+        // Isolated test host name so live com.hands.return_bridge is never touched.
+        let test_host_name = "com.hands.return_bridge.test_reg_rollback";
+        std::env::set_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME", test_host_name);
+
+        // Registered local-init resolves its state dir from LOCALAPPDATA (a caller-supplied
+        // --state-dir is rejected unless --skip-registry). Point LOCALAPPDATA at a temp dir
+        // so the fault can be armed against the exact path the host resolves; otherwise the
+        // armed value never matches and the test would pass without exercising rollback.
+        let local_app_data = tempdir().unwrap();
+        let previous_local_app_data = std::env::var("LOCALAPPDATA").ok();
+        std::env::set_var("LOCALAPPDATA", local_app_data.path());
+        let resolved_state_dir = local_app_data.path().join("Hands").join("return-bridge");
+        std::fs::create_dir_all(&resolved_state_dir).unwrap();
+        let canonical_state = std::fs::canonicalize(&resolved_state_dir).unwrap();
+
+        let test_key = manifest_registry_keys("chrome")[0].clone();
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+
+        let run_registered_init = |extension_id: &str| {
+            arm_fault(&canonical_state);
+            let result = execute_local_init(&LocalInitOptions {
+                browser: "chrome".to_string(),
+                extension_id: extension_id.to_string(),
+                state_dir: None,
+                skip_registry: false,
+            });
+            clear_fault();
+            result
+        };
+
+        // Scenario A: key absent prior to init -> rollback must remove the created key.
+        let res_a = run_registered_init("ext_test_reg_rollback_a");
+        assert!(res_a.is_err(), "Local init must fail when fault is armed");
+        assert!(
+            !Command::new("reg.exe")
+                .args(["query", &test_key])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "Rollback must remove registry key when it did not exist prior to init"
+        );
+
+        // Scenario B: key existed with a default value -> rollback restores that exact value.
+        let prior_dummy_path = r"C:\prior\nonexistent\host.json";
+        let seed_default = Command::new("reg.exe")
+            .args(["add", &test_key, "/ve", "/t", "REG_SZ", "/d", prior_dummy_path, "/f"])
+            .output()
+            .unwrap();
+        assert!(seed_default.status.success(), "Failed to seed prior registry default value");
+
+        let res_b = run_registered_init("ext_test_reg_rollback_b");
+        assert!(res_b.is_err(), "Local init must fail when fault is armed");
+        let query_b = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+        assert!(query_b.status.success(), "Prior registry key must still exist after rollback");
+        let stdout_b = String::from_utf8_lossy(&query_b.stdout);
+        assert!(
+            stdout_b.contains(prior_dummy_path),
+            "Rollback must restore prior default value {}, got: {}",
+            prior_dummy_path,
+            stdout_b
+        );
+
+        // Scenario C: key existed WITHOUT a default value (but with a named value).
+        // `reg query <key> /ve` still exits 0 for that key shape, so the snapshot must
+        // not record the "(value not set)" rendering as a real prior value: rollback
+        // would then write that literal back and leave a fake default value behind.
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+        let seed_named = Command::new("reg.exe")
+            .args(["add", &test_key, "/v", "NamedKeep", "/t", "REG_SZ", "/d", "keepme", "/f"])
+            .output()
+            .unwrap();
+        assert!(seed_named.status.success(), "Failed to seed named-only registry value");
+        let export_dir = tempdir().unwrap();
+        let exported_before_init = export_key_text(&test_key, export_dir.path());
+        assert!(
+            !exported_before_init.contains("@="),
+            "Precondition: seeded key must have no default value; export: {}",
+            exported_before_init
+        );
+
+        let res_c = run_registered_init("ext_test_reg_rollback_c");
+        assert!(res_c.is_err(), "Local init must fail when fault is armed");
+        let named_query = Command::new("reg.exe")
+            .args(["query", &test_key, "/v", "NamedKeep"])
+            .output()
+            .unwrap();
+        assert!(
+            named_query.status.success() && String::from_utf8_lossy(&named_query.stdout).contains("keepme"),
+            "Rollback must preserve a pre-existing key and its named values when the key had no default value"
+        );
+        let exported_after_rollback = export_key_text(&test_key, export_dir.path());
+        assert!(
+            !exported_after_rollback.contains("@="),
+            "Rollback must not leave a default value (real or the '(value not set)' rendering) on a key that had none; export: {}",
+            exported_after_rollback
+        );
+
+        // Cleanup isolated registry key and environment overrides
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+        std::env::remove_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME");
+        match previous_local_app_data {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+    }
 }

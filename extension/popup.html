@@ -4,125 +4,62 @@
   <meta charset="utf-8">
   <title>Hands Return Bridge</title>
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      width: 340px;
-      margin: 0;
-      padding: 16px;
-      color: #222;
-      background: #fafafa;
-    }
-    h2 {
-      font-size: 16px;
-      margin-top: 0;
-      margin-bottom: 8px;
-      color: #111;
-    }
-    .badge {
-      display: inline-block;
-      padding: 3px 8px;
-      font-size: 11px;
-      font-weight: 600;
-      border-radius: 12px;
-      margin-bottom: 12px;
-    }
-    .badge-paired {
-      background: #d4edda;
-      color: #155724;
-    }
-    .badge-unpaired {
-      background: #fff3cd;
-      color: #856404;
-    }
-    .notice-box {
-      font-size: 11px;
-      background: #fdf2e9;
-      border-left: 3px solid #e67e22;
-      padding: 8px 10px;
-      margin-bottom: 12px;
-      line-height: 1.4;
-      color: #7d3c00;
-    }
-    .field-row {
-      font-size: 12px;
-      margin-bottom: 6px;
-      display: flex;
-      justify-content: space-between;
-    }
-    .field-label {
-      color: #666;
-    }
-    .field-value {
-      font-weight: 500;
-      font-family: monospace;
-    }
-    .btn {
-      display: block;
-      width: 100%;
-      box-sizing: border-box;
-      padding: 8px;
-      margin-top: 10px;
-      font-size: 13px;
-      font-weight: 600;
-      text-align: center;
-      background: #0066cc;
-      color: #fff;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      text-decoration: none;
-    }
-    .btn:hover {
-      background: #0052a3;
-    }
-    .btn-secondary {
-      background: #e0e0e0;
-      color: #333;
-    }
-    .btn-secondary:hover {
-      background: #d0d0d0;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; width: 340px; margin: 0; padding: 16px; color: #222; background: #fafafa; }
+    h2 { font-size: 16px; margin: 0 0 10px; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; margin-bottom: 14px; }
+    .connected { background: #d7f1df; color: #126b31; }
+    .offline { background: #fde2e2; color: #9f1d1d; }
+    .section { margin-top: 10px; }
+    .label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #666; margin-bottom: 5px; }
+    select, button { width: 100%; box-sizing: border-box; }
+    select { padding: 7px; border: 1px solid #bbb; border-radius: 5px; background: white; }
+    button { margin-top: 10px; padding: 8px; border: 0; border-radius: 5px; cursor: pointer; font-weight: 600; background: #e8e8e8; }
+    .cmd-box { margin-top: 6px; padding: 7px 8px; background: #f0f0f0; border-radius: 4px; font: 11px monospace; color: #333; word-break: break-all; cursor: pointer; border: 1px solid #ddd; text-align: left; }
+    .cmd-box:hover, .cmd-box:focus { background: #e5e5e5; outline: none; border-color: #999; }
+    .cmd-box:focus-visible, button:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; border-color: #1a73e8; }
+    .cmd-hint { font-size: 10px; color: #888; margin-top: 3px; }
+    .muted { color: #777; font-size: 12px; line-height: 1.4; }
+    .workspace-list { margin-top: 8px; max-height: 110px; overflow-y: auto; }
+    .workspace { padding: 7px 0; border-top: 1px solid #e8e8e8; }
+    .workspace:first-child { border-top: 0; }
+    .workspace-name { font-size: 12px; font-weight: 600; }
+    .workspace-path { font: 10px monospace; color: #777; overflow-wrap: anywhere; }
+    .row { display: flex; justify-content: space-between; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
   <h2>Hands Return Bridge</h2>
-  <div id="statusBadge" class="badge badge-unpaired">Checking status...</div>
+  <div id="statusBadge" class="badge offline">Checking...</div>
 
-  <div class="notice-box">
-    <strong>Security Notice:</strong> A paired extension may submit coding-agent tasks. Target, argv, and policy validation does not sandbox model-directed tool execution or contain a compromised paired extension.
+  <div id="offlineContent" class="muted" style="display:none;">
+    Native host is not installed or unavailable.<br>
+    Run <code>.\bridge\install-return-bridge.ps1</code> and reload this extension.
   </div>
 
-  <div id="pairedContent" style="display: none;">
-    <div class="field-row">
-      <span class="field-label">Profile ID:</span>
-      <span id="profileIdVal" class="field-value">-</span>
+  <div id="connectedContent" style="display:none;">
+    <div id="convTargetSection" class="section" style="display:none;">
+      <div class="label">This Chat Workspace</div>
+      <select id="convTargetSelect"></select>
     </div>
-    <div class="field-row">
-      <span class="field-label">Pairing ID:</span>
-      <span id="pairingIdVal" class="field-value">-</span>
-    </div>
-    <div class="field-row">
-      <span class="field-label">Policy Revision:</span>
-      <span id="policyRevVal" class="field-value">-</span>
-    </div>
-    <div class="field-row">
-      <span class="field-label">Registered Targets:</span>
-      <span id="targetsVal" class="field-value">-</span>
-    </div>
-    <div class="field-row">
-      <span class="field-label">Pending Receipts:</span>
-      <span id="pendingReceiptsVal" class="field-value">-</span>
-    </div>
-    <button id="btnOptions" class="btn btn-secondary">Settings & Pairing</button>
-  </div>
 
-  <div id="unpairedContent" style="display: none;">
-    <p style="font-size: 13px; color: #555;">This browser profile is not paired with a local Hands companion host.</p>
-    <div class="field-row">
-      <span class="field-label">Profile ID:</span>
-      <span id="unpairedProfileId" class="field-value">-</span>
+    <div class="section">
+      <div class="label">Available Workspaces</div>
+      <div id="workspaceList" class="workspace-list"></div>
     </div>
-    <button id="btnPair" class="btn">Pair This Profile</button>
+
+    <div class="row">
+      <span>Pending receipts</span>
+      <strong id="pendingReceiptsVal">0</strong>
+    </div>
+
+    <div class="section">
+      <div class="label">Local CLI Commands (Click to copy)</div>
+      <button id="cmdAdd" class="cmd-box" type="button" title="Click to copy">hands-return-bridge target add --target "&lt;path&gt;"</button>
+      <button id="cmdRemove" class="cmd-box" type="button" title="Click to copy">hands-return-bridge target remove --target-id &lt;id&gt;</button>
+      <div id="cmdCopyNotice" class="cmd-hint"></div>
+    </div>
+
+    <button id="btnOptions">Manage Workspaces</button>
   </div>
 
   <script src="popup.js"></script>
