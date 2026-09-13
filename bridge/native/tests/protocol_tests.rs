@@ -1424,6 +1424,12 @@ fn test_exact_supported_omp_version_matching() {
     assert!(!is_supported_omp_version("omp/18.1.16\nmultiline"));
     assert!(is_supported_omp_version("omp/18.1.16+build.1"));
     assert!(is_supported_omp_version("omp/18.1.18+20260912"));
+    // Build metadata may contain hyphens without turning the version into a prerelease.
+    assert!(is_supported_omp_version("omp/18.1.16+build-foo"));
+    assert!(is_supported_omp_version("omp/19.2.0+20260912-abc"));
+    // Prerelease markers are still rejected on the core, with or without build metadata.
+    assert!(!is_supported_omp_version("omp/18.1.16-rc.1+build-foo"));
+    assert!(!is_supported_omp_version("omp/18.1.16-beta"));
     assert!(!is_supported_omp_version(""));
 }
 

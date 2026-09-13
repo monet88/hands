@@ -58,8 +58,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function conversationIdFromUrl(url) {
     if (!url || !url.startsWith("https://chatgpt.com/")) return null;
-    if (url.includes("#") || url.includes("?")) return null;
     try {
+      // new URL().pathname already excludes query/fragment, so a valid /c/<id>
+      // conversation carrying share/tracking params still resolves to its exact boundary.
       const segments = new URL(url).pathname.split("/").filter(Boolean);
       let id = null;
       if (segments.length === 2 && segments[0] === "c") id = segments[1];

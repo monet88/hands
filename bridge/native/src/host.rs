@@ -322,6 +322,16 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
     };
 
     let current_exe = std::env::current_exe()?;
+    // Snapshot the pre-existing registry state BEFORE any manifest side effect, so a
+    // snapshot failure (reg.exe spawn/read) aborts before the manifest is replaced
+    // instead of leaving the manifest and journal inconsistent.
+    #[cfg(windows)]
+    let prior_reg_snapshot = if !opts.skip_registry {
+        Some(snapshot_manifest_registry(&browser)?)
+    } else {
+        None
+    };
+
     let manifest_json = json!({
         "name": DEFAULT_HOST_NAME,
         "description": "Hands Return Bridge Native Companion Host",
@@ -330,13 +340,6 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
         "allowed_origins": [format!("chrome-extension://{}/", extension_id)]
     });
     write_manifest_atomic(&manifest_path, &serde_json::to_vec_pretty(&manifest_json)?)?;
-
-    #[cfg(windows)]
-    let prior_reg_snapshot = if !opts.skip_registry {
-        Some(snapshot_manifest_registry(&browser)?)
-    } else {
-        None
-    };
 
     if !opts.skip_registry {
         #[cfg(windows)]
@@ -380,11 +383,15 @@ pub fn execute_local_init(opts: &LocalInitOptions) -> Result<LocalInitResult, Ho
         }
     }
 
-    // Deterministic test seam: fail after manifest/registry write to exercise rollback.
-    // Scoped to the calling state_dir so parallel tests with other temp dirs are unaffected.
+    // Deterministic test-only seam: fail after manifest/registry write to exercise rollback.
+    // Gated behind cfg(test) so it is compiled out of production builds, and scoped to the
+    // injected state_dir so parallel tests using other temp dirs are unaffected.
+    #[cfg(test)]
     let fault_armed = std::env::var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL")
         .map(|v| v == "1" || v == state_dir.to_string_lossy())
         .unwrap_or(false);
+    #[cfg(not(test))]
+    let fault_armed = false;
     let journal_update_result = if fault_armed {
         Err(HostError::Storage("injected journal update failure".to_string()))
     } else {
@@ -653,39 +660,60 @@ pub fn manifest_registry_keys(browser: &str) -> Vec<String> {
     }
 }
 
+/// Snapshot of the pre-registration registry state for rollback.
+///
+/// Per key: `None` = key did not exist; `Some(None)` = key existed but had no
+/// (usable) default value; `Some(Some(value))` = key existed with that default
+/// value. Key existence is probed separately from the default value because
+/// `reg.exe query <key> /ve` renders an unset default inconsistently (empty field
+/// or "(value not set)") across key shapes; treating that as "key absent" would
+/// delete a pre-existing key and its named values during rollback.
 #[cfg(windows)]
-pub fn snapshot_manifest_registry(browser: &str) -> Result<Vec<(String, Option<String>)>, HostError> {
+pub fn snapshot_manifest_registry(browser: &str) -> Result<Vec<(String, Option<Option<String>>)>, HostError> {
     let keys = manifest_registry_keys(browser);
     let mut snapshot = Vec::new();
     for key in keys {
-        let output = Command::new("reg.exe").args(["query", &key, "/ve"]).output()?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut val_opt = Some(String::new());
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.contains("REG_SZ") {
-                    if let Some(pos) = trimmed.find("REG_SZ") {
-                        let raw_val = trimmed[pos + "REG_SZ".len()..].trim();
-                        val_opt = Some(raw_val.to_string());
-                        break;
-                    }
-                }
-            }
-            snapshot.push((key, val_opt));
-        } else {
+        let key_query = Command::new("reg.exe").args(["query", &key]).output()?;
+        if !key_query.status.success() {
             // Key does not exist prior to registration
             snapshot.push((key, None));
+            continue;
         }
+        let default_query = Command::new("reg.exe").args(["query", &key, "/ve"]).output()?;
+        if !default_query.status.success() {
+            // Key exists but has no default value at all
+            snapshot.push((key, Some(None)));
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&default_query.stdout);
+        let mut prior_default: Option<String> = None;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("REG_SZ") {
+                if let Some(pos) = trimmed.find("REG_SZ") {
+                    let raw_val = trimmed[pos + "REG_SZ".len()..].trim();
+                    // `reg query /ve` renders an unset default both as an empty field and as
+                    // "(value not set)"; neither is a usable prior manifest path, so both
+                    // collapse to the same state (key exists, no default value).
+                    if !raw_val.is_empty() && !raw_val.eq_ignore_ascii_case("(value not set)") {
+                        prior_default = Some(raw_val.to_string());
+                    }
+                }
+                break;
+            }
+        }
+        snapshot.push((key, Some(prior_default)));
     }
     Ok(snapshot)
 }
 
 #[cfg(windows)]
-pub fn restore_manifest_registry_snapshot(snapshot: &[(String, Option<String>)]) -> Result<(), HostError> {
-    for (key, val_opt) in snapshot {
-        match val_opt {
-            Some(prev_val) => {
+pub fn restore_manifest_registry_snapshot(
+    snapshot: &[(String, Option<Option<String>>)],
+) -> Result<(), HostError> {
+    for (key, prior_state) in snapshot {
+        match prior_state {
+            Some(Some(prev_val)) => {
                 // Key existed before: restore its prior default value
                 let output = Command::new("reg.exe")
                     .args(["add", key, "/ve", "/t", "REG_SZ", "/d", prev_val, "/f"])
@@ -696,6 +724,22 @@ pub fn restore_manifest_registry_snapshot(snapshot: &[(String, Option<String>)])
                         "reg.exe add restore failed for {}: {}",
                         key, err_msg
                     )));
+                }
+            }
+            Some(None) => {
+                // Key existed before without a default value: delete only the value
+                // registration added, preserving the key and its named values.
+                let output = Command::new("reg.exe")
+                    .args(["delete", key, "/ve", "/f"])
+                    .output()?;
+                if !output.status.success() {
+                    let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if !(err_msg.contains("unable to find") || err_msg.contains("was not found")) {
+                        return Err(HostError::Registry(format!(
+                            "reg.exe delete restore failed for {}: {}",
+                            key, err_msg
+                        )));
+                    }
                 }
             }
             None => {
@@ -942,4 +986,226 @@ pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>
         .get_targets(&pairing_id)
         .map_err(|e| HostError::Storage(e.to_string()))?;
     Ok(targets)
+}
+
+#[cfg(test)]
+mod local_init_rollback_tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    /// Serializes tests that mutate process-global environment variables used by the
+    /// local-init rollback seam (`LOCALAPPDATA`, `HANDS_RETURN_BRIDGE_TEST_HOST_NAME`).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn arm_fault(state_dir: &Path) {
+        std::env::set_var(
+            "HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL",
+            state_dir.to_string_lossy().to_string(),
+        );
+    }
+
+    fn clear_fault() {
+        std::env::remove_var("HANDS_RETURN_BRIDGE_FAULT_LOCAL_INIT_JOURNAL");
+    }
+
+    /// `reg query /ve` cannot distinguish "no default value" from a default value set to
+    /// the literal string "(value not set)"; `reg export` can, because it emits an `@=`
+    /// assignment only when a default value actually exists.
+    #[cfg(windows)]
+    fn export_key_text(key: &str, dir: &Path) -> String {
+        let export_path = dir.join("registry_default_probe.reg");
+        let output = Command::new("reg.exe")
+            .args(["export", key, &export_path.to_string_lossy(), "/y"])
+            .output()
+            .expect("reg.exe export must run");
+        assert!(
+            output.status.success(),
+            "reg.exe export failed for {}: {}",
+            key,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&export_path).unwrap();
+        // reg.exe export writes UTF-16LE; fall back to UTF-8 if the file is not.
+        let text = if bytes.len() % 2 == 0 && bytes.len() >= 2 {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+        text
+    }
+
+    #[test]
+    fn test_local_init_preserves_previous_manifest_if_journal_update_fails() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        let ext_initial = "initial_extension_id_abcdef";
+
+        // 1. First init succeeds
+        let res1 = execute_local_init(&LocalInitOptions {
+            browser: "chrome".to_string(),
+            extension_id: ext_initial.to_string(),
+            state_dir: Some(state_dir.clone()),
+            skip_registry: true,
+        })
+        .expect("first local init failed");
+        assert!(std::fs::read_to_string(&res1.manifest_path)
+            .unwrap()
+            .contains(ext_initial));
+
+        // 2. Deterministic post-manifest failure: arm the seam with the canonical state
+        // dir the host itself resolves, so the injected journal failure actually triggers
+        // rollback instead of leaving the call a vacuous success.
+        let canonical_state = state_dir.canonicalize().unwrap();
+        arm_fault(&canonical_state);
+        let res2 = execute_local_init(&LocalInitOptions {
+            browser: "chrome".to_string(),
+            extension_id: "second_extension_id_xyz123".to_string(),
+            state_dir: Some(state_dir.clone()),
+            skip_registry: true,
+        });
+        clear_fault();
+        assert!(res2.is_err(), "Local init must fail when journal cannot be updated");
+        let err_msg = res2.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("additionally failed to restore previous manifest"),
+            "Rollback restore must succeed on this path, got: {}",
+            err_msg
+        );
+
+        // 3. Manifest must be restored to the previous valid manifest
+        let manifest_after = std::fs::read_to_string(&res1.manifest_path).unwrap();
+        assert!(
+            manifest_after.contains(ext_initial),
+            "Manifest must be restored to previous valid manifest on failure"
+        );
+        assert!(
+            !manifest_after.contains("second_extension_id_xyz123"),
+            "Failed init must not leave partial manifest on disk"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_local_init_rollback_restores_prior_registry_snapshot() {
+        let _guard = lock_env();
+
+        // Isolated test host name so live com.hands.return_bridge is never touched.
+        let test_host_name = "com.hands.return_bridge.test_reg_rollback";
+        std::env::set_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME", test_host_name);
+
+        // Registered local-init resolves its state dir from LOCALAPPDATA (a caller-supplied
+        // --state-dir is rejected unless --skip-registry). Point LOCALAPPDATA at a temp dir
+        // so the fault can be armed against the exact path the host resolves; otherwise the
+        // armed value never matches and the test would pass without exercising rollback.
+        let local_app_data = tempdir().unwrap();
+        let previous_local_app_data = std::env::var("LOCALAPPDATA").ok();
+        std::env::set_var("LOCALAPPDATA", local_app_data.path());
+        let resolved_state_dir = local_app_data.path().join("Hands").join("return-bridge");
+        std::fs::create_dir_all(&resolved_state_dir).unwrap();
+        let canonical_state = std::fs::canonicalize(&resolved_state_dir).unwrap();
+
+        let test_key = manifest_registry_keys("chrome")[0].clone();
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+
+        let run_registered_init = |extension_id: &str| {
+            arm_fault(&canonical_state);
+            let result = execute_local_init(&LocalInitOptions {
+                browser: "chrome".to_string(),
+                extension_id: extension_id.to_string(),
+                state_dir: None,
+                skip_registry: false,
+            });
+            clear_fault();
+            result
+        };
+
+        // Scenario A: key absent prior to init -> rollback must remove the created key.
+        let res_a = run_registered_init("ext_test_reg_rollback_a");
+        assert!(res_a.is_err(), "Local init must fail when fault is armed");
+        assert!(
+            !Command::new("reg.exe")
+                .args(["query", &test_key])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "Rollback must remove registry key when it did not exist prior to init"
+        );
+
+        // Scenario B: key existed with a default value -> rollback restores that exact value.
+        let prior_dummy_path = r"C:\prior\nonexistent\host.json";
+        let seed_default = Command::new("reg.exe")
+            .args(["add", &test_key, "/ve", "/t", "REG_SZ", "/d", prior_dummy_path, "/f"])
+            .output()
+            .unwrap();
+        assert!(seed_default.status.success(), "Failed to seed prior registry default value");
+
+        let res_b = run_registered_init("ext_test_reg_rollback_b");
+        assert!(res_b.is_err(), "Local init must fail when fault is armed");
+        let query_b = Command::new("reg.exe").args(["query", &test_key, "/ve"]).output().unwrap();
+        assert!(query_b.status.success(), "Prior registry key must still exist after rollback");
+        let stdout_b = String::from_utf8_lossy(&query_b.stdout);
+        assert!(
+            stdout_b.contains(prior_dummy_path),
+            "Rollback must restore prior default value {}, got: {}",
+            prior_dummy_path,
+            stdout_b
+        );
+
+        // Scenario C: key existed WITHOUT a default value (but with a named value).
+        // `reg query <key> /ve` still exits 0 for that key shape, so the snapshot must
+        // not record the "(value not set)" rendering as a real prior value: rollback
+        // would then write that literal back and leave a fake default value behind.
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+        let seed_named = Command::new("reg.exe")
+            .args(["add", &test_key, "/v", "NamedKeep", "/t", "REG_SZ", "/d", "keepme", "/f"])
+            .output()
+            .unwrap();
+        assert!(seed_named.status.success(), "Failed to seed named-only registry value");
+        let export_dir = tempdir().unwrap();
+        let exported_before_init = export_key_text(&test_key, export_dir.path());
+        assert!(
+            !exported_before_init.contains("@="),
+            "Precondition: seeded key must have no default value; export: {}",
+            exported_before_init
+        );
+
+        let res_c = run_registered_init("ext_test_reg_rollback_c");
+        assert!(res_c.is_err(), "Local init must fail when fault is armed");
+        let named_query = Command::new("reg.exe")
+            .args(["query", &test_key, "/v", "NamedKeep"])
+            .output()
+            .unwrap();
+        assert!(
+            named_query.status.success() && String::from_utf8_lossy(&named_query.stdout).contains("keepme"),
+            "Rollback must preserve a pre-existing key and its named values when the key had no default value"
+        );
+        let exported_after_rollback = export_key_text(&test_key, export_dir.path());
+        assert!(
+            !exported_after_rollback.contains("@="),
+            "Rollback must not leave a default value (real or the '(value not set)' rendering) on a key that had none; export: {}",
+            exported_after_rollback
+        );
+
+        // Cleanup isolated registry key and environment overrides
+        let _ = Command::new("reg.exe").args(["delete", &test_key, "/f"]).output();
+        std::env::remove_var("HANDS_RETURN_BRIDGE_TEST_HOST_NAME");
+        match previous_local_app_data {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+    }
 }

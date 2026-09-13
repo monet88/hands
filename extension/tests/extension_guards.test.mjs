@@ -201,6 +201,11 @@ function createTestHarness({
 }
 
 async function runTests() {
+  // Bun on Windows can exit with code 0 as soon as the event loop holds no host-side
+  // handles while a vm-context async operation (e.g. crypto.subtle.digest inside the
+  // background.js sandbox) is still pending, silently skipping every remaining test.
+  // One harness-side timer keeps the whole run alive; it is cleared at the end.
+  const keepAlive = setInterval(() => {}, 1000);
   console.log("Running real background.js harness tests...");
 
   // ---------------------------------------------------------------------------
@@ -1311,6 +1316,77 @@ async function runTests() {
     console.log("  [PASS] Local mode seeds internal credentials and targets automatically");
   }
 
+  // Test 25b: an existing non-local (bootstrap) pairing and its pending receipt survive
+  // ensureLocalMode byte-for-byte; only the native targets are re-synced.
+  {
+    const legacyReceipt = {
+      receiptId: "rcpt_legacy_1",
+      executionId: "exec_legacy_1",
+      deliveryStatus: "dispatching/uncertain",
+      deliveryRevision: 4,
+      activeAttemptId: "att_legacy_1",
+      originConversationId: "c_legacy",
+      originConversationUrl: "https://chatgpt.com/c/c_legacy",
+      state: "completed",
+      receivedAt: 1700000000000
+    };
+    const harness = createTestHarness({
+      nativeResponse: (msg) => {
+        assert.equal(msg.op, "local_status");
+        return {
+          status: "ok",
+          pairingStatus: "active",
+          policyRevision: "v1",
+          targets: [{ target_id: "hands", canonical_path: "F:\\CodeBase\\hands", name: "hands" }]
+        };
+      },
+      initialStorage: {
+        profileId: "prof_legacy_123456",
+        isPaired: true,
+        pairingId: "pair_bootstrap_legacy",
+        pairingSecret: "rb_sec_bootstrap_legacy",
+        policyRevision: "v7",
+        targets: [{ target_id: "old", canonical_path: "F:\\old", name: "old" }],
+        receipt_rcpt_legacy_1: legacyReceipt
+      }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/popup.html` };
+    const res = await harness.sendMessage({ action: "ensureLocalMode" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(harness.storageStore.profileId, "prof_legacy_123456");
+    assert.equal(harness.storageStore.isPaired, true);
+    assert.equal(harness.storageStore.pairingId, "pair_bootstrap_legacy");
+    assert.equal(harness.storageStore.pairingSecret, "rb_sec_bootstrap_legacy");
+    assert.equal(harness.storageStore.policyRevision, "v7");
+    assert.equal(
+      JSON.stringify(harness.storageStore.receipt_rcpt_legacy_1),
+      JSON.stringify(legacyReceipt),
+      "Pending receipt/fence record must survive ensureLocalMode unchanged"
+    );
+    assert.equal(harness.storageStore.targets[0].target_id, "hands", "Native targets must still sync");
+    console.log("  [PASS] ensureLocalMode preserves an existing non-local pairing and its pending receipt");
+  }
+
+  // Test 25c: partial pre-existing pairing material is fail-safe, never silently replaced.
+  {
+    const harness = createTestHarness({
+      nativeResponse: (msg) => {
+        assert.equal(msg.op, "local_status");
+        return { status: "ok", pairingStatus: "unknown", targets: [] };
+      },
+      initialStorage: { pairingId: "pair_partial_legacy" }
+    });
+    const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };
+    const res = await harness.sendMessage({ action: "ensureLocalMode" }, trustedSender);
+    assert.equal(res.status, "ok");
+    assert.equal(harness.storageStore.pairingId, "pair_partial_legacy");
+    assert.equal("pairingSecret" in harness.storageStore, false);
+    assert.equal("policyRevision" in harness.storageStore, false);
+    assert.notEqual(harness.storageStore.profileId, "local");
+    assert.equal(res.isPaired, false);
+    console.log("  [PASS] ensureLocalMode never silently replaces partial pairing material");
+  }
+
   // Test 26: browser rejects addWorkspace/removeWorkspace actions (trust boundary preserved).
   {
     const harness = createTestHarness({
@@ -2047,6 +2123,373 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------------
+  // Test 36a: Drain reconciliation must not roll a newer local dispatch attempt
+  //          back to an older conclusive native revision (nativeRev >= localRev)
+  // ---------------------------------------------------------------------------
+  {
+    const staleConclusiveNative = {
+      receipt_id: "rcpt_rev_race_1",
+      execution_id: "exec_rev_race_1",
+      pairing_id: "pair_rev_race",
+      delivery_status: "not-sent",
+      delivery_revision: 2,
+      origin_conversation_id: "c_rev_race",
+      origin_conversation_url: "https://chatgpt.com/c/c_rev_race"
+    };
+
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_rev_race",
+        pairingSecret: "rb_sec_rev_race",
+        receipt_rcpt_rev_race_1: {
+          receiptId: "rcpt_rev_race_1",
+          executionId: "exec_rev_race_1",
+          pairingId: "pair_rev_race",
+          originConversationId: "c_rev_race",
+          originConversationUrl: "https://chatgpt.com/c/c_rev_race",
+          deliveryStatus: "dispatching/uncertain",
+          deliveryRevision: 5,
+          activeAttemptId: "att_rev_race_newer"
+        }
+      },
+      nativeResponse: (msg) => {
+        if (msg.op === "drain") {
+          // Older conclusive native revision racing a newer local dispatch attempt,
+          // exposed through BOTH reconciliation paths (summary + receipt).
+          return {
+            status: "ok",
+            summaries: [{ launch_request_id: "req_rev_race", completion_receipt: staleConclusiveNative }],
+            receipts: [staleConclusiveNative]
+          };
+        }
+        return { status: "ok" };
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const drainRes = await harness.sendMessage({ action: "drain" }, trustedSender);
+    assert.equal(drainRes.status, "ok");
+
+    const reconciled = harness.storageStore["receipt_rcpt_rev_race_1"];
+    assert.equal(
+      reconciled.deliveryStatus,
+      "dispatching/uncertain",
+      "An older conclusive native revision must not overwrite newer local uncertainty"
+    );
+    assert.equal(reconciled.deliveryRevision, 5, "Local deliveryRevision must not roll back");
+    assert.equal(reconciled.activeAttemptId, "att_rev_race_newer");
+
+    console.log("  [PASS] Drain reconciliation rejects stale conclusive native revisions (nativeRev >= localRev)");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 36b: Canonical conversation URLs carrying query/fragment still bind
+  // ---------------------------------------------------------------------------
+  {
+    const harness = createTestHarness({
+      initialStorage: {
+        isPaired: true,
+        pairingId: "pair_qf",
+        pairingSecret: "rb_sec_qf",
+        policyRevision: "v1",
+        targets: [{ target_id: "target_qf", canonical_path: "/qf", name: "qf" }]
+      },
+      mockTabs: {
+        301: { id: 301, url: "https://chatgpt.com/c/c_qf_123?share=1#turn-4" }
+      },
+      mockTabMessages: {
+        301: () => ({
+          ok: true,
+          originConversationId: "c_qf_123",
+          originConversationUrl: "https://chatgpt.com/c/c_qf_123",
+          transcriptText: "Turn 1: query and fragment conversation",
+          accountText: "Workspace QF"
+        })
+      },
+      nativeResponse: (msg) => {
+        if (msg.op === "launch") {
+          return { status: "ok", executionId: "exec_qf", returnToken: "ret_qf", state: "started" };
+        }
+        return { status: "ok" };
+      }
+    });
+
+    const trustedSender = {
+      id: harness.extensionId,
+      url: `chrome-extension://${harness.extensionId}/popup.html`
+    };
+
+    const launchRes = await harness.sendMessage({
+      action: "launch",
+      tabId: 301,
+      promptText: "Continue the query/fragment conversation"
+    }, trustedSender);
+
+    assert.equal(launchRes.status, "ok", "Query/fragment chat URL must resolve to its canonical conversation");
+    const launchMsg = harness.nativeMessagesSent.find(entry => entry.msg.op === "launch");
+    assert.ok(launchMsg, "Native launch must be sent for the canonical route");
+    if (launchMsg) {
+      assert.equal(launchMsg.msg.originConversationId, "c_qf_123", "Conversation boundary must stay exact without query/fragment");
+      assert.equal(launchMsg.msg.originConversationUrl, "https://chatgpt.com/c/c_qf_123");
+    }
+
+    console.log("  [PASS] Canonical chat URLs with query/fragment resolve to the exact conversation boundary");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 36c: Pre-click account revalidation uses stable identity evidence
+  // ---------------------------------------------------------------------------
+  {
+    // Sub-case 1: rendered account text drifts (badge/counter) while identity is stable ->
+    // the dispatch must still proceed (pre-fix, exact rendered-text equality aborted it).
+    const csTextDrift = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountTextDriftAfterTicks: 2,
+      account: "Personal User",
+      driftedAccountText: "Personal User (2 pending)"
+    });
+    let readResp1 = null;
+    csTextDrift.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp1 = r; });
+    assert.equal(readResp1.ok, true);
+    assert.ok(
+      Array.isArray(readResp1.readiness.accountIdentity) && readResp1.readiness.accountIdentity.length > 0,
+      "Readiness must expose stable account/workspace identity evidence"
+    );
+
+    let res1 = null;
+    await new Promise((resolve) => {
+      csTextDrift.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_identity_text_drift",
+        expectedDocumentId: readResp1.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp1.readiness.accountText,
+        expectedAccountIdentity: readResp1.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res1 = r; resolve(); });
+    });
+    assert.equal(res1.ok, true, "Transient rendered account text must not fail the stable identity check");
+    assert.equal(res1.clicked, true);
+    assert.equal(csTextDrift.getClickCount(), 1);
+
+    // Sub-case 2: an extra account/workspace node mounts during the wait ->
+    // identity tokens are unchanged, so the dispatch must still proceed.
+    const csExtraNode = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      extraAccountNodeAfterTicks: 2,
+      account: "Personal User"
+    });
+    let readResp2 = null;
+    csExtraNode.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp2 = r; });
+    let res2 = null;
+    await new Promise((resolve) => {
+      csExtraNode.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_identity_extra_node",
+        expectedDocumentId: readResp2.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp2.readiness.accountText,
+        expectedAccountIdentity: readResp2.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res2 = r; resolve(); });
+    });
+    assert.equal(res2.ok, true, "An additionally mounted account node must not abort a valid dispatch");
+    assert.equal(res2.clicked, true);
+
+    // Sub-case 3: the account/workspace identity actually changes -> fail closed,
+    // even though the rendered text still matches the readiness value.
+    const csIdentityChange = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountChangesAfterTicks: 2,
+      account: "Personal User",
+      changedAccount: "Other Workspace",
+      accountTextDriftAfterTicks: 2,
+      driftedAccountText: "Personal User"
+    });
+    let readResp3 = null;
+    csIdentityChange.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp3 = r; });
+    let res3 = null;
+    await new Promise((resolve) => {
+      csIdentityChange.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_identity_switch",
+        expectedDocumentId: readResp3.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp3.readiness.accountText,
+        expectedAccountIdentity: readResp3.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res3 = r; resolve(); });
+    });
+    assert.equal(res3.ok, false);
+    assert.equal(res3.clicked, false);
+    assert.equal(res3.reason, "account_context_mismatch");
+    assert.equal(csIdentityChange.getClickCount(), 0, "Identity switch after grant must prevent click");
+
+    // Sub-case 4: the DOM element and its static structural identity (same data-testid/id and a
+    // generic selector label) stay identical while the account/workspace actually changes.
+    // Structural selector identifiers must not authorize the click: the guard has to fall through
+    // to the account/workspace text and fail closed.
+    const csStaticStructural = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountChangesAfterTicks: 2,
+      account: "Personal User",
+      changedAccount: "Other Workspace",
+      staticAccountLabel: "Workspace picker",
+      staticAccountTestId: "workspace-picker"
+    });
+    let readResp4 = null;
+    csStaticStructural.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp4 = r; });
+    assert.equal(
+      (readResp4.readiness.accountIdentity || []).some(token => String(token).includes("workspace-picker")),
+      false,
+      "Static selector identifiers must never be reported as account/workspace identity evidence"
+    );
+    assert.equal(readResp4.readiness.accountText, "Personal User", "Account text must stay available as fallback evidence");
+
+    let res4 = null;
+    await new Promise((resolve) => {
+      csStaticStructural.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_static_structural_identity",
+        expectedDocumentId: readResp4.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp4.readiness.accountText,
+        expectedAccountIdentity: readResp4.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res4 = r; resolve(); });
+    });
+    assert.equal(res4.ok, false, "A static selector identity must not authorize a changed account/workspace");
+    assert.equal(res4.clicked, false);
+    assert.equal(res4.reason, "account_context_mismatch");
+    assert.equal(csStaticStructural.getClickCount(), 0, "Changed account/workspace behind a static selector must prevent click");
+
+    // Sub-case 5: same-prefix but different account/workspace name must be blocked through the
+    // semantic identity path (prefix matching must never authorize: "Personal User Team" is not
+    // "Personal User").
+    const csPrefixSwitch = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountChangesAfterTicks: 2,
+      account: "Personal User",
+      changedAccount: "Personal User Team"
+    });
+    let readResp5 = null;
+    csPrefixSwitch.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp5 = r; });
+    assert.ok(
+      (readResp5.readiness.accountIdentity || []).length > 0,
+      "This case must exercise the semantic identity path"
+    );
+
+    let res5 = null;
+    await new Promise((resolve) => {
+      csPrefixSwitch.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_prefix_switch_identity",
+        expectedDocumentId: readResp5.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp5.readiness.accountText,
+        expectedAccountIdentity: readResp5.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res5 = r; resolve(); });
+    });
+    assert.equal(res5.ok, false, "A same-prefix account/workspace name must not authorize the click");
+    assert.equal(res5.clicked, false);
+    assert.equal(res5.reason, "account_context_mismatch");
+    assert.equal(csPrefixSwitch.getClickCount(), 0, "Same-prefix workspace switch must prevent click");
+
+    // Sub-case 6: without semantic identity evidence the rendered-text fallback is normalized
+    // exact equality too, so a same-prefix suffix still fails closed.
+    const csFallbackPrefix = setupContentScriptDispatchHarness({
+      pathname: "/c/c_test_cs",
+      buttonDisabledInitially: true,
+      buttonEnablesAfterTicks: 4,
+      accountChangesAfterTicks: 2,
+      account: "Personal User",
+      changedAccount: "Personal User Team",
+      staticAccountLabel: "Workspace picker",
+      staticAccountTestId: "workspace-picker"
+    });
+    let readResp6 = null;
+    csFallbackPrefix.listener({
+      action: "check_delivery_readiness",
+      expectedConversationId: "c_test_cs",
+      expectedConversationUrl: "https://chatgpt.com/c/c_test_cs"
+    }, {}, (r) => { readResp6 = r; });
+    assert.equal(
+      (readResp6.readiness.accountIdentity || []).length,
+      0,
+      "A generic selector label must not produce semantic identity evidence"
+    );
+
+    let res6 = null;
+    await new Promise((resolve) => {
+      csFallbackPrefix.listener({
+        action: "consume_grant_and_dispatch",
+        attemptId: "att_prefix_switch_text_fallback",
+        expectedDocumentId: readResp6.documentId,
+        expectedConversationId: "c_test_cs",
+        expectedConversationUrl: "https://chatgpt.com/c/c_test_cs",
+        expectedAccountText: readResp6.readiness.accountText,
+        expectedAccountIdentity: readResp6.readiness.accountIdentity,
+        continuationText: "Continuation payload",
+        receiptMarker: "marker_1"
+      }, {}, (r) => { res6 = r; resolve(); });
+    });
+    assert.equal(res6.ok, false, "The rendered-text fallback must not accept a same-prefix account/workspace name");
+    assert.equal(res6.clicked, false);
+    assert.equal(res6.reason, "account_context_mismatch");
+    assert.equal(csFallbackPrefix.getClickCount(), 0, "Same-prefix workspace switch must prevent click without semantic identity");
+
+    console.log("  [PASS] Pre-click account revalidation uses stable identity and still fails closed on identity switch");
+    console.log("  [PASS] Static selector identity never authorizes a changed account/workspace");
+    console.log("  [PASS] Same-prefix account/workspace names are blocked on identity and text-fallback paths");
+  }
+
+  // ---------------------------------------------------------------------------
   // Test 37: N3 State Loss: Loss of extension local state after Dispatch Fence
   //          does not click Send again; native durable state keeps attempt uncertain
   // ---------------------------------------------------------------------------
@@ -2720,6 +3163,11 @@ async function runTests() {
     detachComposerAfterTicks = 0,
     accountChangesAfterTicks = 0,
     changedAccount = "Other User",
+    accountTextDriftAfterTicks = 0,
+    driftedAccountText = "Personal User (2 pending)",
+    extraAccountNodeAfterTicks = 0,
+    staticAccountLabel = "",
+    staticAccountTestId = "",
     userDraft = "",
     turns = ["Turn 1: prior chat"],
     account = "Personal User"
@@ -2733,6 +3181,8 @@ async function runTests() {
     let buttonDisabled = buttonDisabledInitially;
     let buttonAriaDisabled = buttonAriaDisabledInitially;
     let currentAccount = account;
+    let currentAccountText = account;
+    let extraAccountNodePresent = false;
 
     const mockChrome = {
       runtime: {
@@ -2843,6 +3293,13 @@ async function runTests() {
           }
           if (accountChangesAfterTicks && buttonTicks >= accountChangesAfterTicks) {
             currentAccount = changedAccount;
+            currentAccountText = changedAccount;
+          }
+          if (accountTextDriftAfterTicks && buttonTicks >= accountTextDriftAfterTicks) {
+            currentAccountText = driftedAccountText;
+          }
+          if (extraAccountNodeAfterTicks && buttonTicks >= extraAccountNodeAfterTicks) {
+            extraAccountNodePresent = true;
           }
           return buttonAttached ? sendBtnObj : null;
         }
@@ -2853,11 +3310,24 @@ async function runTests() {
           return turns.map(t => ({ innerText: t }));
         }
         if (selector.includes("profile menu") || selector.includes("user-menu")) {
-          return [{
+          const accountNodes = [{
             tagName: "BUTTON",
-            innerText: currentAccount,
-            getAttribute: (n) => n === "aria-label" ? currentAccount + ", open profile menu" : null
+            innerText: currentAccountText,
+            getAttribute: (n) => {
+              if (n === "aria-label") return staticAccountLabel || currentAccount + ", open profile menu";
+              if (n === "data-testid") return staticAccountTestId || null;
+              if (n === "id") return staticAccountTestId || null;
+              return null;
+            }
           }];
+          if (extraAccountNodePresent) {
+            accountNodes.push({
+              tagName: "DIV",
+              innerText: "Workspace picker",
+              getAttribute: (n) => n === "data-testid" ? "workspace-picker" : null
+            });
+          }
+          return accountNodes;
         }
         return [];
       }
@@ -4126,6 +4596,7 @@ async function runTests() {
     console.log("  [PASS] checkReadinessGuards inspects raw composer text and blocks on whitespace-only user drafts");
   }
 
+  clearInterval(keepAlive);
   console.log("ALL real background.js and content_script.js harness tests PASSED CLEANLY!");
 }
 

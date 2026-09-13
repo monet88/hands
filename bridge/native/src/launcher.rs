@@ -67,11 +67,10 @@ pub fn is_supported_omp_version(output: &str) -> bool {
 }
 
 fn parse_omp_version_tuple(version_str: &str) -> Option<(u64, u64, u64)> {
-    // Reject prerelease channel outright (e.g. 18.1.16-rc.1). Build metadata
-    // (+...) is tolerated only when the core remains exactly 3 numeric parts.
-    if version_str.contains('-') {
-        return None;
-    }
+    // Separate SemVer build metadata (+...) first: build metadata may legitimately
+    // contain hyphens (e.g. 18.1.16+build-foo), so the prerelease check below must
+    // only ever look at the numeric core. Build metadata is tolerated only when the
+    // core remains exactly 3 numeric parts.
     let (core, build) = match version_str.split_once('+') {
         Some((core, build)) => (core, Some(build)),
         None => (version_str, None),
@@ -80,6 +79,10 @@ fn parse_omp_version_tuple(version_str: &str) -> Option<(u64, u64, u64)> {
         if build.is_empty() || build.contains('+') {
             return None;
         }
+    }
+    // Reject prerelease channel (e.g. 18.1.16-rc.1) on the core portion only.
+    if core.contains('-') {
+        return None;
     }
     let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;

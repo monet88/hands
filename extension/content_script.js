@@ -110,6 +110,55 @@
     return accountText;
   }
 
+  function normalizeAccountText(text) {
+    return (text || "").replace(/\s+/g, " ").trim();
+  }
+
+  // Pure UI-role phrases name the control, never the account/workspace, so a static
+  // selector label such as "Workspace picker" or "Open profile menu" must never count
+  // as account identity evidence.
+  const STRUCTURAL_ACCOUNT_LABEL =
+    /^(?:open|show|toggle|switch|select|choose)?\s*(?:profile|account|user|workspace|menu|picker)(?:\s+(?:menu|picker|switcher|selector|profile|account|user|workspace))*$/i;
+
+  function isAccountIdentityEvidence(value) {
+    const normalized = normalizeAccountText(value);
+    return normalized.length > 0 && !STRUCTURAL_ACCOUNT_LABEL.test(normalized);
+  }
+
+  // Identity comparison is normalized exact equality: an appended or prefixed suffix is never
+  // the same account/workspace ("Personal User Team" differs from "Personal User"). Transient
+  // badge/counter text is tolerated only through the stable aria-label identity path, never by
+  // guessing arbitrary suffixes on rendered text.
+  function normalizeAccountIdentity(value) {
+    return normalizeAccountText(value).toLowerCase();
+  }
+
+  // Account/workspace identity evidence: accessible labels of the account/workspace nodes
+  // only. Structural selector identifiers (`data-testid`, element `id`) merely locate those
+  // nodes and stay constant across an account/workspace switch, so they must never be
+  // treated as identity evidence or authorize a click on their own.
+  function getAccountContextIdentity() {
+    const accountSelectors = [
+      '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]',
+      '[aria-label*="profile menu" i]'
+    ];
+
+    const tokens = [];
+    for (const selector of accountSelectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        const cleanedAriaLabel = normalizeAccountText(node?.getAttribute?.("aria-label") || "")
+          .replace(/\s*,\s*open profile menu\s*$/i, "")
+          .trim();
+        if (isAccountIdentityEvidence(cleanedAriaLabel)) {
+          tokens.push(normalizeAccountIdentity(cleanedAriaLabel));
+        }
+      }
+    }
+
+    // Order-insensitive + deduplicated: DOM reorder and extra nodes must not change identity.
+    return Array.from(new Set(tokens)).sort();
+  }
+
   function checkReadinessGuards(expectedConversationId, expectedConversationUrl) {
     // 1. Navigation / Route change check
     const currentUrl = window.location.href.split("#")[0].split("?")[0];
@@ -168,7 +217,8 @@
       conversationId: currentConvId,
       currentUrl,
       transcriptText,
-      accountText
+      accountText,
+      accountIdentity: getAccountContextIdentity()
     };
   }
 
@@ -244,7 +294,7 @@
         let composer = null;
         const continuationText = request?.continuationText;
         try {
-          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, expectedAccountText, receiptMarker } = request;
+          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, expectedAccountText, expectedAccountIdentity, receiptMarker } = request;
 
         // Document Identity Check: grant is bound to this specific document
         if (expectedDocumentId !== DOCUMENT_ID) {
@@ -414,9 +464,31 @@
 
         // Revalidate the same account/workspace context immediately before click.
         // Keep this synchronous: hashing here would introduce a fresh async gap after the native grant.
-        if (expectedAccountText) {
-          const currentAccountText = getAccountContextText();
-          if (!currentAccountText || currentAccountText !== expectedAccountText) {
+        // Only account/workspace-specific semantic evidence (accessible labels) is authoritative;
+        // structural selector identifiers stay constant across an account switch and cannot
+        // authorize the click. Semantic identity tokens and the rendered-text fallback are both
+        // compared by normalized exact equality, so DOM reorder, an extra node, or a transient
+        // badge suffix (which changes only the rendered text, not the label) cannot authorize a
+        // different account/workspace and can never mask a real switch.
+        const expectedAccountTokens = Array.isArray(expectedAccountIdentity) ? expectedAccountIdentity : [];
+        if (expectedAccountTokens.length > 0) {
+          const currentAccountTokens = getAccountContextIdentity();
+          const identityMatches = expectedAccountTokens.every(expectedToken =>
+            currentAccountTokens.includes(normalizeAccountIdentity(expectedToken))
+          );
+          if (!identityMatches) {
+            clearComposer(composer, continuationText);
+            sendResponse({
+              ok: false,
+              clicked: false,
+              reason: "account_context_mismatch",
+              message: "Account/workspace identity changed after dispatch grant"
+            });
+            return true;
+          }
+        } else if (expectedAccountText) {
+          const currentAccountText = normalizeAccountIdentity(getAccountContextText());
+          if (!currentAccountText || currentAccountText !== normalizeAccountIdentity(expectedAccountText)) {
             clearComposer(composer, continuationText);
             sendResponse({
               ok: false,

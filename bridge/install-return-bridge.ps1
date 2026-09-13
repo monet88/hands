@@ -18,6 +18,36 @@ $debugBinary = Join-Path $repoRoot "bridge\native\target\debug\hands-return-brid
 $installDir = Join-Path $env:LOCALAPPDATA "Hands\return-bridge"
 $installedBinary = Join-Path $installDir "hands-return-bridge.exe"
 
+function Send-EnvironmentChangedBroadcast {
+    param(
+        [string]$Name = "Environment"
+    )
+
+    # A direct registry write does not notify running processes, so Explorer keeps the
+    # old user PATH until it is restarted. Broadcast WM_SETTINGCHANGE so newly launched
+    # processes inherit the updated PATH without a logoff/restart.
+    try {
+        if (-not ("HandsReturnBridge.NativeMethods" -as [type])) {
+            Add-Type -Namespace HandsReturnBridge -Name NativeMethods -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto, SetLastError = true)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+"@
+        }
+        $broadcastResult = [System.UIntPtr]::Zero
+        [HandsReturnBridge.NativeMethods]::SendMessageTimeout(
+            [System.IntPtr]0xffff,
+            0x001A,
+            [System.UIntPtr]::Zero,
+            $Name,
+            2,
+            5000,
+            [ref]$broadcastResult
+        ) | Out-Null
+    } catch {
+        Write-Warning "User PATH was updated, but broadcasting the environment change failed: $($_.Exception.Message)"
+    }
+}
+
 function Resolve-ExtensionId {
     param(
         [string]$BrowserName,
@@ -112,8 +142,12 @@ try {
     if ($regKey) {
         try { $rawUserPath = $regKey.GetValue("Path", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } finally { $regKey.Close() }
     }
-} catch { $rawUserPath = $null }
-if ([string]::IsNullOrEmpty($rawUserPath)) { $rawUserPath = "" }
+} catch {
+    # Fail closed: treating an unreadable user PATH as empty would overwrite the
+    # registry value and discard every existing user PATH entry.
+    throw "Failed to read user PATH from registry: $($_.Exception.Message)"
+}
+if ($null -eq $rawUserPath) { $rawUserPath = "" }
     $pathEntries = @($rawUserPath -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
     $alreadyPresent = @($pathEntries | Where-Object { $_.TrimEnd("\").Equals($installDir.TrimEnd("\"), [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
 if (-not $alreadyPresent) {
@@ -122,6 +156,7 @@ if (-not $alreadyPresent) {
         $regWrite = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
         try { $regWrite.SetValue("Path", $newRawPath, [Microsoft.Win32.RegistryValueKind]::ExpandString) } finally { $regWrite.Close() }
     } catch { throw "Failed to update user PATH in registry: $($_.Exception.Message)" }
+    Send-EnvironmentChangedBroadcast
     $env:Path = "$env:Path;$installDir"
     Write-Host "Added to user PATH: $installDir"
     Write-Host "Undo: remove '$installDir' from HKCU:\Environment\Path (User variables)."

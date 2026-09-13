@@ -173,7 +173,7 @@ async function processDrainResponse(drainResponse, stored, profileId) {
           updated = true;
         }
         if (rcpt.delivery_status && rcpt.delivery_status !== existing.deliveryStatus) {
-          if (localRev < nativeRev || (nativeConclusive && localStaleUncertain)) {
+          if (localRev < nativeRev || (nativeConclusive && localStaleUncertain && nativeRev >= localRev)) {
             existing.deliveryStatus = rcpt.delivery_status;
             updated = true;
           }
@@ -203,10 +203,12 @@ async function processDrainResponse(drainResponse, stored, profileId) {
     let receiptRecord = buildReceiptRecord(rcpt);
     if (existing && existing.deliveryStatus && existing.deliveryStatus !== "received") {
       const conclusiveNative = rcpt.delivery_status === "not-sent" || rcpt.delivery_status === "submitted-observed";
-      const localStale = existing.deliveryStatus === "dispatching/uncertain" || existing.deliveryStatus === "dispatching";
       const nativeRev = rcpt.delivery_revision || 0;
       const localRev = existing.deliveryRevision || 0;
-      if (!(conclusiveNative && (localStale || nativeRev > localRev))) {
+      // A newer local dispatch attempt must win over an older conclusive native
+      // revision; otherwise a racing drain response would roll the receipt (and
+      // its revision) back and leave the native slot held.
+      if (!(conclusiveNative && nativeRev >= localRev)) {
         receiptRecord = existing;
       }
     }
@@ -269,8 +271,13 @@ async function sha256Hex(str) {
 
 function parseCanonicalConversationId(urlStr) {
   if (!urlStr || typeof urlStr !== "string" || !urlStr.startsWith("https://chatgpt.com/")) return null;
-  if (urlStr.includes("#") || urlStr.includes("?")) return null;
-  const path = urlStr.slice("https://chatgpt.com/".length);
+  // Canonicalize to the pathname (drop any query/fragment) so share/tracking params or
+  // anchors do not hide a valid conversation route, while the exact /c/<id> or
+  // /g/<gizmo>/c/<id> boundary is still enforced.
+  const queryStart = urlStr.search(/[?#]/);
+  const path = queryStart === -1
+    ? urlStr.slice("https://chatgpt.com/".length)
+    : urlStr.slice("https://chatgpt.com/".length, queryStart);
   const segments = path.split("/").filter(Boolean);
   let id = null;
   if (segments.length === 2 && segments[0] === "c") {
@@ -397,6 +404,9 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
   const documentId = readinessResp.documentId;
   const transcriptText = readinessResp.readiness.transcriptText || "";
   const accountText = readinessResp.readiness.accountText || "";
+  const accountIdentity = Array.isArray(readinessResp.readiness.accountIdentity)
+    ? readinessResp.readiness.accountIdentity
+    : [];
 
   const transcriptEvidenceHash = await sha256Hex(transcriptText);
   const accountEvidenceHash = await sha256Hex(accountText);
@@ -470,6 +480,7 @@ async function dispatchSingleReceipt(receiptRecord, stored, profileId) {
           expectedConversationId: originConversationId,
           expectedConversationUrl: originConversationUrl,
           expectedAccountText: accountText,
+          expectedAccountIdentity: accountIdentity,
           continuationText,
           receiptMarker
         },
@@ -719,6 +730,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             break;
           }
           const targets = Array.isArray(response.targets) ? response.targets : [];
+
+          // Seed local-mode credentials only when browser storage holds NO pairing state at all.
+          // Any pre-existing pairing material - a real bootstrap pairing, or a partial/legacy set -
+          // is preserved verbatim: replacing it would rebind this profile to the local pairing and
+          // strand the superseded pairing's pending receipts and unresolved fences with no undo.
+          const storedPairing = await chrome.storage.local.get([
+            "isPaired",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "policyRevision"
+          ]);
+          const hasPairingMaterial =
+            storedPairing.isPaired === true ||
+            (typeof storedPairing.pairingId === "string" && storedPairing.pairingId.length > 0) ||
+            (typeof storedPairing.pairingSecret === "string" && storedPairing.pairingSecret.length > 0);
+          if (hasPairingMaterial) {
+            // Sync native targets/status only; pairing identity and receipt/fence records stay untouched.
+            await chrome.storage.local.set({ targets });
+            sendResponse({
+              status: "ok",
+              isPaired: storedPairing.isPaired === true,
+              pairingStatus: response.pairingStatus || "active",
+              taskExecutionAvailable: response.taskExecutionAvailable !== false,
+              targetsCount: targets.length,
+              targets
+            });
+            break;
+          }
+
           await chrome.storage.local.set({
             profileId: LOCAL_PROFILE_ID,
             isPaired: true,
