@@ -38,13 +38,13 @@ hands-bridge failed --conversation <conversation_id> --message "cargo test faile
 `done`/`failed` run both internal steps:
 
 ```text
-resolve the conversation
--> reuse the execution this worker was launched with, or claim a new one
+look up the launch request by execution ID (the journal is the routing authority)
+-> nothing found? claim identity for --conversation instead
 -> record the completion receipt
 -> exit 0
 ```
 
-The worker never handles task IDs, execution IDs, state directories, or the return token. A worker that the extension launched inherits `HANDS_TASK_ID`, `HANDS_RETURN_BRIDGE_EXECUTION_ID`, and `HANDS_RETURN_BRIDGE_CONVERSATION_ID`, so it needs no arguments at all:
+The worker never handles task IDs, execution IDs, state directories, the conversation ID, or the return token. A worker that the extension launched inherits `HANDS_TASK_ID` and `HANDS_RETURN_BRIDGE_EXECUTION_ID`, so it needs no arguments at all:
 
 ```bash
 hands-bridge done
@@ -52,8 +52,9 @@ hands-bridge done
 
 Contract rules:
 
-- `--conversation` is required unless the worker environment already names the conversation; otherwise the command exits 2 without touching the journal.
-- A worker execution bound to one conversation refuses to report for another conversation (`--conversation` mismatch) and exits 1.
+- Routing always follows the launch request's `origin_conversation_id` in the journal; the CLI prints that conversation, so the worker can verify where the receipt went without knowing it in advance.
+- `--conversation` (or an inherited `HANDS_RETURN_BRIDGE_CONVERSATION_ID`) is only needed to claim identity when the worker has no execution ID: it then exits 2 when no conversation is named, and never touches the journal.
+- Either value is an assertion when an execution ID is present: a worker execution bound to one conversation refuses to report for another (`conversation_mismatch`, exit 1) before writing anything.
 - Each call records its own receipt: two `done` calls produce two messages in ChatGPT.
 
 ### Underlying steps (implementation detail)

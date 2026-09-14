@@ -2320,6 +2320,7 @@ fn test_record_explicit_notification_done() {
     assert_eq!(res.state, "completed");
     assert_eq!(res.execution_id, execution_id);
     assert_eq!(res.task_id, task_id);
+    assert_eq!(res.origin_conversation_id, "conv_notify_1");
     assert!(!res.is_idempotent);
 
     let rcpt = journal
@@ -2329,6 +2330,49 @@ fn test_record_explicit_notification_done() {
     assert_eq!(rcpt.state, "completed");
     assert_eq!(rcpt.stop_reason, "explicit_done");
     assert_eq!(rcpt.task_id.as_deref(), Some(task_id.as_str()));
+}
+
+#[test]
+fn test_record_explicit_notification_conversation_assertion_fails_closed() {
+    let (_dir, _target_dir, journal, _pairing_id, task_id, execution_id) = setup_test_journal_with_launch();
+
+    // A caller that believes it is reporting to a different conversation is refused before
+    // anything is written: delivery routes from the launch request, never from the caller.
+    let mismatch = journal
+        .record_explicit_notification_checked(
+            &ExplicitNotificationParams {
+                task_id: Some(task_id.clone()),
+                execution_id: Some(execution_id.clone()),
+                status: ExplicitNotificationStatus::Done,
+            },
+            Some("conv_somewhere_else"),
+        )
+        .expect_err("a foreign conversation must fail closed");
+    assert_eq!(
+        mismatch,
+        PairingError::ConversationMismatch {
+            expected: "conv_somewhere_else".to_string(),
+            bound: "conv_notify_1".to_string(),
+        }
+    );
+    assert!(
+        journal.get_completion_receipt(&execution_id).unwrap().is_none(),
+        "a refused notification must not write a receipt"
+    );
+
+    // The bound conversation records, and the result reports the journal's conversation.
+    let res = journal
+        .record_explicit_notification_checked(
+            &ExplicitNotificationParams {
+                task_id: Some(task_id),
+                execution_id: Some(execution_id),
+                status: ExplicitNotificationStatus::Done,
+            },
+            Some("conv_notify_1"),
+        )
+        .expect("the bound conversation must record");
+    assert_eq!(res.origin_conversation_id, "conv_notify_1");
+    assert!(!res.is_idempotent);
 }
 
 #[test]

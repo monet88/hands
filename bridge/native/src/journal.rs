@@ -98,6 +98,7 @@ pub enum PairingError {
     AlreadyAttempted,
     ReceiptNotFound,
     ExecutionMismatch,
+    ConversationMismatch { expected: String, bound: String },
     ConversationNotRegistered,
     AccountContextMismatch,
     DispatchFenceConflict,
@@ -121,6 +122,11 @@ impl std::fmt::Display for PairingError {
             PairingError::AlreadyAttempted => write!(f, "already_attempted"),
             PairingError::ReceiptNotFound => write!(f, "receipt_not_found"),
             PairingError::ExecutionMismatch => write!(f, "execution_mismatch"),
+            PairingError::ConversationMismatch { expected, bound } => write!(
+                f,
+                "conversation {} does not match the conversation bound to this worker execution ({})",
+                expected, bound
+            ),
             PairingError::ConversationNotRegistered => write!(f, "conversation_not_registered"),
             PairingError::AccountContextMismatch => write!(f, "account_context_mismatch"),
             PairingError::DispatchFenceConflict => write!(f, "dispatch_fence_conflict"),
@@ -252,6 +258,8 @@ pub struct ExplicitNotificationResult {
     pub receipt_id: String,
     pub execution_id: String,
     pub task_id: String,
+    /// Conversation the launch is bound to; the journal, not the caller, decides routing.
+    pub origin_conversation_id: String,
     pub state: String,
     pub is_idempotent: bool,
 }
@@ -2887,6 +2895,18 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
         &self,
         params: &ExplicitNotificationParams,
     ) -> Result<ExplicitNotificationResult, PairingError> {
+        self.record_explicit_notification_checked(params, None)
+    }
+
+    /// Records a terminal notification, optionally asserting which conversation the caller
+    /// believes it belongs to. The launch request stays the routing authority: a caller that
+    /// names a different conversation fails closed before any receipt is written, so a worker
+    /// never needs to know (or carry) the conversation ID to deliver correctly.
+    pub fn record_explicit_notification_checked(
+        &self,
+        params: &ExplicitNotificationParams,
+        expected_conversation_id: Option<&str>,
+    ) -> Result<ExplicitNotificationResult, PairingError> {
         let mut conn = self.conn.lock();
 
         let has_task = params.task_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
@@ -2986,6 +3006,15 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             });
         }
 
+        if let Some(expected) = expected_conversation_id.filter(|c| !c.trim().is_empty()) {
+            if expected != launch.origin_conversation_id {
+                return Err(PairingError::ConversationMismatch {
+                    expected: expected.to_string(),
+                    bound: launch.origin_conversation_id.clone(),
+                });
+            }
+        }
+
         let (target_state, stop_reason, assistant_text) = match &params.status {
             ExplicitNotificationStatus::Done => ("completed", "explicit_done", String::new()),
             ExplicitNotificationStatus::Failed { message } => {
@@ -3017,6 +3046,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     receipt_id: existing_id,
                     execution_id: launch.execution_id,
                     task_id: launch.launch_request_id,
+                    origin_conversation_id: launch.origin_conversation_id.clone(),
                     state: existing_state,
                     is_idempotent: true,
                 });
@@ -3084,6 +3114,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             receipt_id,
             execution_id: launch.execution_id,
             task_id: launch.launch_request_id,
+            origin_conversation_id: launch.origin_conversation_id,
             state: target_state.to_string(),
             is_idempotent: false,
         })

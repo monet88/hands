@@ -1192,7 +1192,8 @@ fn test_worker_shorthand_done_and_failed_need_no_identity() {
     let (_, receipts) = journal.drain_records(pairing_id, None).unwrap();
     assert_eq!(receipts.len(), 2, "a mismatched shorthand must not record anything");
 
-    // 6. A worker launched by the extension reports with no arguments at all.
+    // 6. A worker launched by the extension reports with no arguments at all, and never
+    // carries the conversation ID: the printed conversation comes from the journal.
     let out_worker = Command::new(bin)
         .args(["done", "--state-dir", &state_dir.path().to_string_lossy()])
         .env("HANDS_TASK_ID", prepared["task_id"].as_str().unwrap())
@@ -1201,7 +1202,6 @@ fn test_worker_shorthand_done_and_failed_need_no_identity() {
             prepared["execution_id"].as_str().unwrap(),
         )
         .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
-        .env("HANDS_RETURN_BRIDGE_CONVERSATION_ID", "conv_other")
         .output()
         .unwrap();
     assert!(out_worker.status.success(), "worker done failed: {}", String::from_utf8_lossy(&out_worker.stderr));

@@ -1118,6 +1118,14 @@ fn map_pairing_error(err: PairingError) -> Value {
             "code": "execution_mismatch",
             "message": "Execution ID does not match the completion receipt"
         }),
+        PairingError::ConversationMismatch { expected, bound } => json!({
+            "status": "error",
+            "code": "conversation_mismatch",
+            "message": format!(
+                "conversation {} does not match the conversation bound to this worker execution ({})",
+                expected, bound
+            )
+        }),
         PairingError::ConversationNotRegistered => json!({
             "status": "error",
             "code": "conversation_not_registered",

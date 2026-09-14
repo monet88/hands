@@ -666,28 +666,22 @@ fn main() {
 
             // A worker launched by the extension already owns an execution; anything else
             // mints one here so the caller never has to pass identity around.
-            let (task_id, execution_id, notify_state_dir, conversation_id) =
+            let (task_id, execution_id, notify_state_dir, asserted_conversation) =
                 match (env_var("HANDS_TASK_ID"), env_var("HANDS_RETURN_BRIDGE_EXECUTION_ID")) {
                     (Some(task_id), Some(execution_id)) => {
-                        let worker_conversation = env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID");
-                        if let (Some(requested), Some(bound)) =
-                            (conversation_id.as_deref(), worker_conversation.as_deref())
-                        {
-                            if requested != bound {
-                                eprintln!(
-                                    "error: --conversation {} does not match the conversation bound to this worker execution ({})",
-                                    requested, bound
-                                );
-                                std::process::exit(1);
-                            }
-                        }
+                        // Routing comes from the launch request in the journal, so a worker
+                        // never has to carry the conversation ID. A conversation supplied by
+                        // flag or environment is only an assertion, checked against the journal
+                        // by the native host before anything is written.
+                        let asserted_conversation =
+                            conversation_id.or_else(|| env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID"));
                         (
                             task_id,
                             execution_id,
                             state_dir
                                 .clone()
                                 .or_else(|| env_var("HANDS_RETURN_BRIDGE_STATE_DIR").map(PathBuf::from)),
-                            conversation_id.or(worker_conversation).unwrap_or_default(),
+                            asserted_conversation,
                         )
                     }
                     _ => {
@@ -714,7 +708,7 @@ fn main() {
                                 worker.task_id,
                                 worker.execution_id,
                                 Some(PathBuf::from(worker.state_dir)),
-                                worker.origin_conversation_id,
+                                Some(worker.origin_conversation_id),
                             ),
                             Err(e) => {
                                 eprintln!("error: {}", e);
@@ -729,22 +723,16 @@ fn main() {
                 execution_id: Some(execution_id),
                 status,
                 state_dir: notify_state_dir,
+                expected_conversation_id: asserted_conversation,
             };
 
             match execute_notify(options) {
                 Ok(res) => {
                     let verb = if res.is_idempotent { "already recorded" } else { "recorded" };
-                    if conversation_id.is_empty() {
-                        println!(
-                            "Notification {} (receipt: {}, status: {}).",
-                            verb, res.receipt_id, res.state
-                        );
-                    } else {
-                        println!(
-                            "Notification {} (receipt: {}, conversation: {}, status: {}).",
-                            verb, res.receipt_id, conversation_id, res.state
-                        );
-                    }
+                    println!(
+                        "Notification {} (receipt: {}, conversation: {}, status: {}).",
+                        verb, res.receipt_id, res.origin_conversation_id, res.state
+                    );
                 }
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -827,6 +815,7 @@ fn main() {
                 execution_id,
                 status,
                 state_dir,
+                expected_conversation_id: None,
             };
 
             match execute_notify(options) {

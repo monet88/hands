@@ -1147,6 +1147,8 @@ pub struct NotifyOptions {
     pub execution_id: Option<String>,
     pub status: ExplicitNotificationStatus,
     pub state_dir: Option<PathBuf>,
+    /// Optional caller assertion only. Routing always follows the launch request in the journal.
+    pub expected_conversation_id: Option<String>,
 }
 
 pub fn execute_notify(options: NotifyOptions) -> Result<ExplicitNotificationResult, HostError> {
@@ -1177,10 +1179,12 @@ pub fn execute_notify(options: NotifyOptions) -> Result<ExplicitNotificationResu
         execution_id,
         status: options.status,
     };
-    let result = journal.record_explicit_notification(&params).map_err(|e| match e {
-        crate::journal::PairingError::StorageError(s) => HostError::Storage(s),
-        other => HostError::Notification(other.to_string()),
-    })?;
+    let result = journal
+        .record_explicit_notification_checked(&params, options.expected_conversation_id.as_deref())
+        .map_err(|e| match e {
+            crate::journal::PairingError::StorageError(s) => HostError::Storage(s),
+            other => HostError::Notification(other.to_string()),
+        })?;
 
     // Durability comes first. The push signal is only a wake-up hint for the connected
     // extension; if it is absent/stale, the committed receipt is recovered on reconnect.
@@ -1300,6 +1304,7 @@ mod push_tests {
             receipt_id: "rcpt_push_test".to_string(),
             execution_id: "exec_push_test".to_string(),
             task_id: "task_push_test".to_string(),
+            origin_conversation_id: "conv_push_test".to_string(),
             state: "completed".to_string(),
             is_idempotent: false,
         };
@@ -1320,6 +1325,7 @@ mod push_tests {
             receipt_id: "rcpt_no_push".to_string(),
             execution_id: "exec_no_push".to_string(),
             task_id: "task_no_push".to_string(),
+            origin_conversation_id: "conv_no_push".to_string(),
             state: "completed".to_string(),
             is_idempotent: false,
         };
