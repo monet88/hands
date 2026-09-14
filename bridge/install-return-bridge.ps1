@@ -14,9 +14,9 @@ if ($env:OS -ne "Windows_NT") {
 $repoRoot = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $extensionPath = [IO.Path]::GetFullPath((Join-Path $repoRoot "extension")).TrimEnd('\')
 $manifestPath = Join-Path $repoRoot "bridge\native\Cargo.toml"
-$debugBinary = Join-Path $repoRoot "bridge\native\target\debug\hands-return-bridge.exe"
+$debugBinary = Join-Path $repoRoot "bridge\native\target\debug\hands-bridge.exe"
 $installDir = Join-Path $env:LOCALAPPDATA "Hands\return-bridge"
-$installedBinary = Join-Path $installDir "hands-return-bridge.exe"
+$installedBinary = Join-Path $installDir "hands-bridge.exe"
 
 function Send-EnvironmentChangedBroadcast {
     param(

@@ -1204,6 +1204,84 @@ process.kill(process.pid, 9);
   }
 
   // -------------------------------------------------------------
+  // N5: Explicit Notification and Adapter Fallback Convergence
+  // -------------------------------------------------------------
+  console.log("-> Testing N5: Explicit Notification and Adapter Fallback Convergence...");
+  {
+    const env = createTempTestEnvironment();
+
+    // 1. Explicit done followed by adapter agent_end: exactly one receipt, no conflict thrown
+    const execDone = "exec_n5_done";
+    env.seedLaunchRequest(execDone, "task_n5_done", "ret_n5_done");
+
+    const nowSecs = Math.floor(Date.now() / 1000);
+    env.db.run(
+      `INSERT INTO completion_receipts (
+        receipt_id, execution_id, pairing_id, return_token,
+        origin_conversation_id, turn_index, stop_reason,
+        assistant_message_id, assistant_text, content_digest,
+        tool_call_count, state, committed_at
+      ) VALUES (?, ?, 'pair_1', 'ret_n5_done', 'conv_123', 0, 'explicit_done', NULL, '', 'digest_explicit_done', 0, 'completed', ?)`,
+      ["rcpt_explicit_done_1", execDone, nowSecs]
+    );
+
+    const adapterDoneFactory = await loadAdapter(env.adapterPath, {
+      HANDS_RETURN_BRIDGE_EXECUTION_ID: execDone,
+      HANDS_RETURN_BRIDGE_STATE_DIR: env.tempDir,
+    });
+    const piDone = createMockPi();
+    adapterDoneFactory(piDone);
+    const ctxDone = createMockCtx("sess_n5_done");
+
+    await piDone.emit("agent_start", {}, ctxDone);
+    const msgDone = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Late assistant text" }] };
+    await piDone.emit("session_stop", { turn_id: 0, last_assistant_message: msgDone, messages: [msgDone], stop_hook_active: false }, ctxDone);
+
+    // agent_end should exit cleanly without throwing payload_conflict and without overwriting receipt
+    await piDone.emit("agent_end", { messages: [msgDone], willContinue: false }, ctxDone);
+
+    const receiptsDone = env.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execDone);
+    assert.equal(receiptsDone.length, 1, "Must still have exactly one receipt");
+    assert.equal(receiptsDone[0].receipt_id, "rcpt_explicit_done_1");
+    assert.equal(receiptsDone[0].stop_reason, "explicit_done");
+
+    // 2. Explicit failed followed by adapter agent_end: exactly one receipt, no conflict thrown
+    const execFailed = "exec_n5_failed";
+    env.seedLaunchRequest(execFailed, "task_n5_failed", "ret_n5_failed");
+
+    env.db.run(
+      `INSERT INTO completion_receipts (
+        receipt_id, execution_id, pairing_id, return_token,
+        origin_conversation_id, turn_index, stop_reason,
+        assistant_message_id, assistant_text, content_digest,
+        tool_call_count, state, committed_at
+      ) VALUES (?, ?, 'pair_1', 'ret_n5_failed', 'conv_123', 0, 'explicit_failed', NULL, 'Task failed on error', 'digest_explicit_failed', 0, 'failed', ?)`,
+      ["rcpt_explicit_failed_1", execFailed, nowSecs]
+    );
+
+    const adapterFailedFactory = await loadAdapter(env.adapterPath, {
+      HANDS_RETURN_BRIDGE_EXECUTION_ID: execFailed,
+      HANDS_RETURN_BRIDGE_STATE_DIR: env.tempDir,
+    });
+    const piFailed = createMockPi();
+    adapterFailedFactory(piFailed);
+    const ctxFailed = createMockCtx("sess_n5_failed");
+
+    await piFailed.emit("agent_start", {}, ctxFailed);
+    const msgFailed = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Late assistant text on failed task" }] };
+    await piFailed.emit("session_stop", { turn_id: 0, last_assistant_message: msgFailed, messages: [msgFailed], stop_hook_active: false }, ctxFailed);
+    await piFailed.emit("agent_end", { messages: [msgFailed], willContinue: false }, ctxFailed);
+
+    const receiptsFailed = env.db.query("SELECT * FROM completion_receipts WHERE execution_id = ?").all(execFailed);
+    assert.equal(receiptsFailed.length, 1, "Must still have exactly one receipt");
+    assert.equal(receiptsFailed[0].receipt_id, "rcpt_explicit_failed_1");
+    assert.equal(receiptsFailed[0].stop_reason, "explicit_failed");
+    assert.equal(receiptsFailed[0].state, "failed");
+
+    console.log("  [PASS] N5: Explicit terminal notification followed by adapter agent_end is a harmless no-op");
+  }
+
+  // -------------------------------------------------------------
   // Real OMP Process Probe: multiple tool rounds -> exactly one receipt
   // -------------------------------------------------------------
   if (process.env.HANDS_RETURN_BRIDGE_RUN_REAL_OMP === "1") {

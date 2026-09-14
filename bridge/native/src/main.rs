@@ -1,26 +1,39 @@
 use std::env;
 use std::path::PathBuf;
 
-use hands_return_bridge::host::{
-    LocalInitOptions, SetupOptions, TargetAddOptions, TargetListOptions, TargetRemoveOptions,
-    execute_local_init, execute_setup, execute_target_add, execute_target_list,
-    execute_target_remove, resolve_state_dir, run_native_host,
+use hands_bridge::host::{
+    LocalInitOptions, NotifyOptions, PrepareOptions, SetupOptions, TargetAddOptions,
+    TargetListOptions, TargetRemoveOptions, execute_local_init, execute_notify, execute_prepare,
+    execute_setup, execute_target_add, execute_target_list, execute_target_remove,
+    resolve_state_dir, run_native_host,
 };
-use hands_return_bridge::journal::Journal;
-use hands_return_bridge::protocol::TRUST_NOTICE;
+use hands_bridge::journal::{ExplicitNotificationStatus, Journal};
+use hands_bridge::protocol::TRUST_NOTICE;
+use serde_json::json;
 
-fn print_help() {
-    eprintln!(
-        r#"Hands Return Bridge Companion CLI
+/// Non-empty, trimmed environment variable used by the one-command worker flow.
+fn env_var(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+const HELP: &str = r#"Hands Return Bridge Companion CLI
 Usage:
-  hands-return-bridge native-host [--state-dir <dir>]
-  hands-return-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
-  hands-return-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
-  hands-return-bridge status [--state-dir <dir>]
-  hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
-  hands-return-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
-  hands-return-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
-  hands-return-bridge target list [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge native-host [--state-dir <dir>]
+  hands-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
+  hands-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
+  hands-bridge status [--state-dir <dir>]
+  hands-bridge revoke --pairing-id <id> [--state-dir <dir>]
+  hands-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge target list [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge done [--conversation <conversation_id>] [--state-dir <dir>]
+  hands-bridge failed --message <text> [--conversation <conversation_id>] [--state-dir <dir>]
+  hands-bridge notify done [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-bridge notify failed --message <text> [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
@@ -38,15 +51,39 @@ Target Commands:
   target add                    Register a new git workspace target on active pairing
   target remove                 Remove a registered target from active pairing
   target list                   List registered targets on active pairing
-"#
-    );
+
+Worker Commands:
+  done                          One-command completion: reuse the execution this worker was
+                                launched with, or claim a new one for --conversation, then
+                                record the receipt. No identity arguments are needed.
+  failed                        Same one-command flow for a failed run; --message is required.
+  prepare                       Claim task/execution identity for a registered ChatGPT conversation
+                                and print the environment for a normal Orca OMP worker
+                                (no target/workspace is involved; routing follows the conversation)
+  notify done                   Record explicit terminal success for a prepared/launched task
+  notify failed                 Record explicit terminal failure for a prepared/launched task
+
+  Examples:
+    hands-bridge done --conversation 6aa7f156-6ef4-83ec-9be6-ebd9260b79ac
+    hands-bridge failed --conversation <id> --message "cargo test failed"
+    hands-bridge prepare --conversation <id> --json
+"#;
+
+/// Help is a request: it prints to stdout so a caller can pipe it.
+fn print_help() {
+    println!("{HELP}");
+}
+
+/// Usage text that accompanies an error keeps the error stream.
+fn print_help_err() {
+    eprintln!("{HELP}");
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     // Chrome/Edge Native Messaging calls the binary with the extension origin as the first arg:
-    // e.g., "hands-return-bridge.exe chrome-extension://<id>/"
+    // e.g., "hands-bridge.exe chrome-extension://<id>/"
     let caller_origin = if args.len() >= 2 && args[1].starts_with("chrome-extension://") {
         Some(args[1].as_str())
     } else {
@@ -196,7 +233,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("Unknown option: {}", other);
-                        print_help();
+                        print_help_err();
                         std::process::exit(1);
                     }
                 }
@@ -352,7 +389,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("Unknown option for revoke: {}", other);
-                        print_help();
+                        print_help_err();
                         std::process::exit(1);
                     }
                 }
@@ -400,7 +437,7 @@ fn main() {
         "target" => {
             if args.len() < 3 {
                 eprintln!("Error: target requires a subcommand: add, remove, or list");
-                print_help();
+                print_help_err();
                 std::process::exit(1);
             }
             match args[2].as_str() {
@@ -434,7 +471,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target add: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -491,7 +528,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target remove: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -539,7 +576,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target list: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -570,7 +607,309 @@ fn main() {
                 }
                 other => {
                     eprintln!("Unknown target subcommand: {}", other);
-                    print_help();
+                    print_help_err();
+                    std::process::exit(1);
+                }
+            }
+        }
+        "done" | "failed" => {
+            let sub = args[1].as_str();
+            let mut conversation_id: Option<String> = None;
+            let mut message = None;
+            let mut state_dir = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--conversation" if i + 1 < args.len() => {
+                        conversation_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--message" if i + 1 < args.len() => {
+                        message = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
+                    }
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let status = match sub {
+                "done" => {
+                    if message.is_some() {
+                        eprintln!("error: --message is not supported for 'done'");
+                        std::process::exit(2);
+                    }
+                    ExplicitNotificationStatus::Done
+                }
+                _ => match message {
+                    Some(m) if !m.trim().is_empty() => {
+                        ExplicitNotificationStatus::Failed { message: m }
+                    }
+                    _ => {
+                        eprintln!("error: --message is required for 'failed'");
+                        std::process::exit(2);
+                    }
+                },
+            };
+
+            // A worker launched by the extension already owns an execution; anything else
+            // mints one here so the caller never has to pass identity around.
+            let (task_id, execution_id, notify_state_dir, asserted_conversation) =
+                match (env_var("HANDS_TASK_ID"), env_var("HANDS_RETURN_BRIDGE_EXECUTION_ID")) {
+                    (Some(task_id), Some(execution_id)) => {
+                        // Routing comes from the launch request in the journal, so a worker
+                        // never has to carry the conversation ID. A conversation supplied by
+                        // flag or environment is only an assertion, checked against the journal
+                        // by the native host before anything is written.
+                        let asserted_conversation =
+                            conversation_id.or_else(|| env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID"));
+                        (
+                            task_id,
+                            execution_id,
+                            state_dir
+                                .clone()
+                                .or_else(|| env_var("HANDS_RETURN_BRIDGE_STATE_DIR").map(PathBuf::from)),
+                            asserted_conversation,
+                        )
+                    }
+                    _ => {
+                        let conversation_id = match conversation_id
+                            .or_else(|| env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID"))
+                        {
+                            Some(value) if !value.is_empty() => value,
+                            _ => {
+                                let message_flag = if sub == "failed" { " --message <text>" } else { "" };
+                                eprintln!(
+                                    "usage: hands-bridge {} [--conversation <conversation_id>] [--state-dir <dir>]{}",
+                                    sub, message_flag
+                                );
+                                std::process::exit(2);
+                            }
+                        };
+                        let options = PrepareOptions {
+                            pairing_id: None,
+                            conversation_id,
+                            state_dir: state_dir.clone(),
+                        };
+                        match execute_prepare(options) {
+                            Ok(worker) => (
+                                worker.task_id,
+                                worker.execution_id,
+                                Some(PathBuf::from(worker.state_dir)),
+                                Some(worker.origin_conversation_id),
+                            ),
+                            Err(e) => {
+                                eprintln!("error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+
+            let options = NotifyOptions {
+                task_id: Some(task_id),
+                execution_id: Some(execution_id),
+                status,
+                state_dir: notify_state_dir,
+                expected_conversation_id: asserted_conversation,
+            };
+
+            match execute_notify(options) {
+                Ok(res) => {
+                    let verb = if res.is_idempotent { "already recorded" } else { "recorded" };
+                    println!(
+                        "Notification {} (receipt: {}, conversation: {}, status: {}).",
+                        verb, res.receipt_id, res.origin_conversation_id, res.state
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "notify" => {
+            if args.len() < 3 {
+                eprintln!("Usage: hands-bridge notify done [--task <task_id>] | failed --message <text> [--task <task_id>]");
+                std::process::exit(2);
+            }
+            if matches!(args[2].as_str(), "--help" | "-h") {
+                print_help();
+                return;
+            }
+            let sub = args[2].as_str();
+            let mut task_id = None;
+            let mut execution_id = None;
+            let mut state_dir = None;
+            let mut message = None;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--task" if i + 1 < args.len() => {
+                        task_id = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--execution-id" if i + 1 < args.len() => {
+                        execution_id = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--message" if i + 1 < args.len() => {
+                        message = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
+                    }
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let status = match sub {
+                "done" => {
+                    if message.is_some() {
+                        eprintln!("error: --message is not supported for 'notify done'");
+                        std::process::exit(2);
+                    }
+                    ExplicitNotificationStatus::Done
+                }
+                "failed" => {
+                    let msg = match message {
+                        Some(m) if !m.trim().is_empty() => m,
+                        _ => {
+                            eprintln!("error: --message is required for 'notify failed'");
+                            std::process::exit(2);
+                        }
+                    };
+                    ExplicitNotificationStatus::Failed { message: msg }
+                }
+                other => {
+                    eprintln!("error: unknown notify subcommand '{}'", other);
+                    std::process::exit(2);
+                }
+            };
+
+            let options = NotifyOptions {
+                task_id,
+                execution_id,
+                status,
+                state_dir,
+                expected_conversation_id: None,
+            };
+
+            match execute_notify(options) {
+                Ok(res) => {
+                    if res.is_idempotent {
+                        println!(
+                            "Notification already recorded (receipt: {}, task: {}, execution: {}, status: {}).",
+                            res.receipt_id, res.task_id, res.execution_id, res.state
+                        );
+                    } else {
+                        println!(
+                            "Notification recorded (receipt: {}, task: {}, execution: {}, status: {}).",
+                            res.receipt_id, res.task_id, res.execution_id, res.state
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "prepare" => {
+            let mut conversation_id: Option<String> = None;
+            let mut pairing_id = None;
+            let mut state_dir = None;
+            let mut as_json = false;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--conversation" if i + 1 < args.len() => {
+                        conversation_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--pairing-id" if i + 1 < args.len() => {
+                        pairing_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "--json" => as_json = true,
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let conversation_id = match conversation_id {
+                Some(c) if !c.is_empty() => c,
+                _ => {
+                    eprintln!("usage: hands-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]");
+                    std::process::exit(2);
+                }
+            };
+
+            let options = PrepareOptions {
+                pairing_id,
+                conversation_id,
+                state_dir,
+            };
+
+            match execute_prepare(options) {
+                Ok(worker) => {
+                    if as_json {
+                        println!(
+                            "{}",
+                            json!({
+                                "task_id": worker.task_id,
+                                "execution_id": worker.execution_id,
+                                "origin_conversation_id": worker.origin_conversation_id,
+                                "policy_revision": worker.policy_revision,
+                                "state": worker.state,
+                                "state_dir": worker.state_dir,
+                                "env": worker.env,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "Prepared worker claim (task: {}, execution: {}, conversation: {}, state: {}).",
+                            worker.task_id, worker.execution_id, worker.origin_conversation_id, worker.state
+                        );
+                        println!("Set this environment on the normal Orca OMP worker before it runs:");
+                        for (key, value) in &worker.env {
+                            println!("  $env:{}='{}'", key, value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -580,7 +919,7 @@ fn main() {
         }
         other => {
             eprintln!("Unknown command: {}", other);
-            print_help();
+            print_help_err();
             std::process::exit(1);
         }
     }
