@@ -3579,7 +3579,7 @@ async function runTests() {
     assert.equal(/Please inspect|task:|execution:|status:/.test(payloadDone.continuationText), false);
     assert.equal(payloadDone.receiptMarker, "[hands-bridge:receipt=rcpt_done_1]");
 
-    // Failed status with message includes failure details
+    // A failed run keeps the single wording and carries its reason as the note.
     const payloadFailed = harness.context.buildContinuationPayload({
       receiptId: "rcpt_fail_1",
       executionId: "exec_fail_1",
@@ -3587,11 +3587,20 @@ async function runTests() {
       state: "failed",
       assistantText: "Fatal: out of memory on build"
     });
-    assert.ok(payloadFailed.continuationText.startsWith("[Hands Bridge] Agent execution failed: Fatal: out of memory on build."));
-    assert.ok(payloadFailed.continuationText.includes("Check the work and continue!"));
+    assert.ok(payloadFailed.continuationText.startsWith("[Hands Bridge] Agent execution completed. Fatal: out of memory on build"));
     assert.ok(payloadFailed.continuationText.includes("[hands-bridge:receipt=rcpt_fail_1]"));
-    assert.equal(/Please inspect|task:|execution:|status:/.test(payloadFailed.continuationText), false);
+    assert.equal(/Agent execution failed|Please inspect|task:|execution:|status:/.test(payloadFailed.continuationText), false);
     assert.equal(payloadFailed.receiptMarker, "[hands-bridge:receipt=rcpt_fail_1]");
+
+    // A note replaces the default prompt rather than standing beside it.
+    const payloadNoted = harness.context.buildContinuationPayload({
+      receiptId: "rcpt_done_2",
+      state: "completed",
+      assistantText: "Rebuilt the bundle"
+    });
+    assert.ok(payloadNoted.continuationText.startsWith("[Hands Bridge] Agent execution completed. Rebuilt the bundle"));
+    assert.equal(payloadNoted.continuationText.includes("Check the work and continue!"), false);
+    assert.ok(payloadNoted.continuationText.endsWith("[hands-bridge:receipt=rcpt_done_2]"));
 
     // Drain reconciles task_id into storage record
     const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };

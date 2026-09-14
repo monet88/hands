@@ -87,14 +87,14 @@ Drive the steps separately only when you must inject identity into a process you
 5. Inside the MAIN world of the conversation tab the worker: reads `/api/auth/session` for an access token, reads `current_node` and `gizmo_id` from `/backend-api/conversation/<id>`, runs Sentinel `prepare`, proof-of-work, and the turnstile VM, calls Sentinel `finalize`, then `POST`s `/backend-api/conversation`.
 6. It re-reads the conversation and looks for the receipt marker in the transcript before settling the fence.
 
-The message the conversation receives is deliberately short and self-identifying:
+The message the conversation receives is deliberately short and self-identifying, and uses the same wording for both terminal states:
 
 ```text
 [Hands Bridge] Agent execution completed. Check the work and continue! [hands-bridge:receipt=rcpt_…]
-[Hands Bridge] Agent execution failed: <reason>. Check the work and continue! [hands-bridge:receipt=rcpt_…]
+[Hands Bridge] Agent execution completed. <failure reason> [hands-bridge:receipt=rcpt_…]
 ```
 
-Task and execution identifiers stay out of the text — the journal maps `receipt -> task/execution` — but the trailing marker must stay. It is the only token that is unique per receipt, so transcript verification and the recovery probe can tell this delivery apart from every other message in the same conversation; a conversation id cannot serve that purpose.
+Task and execution identifiers stay out of the text — the journal maps `receipt -> task/execution`, and the receipt's own `state` is the authoritative success/failure record, so the wording does not need to repeat it. The trailing marker must stay: it is the only token that is unique per receipt, so transcript verification and the recovery probe can tell this delivery apart from every other message in the same conversation; a conversation id cannot serve that purpose.
 
 Fence settlement outcomes:
 

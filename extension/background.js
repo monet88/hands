@@ -360,18 +360,14 @@ function sendNative(msg) {
 function buildContinuationPayload(rcpt) {
   // The receipt marker is the only unique token in the message: transcript verification
   // and the stuck-attempt recovery probe settle by finding it, so it must stay.
+  // Delivery uses one wording for both terminal states; the receipt records the real
+  // status, and a failed run carries its reason as the note.
   const receiptMarker = `[hands-bridge:receipt=${rcpt.receiptId}]`;
-  const terminalStatus = rcpt.state || "completed";
-
-  let continuationText;
-  if (terminalStatus === "failed") {
-    const rawMsg = rcpt.assistantText || rcpt.assistant_text || "";
-    const boundedMsg = typeof rawMsg === "string" && rawMsg.trim() ? rawMsg.trim().slice(0, 1024) : "";
-    const failureDetail = boundedMsg ? `: ${boundedMsg}` : "";
-    continuationText = `[Hands Bridge] Agent execution failed${failureDetail}. Check the work and continue! ${receiptMarker}`;
-  } else {
-    continuationText = `[Hands Bridge] Agent execution completed. Check the work and continue! ${receiptMarker}`;
-  }
+  const rawMsg = rcpt.assistantText || rcpt.assistant_text || "";
+  const note = typeof rawMsg === "string" ? rawMsg.trim().slice(0, 1024) : "";
+  const continuationText = note
+    ? `[Hands Bridge] Agent execution completed. ${note} ${receiptMarker}`
+    : `[Hands Bridge] Agent execution completed. Check the work and continue! ${receiptMarker}`;
   return { receiptMarker, continuationText };
 }
 
