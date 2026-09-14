@@ -29,7 +29,6 @@ const MAX_PUSH_SIGNAL_BYTES: u64 = 16 * 1024;
 struct PushEndpoint {
     port: u16,
     token: String,
-    pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -844,7 +843,6 @@ fn start_push_subscription(
     let endpoint = PushEndpoint {
         port,
         token: token.clone(),
-        pid: std::process::id(),
     };
     std::fs::write(&endpoint_path, serde_json::to_vec(&endpoint)?)?;
 
@@ -1282,7 +1280,6 @@ mod push_tests {
         let endpoint = PushEndpoint {
             port,
             token: token.clone(),
-            pid: std::process::id(),
         };
         std::fs::write(
             push_endpoint_path(dir.path()),
