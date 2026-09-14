@@ -87,6 +87,15 @@ Drive the steps separately only when you must inject identity into a process you
 5. Inside the MAIN world of the conversation tab the worker: reads `/api/auth/session` for an access token, reads `current_node` and `gizmo_id` from `/backend-api/conversation/<id>`, runs Sentinel `prepare`, proof-of-work, and the turnstile VM, calls Sentinel `finalize`, then `POST`s `/backend-api/conversation`.
 6. It re-reads the conversation and looks for the receipt marker in the transcript before settling the fence.
 
+The message the conversation receives is deliberately short and self-identifying:
+
+```text
+[Hands Bridge] Agent execution completed. Check the work and continue! [hands-bridge:receipt=rcpt_…]
+[Hands Bridge] Agent execution failed: <reason>. Check the work and continue! [hands-bridge:receipt=rcpt_…]
+```
+
+Task and execution identifiers stay out of the text — the journal maps `receipt -> task/execution` — but the trailing marker must stay. It is the only token that is unique per receipt, so transcript verification and the recovery probe can tell this delivery apart from every other message in the same conversation; a conversation id cannot serve that purpose.
+
 Fence settlement outcomes:
 
 - **`submitted-observed`** — the receipt marker was observed in the conversation transcript. The message is in ChatGPT; the delivery slot is released.

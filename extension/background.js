@@ -358,9 +358,9 @@ function sendNative(msg) {
 }
 
 function buildContinuationPayload(rcpt) {
+  // The receipt marker is the only unique token in the message: transcript verification
+  // and the stuck-attempt recovery probe settle by finding it, so it must stay.
   const receiptMarker = `[hands-bridge:receipt=${rcpt.receiptId}]`;
-  const taskId = rcpt.taskId || rcpt.task_id || rcpt.executionId;
-  const executionId = rcpt.executionId || rcpt.execution_id;
   const terminalStatus = rcpt.state || "completed";
 
   let continuationText;
@@ -368,9 +368,9 @@ function buildContinuationPayload(rcpt) {
     const rawMsg = rcpt.assistantText || rcpt.assistant_text || "";
     const boundedMsg = typeof rawMsg === "string" && rawMsg.trim() ? rawMsg.trim().slice(0, 1024) : "";
     const failureDetail = boundedMsg ? `: ${boundedMsg}` : "";
-    continuationText = `[Hands Return Bridge] Local agent execution failed (task: ${taskId}, execution: ${executionId}, receipt: ${rcpt.receiptId}, status: ${terminalStatus})${failureDetail}. Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+    continuationText = `[Hands Bridge] Agent execution failed${failureDetail}. Check the work and continue! ${receiptMarker}`;
   } else {
-    continuationText = `[Hands Return Bridge] Local agent execution completed (task: ${taskId}, execution: ${executionId}, receipt: ${rcpt.receiptId}, status: ${terminalStatus}). Please inspect local agent/repository truth and continue. ${receiptMarker}`;
+    continuationText = `[Hands Bridge] Agent execution completed. Check the work and continue! ${receiptMarker}`;
   }
   return { receiptMarker, continuationText };
 }

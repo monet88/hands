@@ -3573,11 +3573,10 @@ async function runTests() {
       taskId: "task_done_1",
       state: "completed"
     });
-    assert.ok(payloadDone.continuationText.includes("task: task_done_1"));
-    assert.ok(payloadDone.continuationText.includes("execution: exec_done_1"));
-    assert.ok(payloadDone.continuationText.includes("receipt: rcpt_done_1"));
-    assert.ok(payloadDone.continuationText.includes("status: completed"));
-    assert.ok(payloadDone.continuationText.includes("[Hands Return Bridge] Local agent execution completed"));
+    assert.ok(payloadDone.continuationText.startsWith("[Hands Bridge] Agent execution completed."));
+    assert.ok(payloadDone.continuationText.includes("Check the work and continue!"));
+    assert.ok(payloadDone.continuationText.includes("[hands-bridge:receipt=rcpt_done_1]"));
+    assert.equal(/Please inspect|task:|execution:|status:/.test(payloadDone.continuationText), false);
     assert.equal(payloadDone.receiptMarker, "[hands-bridge:receipt=rcpt_done_1]");
 
     // Failed status with message includes failure details
@@ -3588,12 +3587,10 @@ async function runTests() {
       state: "failed",
       assistantText: "Fatal: out of memory on build"
     });
-    assert.ok(payloadFailed.continuationText.includes("task: task_fail_1"));
-    assert.ok(payloadFailed.continuationText.includes("execution: exec_fail_1"));
-    assert.ok(payloadFailed.continuationText.includes("receipt: rcpt_fail_1"));
-    assert.ok(payloadFailed.continuationText.includes("status: failed"));
-    assert.ok(payloadFailed.continuationText.includes("Fatal: out of memory on build"));
-    assert.ok(payloadFailed.continuationText.includes("[Hands Return Bridge] Local agent execution failed"));
+    assert.ok(payloadFailed.continuationText.startsWith("[Hands Bridge] Agent execution failed: Fatal: out of memory on build."));
+    assert.ok(payloadFailed.continuationText.includes("Check the work and continue!"));
+    assert.ok(payloadFailed.continuationText.includes("[hands-bridge:receipt=rcpt_fail_1]"));
+    assert.equal(/Please inspect|task:|execution:|status:/.test(payloadFailed.continuationText), false);
     assert.equal(payloadFailed.receiptMarker, "[hands-bridge:receipt=rcpt_fail_1]");
 
     // Drain reconciles task_id into storage record
