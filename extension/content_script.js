@@ -5,7 +5,6 @@
 (() => {
   // Stable per-document identity generated on script load
   const DOCUMENT_ID = "doc_" + (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID().replace(/-/g, "").slice(0, 16) : Math.random().toString(36).slice(2, 18));
-  const SCRIPT_LOADED_URL = window.location.href.split("#")[0].split("?")[0];
 
   // Track one-time grant consumption by attemptId in this live document
   const consumedGrantAttemptIds = new Set();
@@ -15,6 +14,55 @@
     if (btn.disabled) return false;
     if (btn.getAttribute && btn.getAttribute("aria-disabled") === "true") return false;
     return true;
+  }
+
+  function hasActiveGeneration() {
+    return !!document.querySelector(
+      'button[data-testid="stop-button"], button[aria-label*="Stop generating" i], button[aria-label*="Stop response" i]'
+    );
+  }
+
+  let generationWakeObserver = null;
+  function armGenerationEndWakeup() {
+    if (generationWakeObserver || typeof MutationObserver === "undefined" || !document.body) return;
+    generationWakeObserver = new MutationObserver(() => {
+      if (hasActiveGeneration()) return;
+      generationWakeObserver.disconnect();
+      generationWakeObserver = null;
+      try {
+        chrome.runtime.sendMessage({ action: "pageReady" }, () => {
+          void chrome.runtime.lastError;
+        });
+      } catch {}
+    });
+    generationWakeObserver.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["aria-label", "data-testid"]
+    });
+  }
+
+  function findEnabledSendButton() {
+    const selectors = [
+      'button[data-testid="send-button"]',
+      'button[data-testid="fruitjuice-send-button"]',
+      'button[aria-label*="Send prompt" i]',
+      'button[aria-label*="Send message" i]',
+      'button[aria-label="Send" i]',
+      '#composer-submit-button'
+    ];
+    for (const selector of selectors) {
+      const btn = document.querySelector(selector);
+      if (!isButtonEnabled(btn)) continue;
+      const testId = String(btn.getAttribute?.("data-testid") || "").toLowerCase();
+      const ariaLabel = String(btn.getAttribute?.("aria-label") || "").toLowerCase();
+      if (testId.includes("stop") || ariaLabel.includes("stop")) continue;
+      // The generic submit id is reused by ChatGPT while generation is active.
+      if (selector === "#composer-submit-button" && hasActiveGeneration()) continue;
+      return btn;
+    }
+    return null;
   }
   function clearComposer(composer, expectedText) {
     if (!composer) return;
@@ -110,116 +158,36 @@
     return accountText;
   }
 
-  function normalizeAccountText(text) {
-    return (text || "").replace(/\s+/g, " ").trim();
-  }
-
-  // Pure UI-role phrases name the control, never the account/workspace, so a static
-  // selector label such as "Workspace picker" or "Open profile menu" must never count
-  // as account identity evidence.
-  const STRUCTURAL_ACCOUNT_LABEL =
-    /^(?:open|show|toggle|switch|select|choose)?\s*(?:profile|account|user|workspace|menu|picker)(?:\s+(?:menu|picker|switcher|selector|profile|account|user|workspace))*$/i;
-
-  function isAccountIdentityEvidence(value) {
-    const normalized = normalizeAccountText(value);
-    return normalized.length > 0 && !STRUCTURAL_ACCOUNT_LABEL.test(normalized);
-  }
-
-  // Identity comparison is normalized exact equality: an appended or prefixed suffix is never
-  // the same account/workspace ("Personal User Team" differs from "Personal User"). Transient
-  // badge/counter text is tolerated only through the stable aria-label identity path, never by
-  // guessing arbitrary suffixes on rendered text.
-  function normalizeAccountIdentity(value) {
-    return normalizeAccountText(value).toLowerCase();
-  }
-
-  // Account/workspace identity evidence: accessible labels of the account/workspace nodes
-  // only. Structural selector identifiers (`data-testid`, element `id`) merely locate those
-  // nodes and stay constant across an account/workspace switch, so they must never be
-  // treated as identity evidence or authorize a click on their own.
-  function getAccountContextIdentity() {
-    const accountSelectors = [
-      '[data-testid*="user-profile"], [data-testid*="workspace"], button[id*="user-menu"]',
-      '[aria-label*="profile menu" i]'
-    ];
-
-    const tokens = [];
-    for (const selector of accountSelectors) {
-      for (const node of document.querySelectorAll(selector)) {
-        const cleanedAriaLabel = normalizeAccountText(node?.getAttribute?.("aria-label") || "")
-          .replace(/\s*,\s*open profile menu\s*$/i, "")
-          .trim();
-        if (isAccountIdentityEvidence(cleanedAriaLabel)) {
-          tokens.push(normalizeAccountIdentity(cleanedAriaLabel));
-        }
-      }
-    }
-
-    // Order-insensitive + deduplicated: DOM reorder and extra nodes must not change identity.
-    return Array.from(new Set(tokens)).sort();
-  }
-
-  function checkReadinessGuards(expectedConversationId, expectedConversationUrl) {
-    // 1. Navigation / Route change check
-    const currentUrl = window.location.href.split("#")[0].split("?")[0];
-    if (currentUrl !== SCRIPT_LOADED_URL) {
-      return { ready: false, reason: "navigation_invalidated", message: "Document URL changed since script load" };
-    }
+  function checkReadinessGuards(expectedConversationId) {
+    // Conversation ID is the sole Return Bridge routing authority.
     const currentConvId = getCanonicalConversationId();
     if (!currentConvId || currentConvId !== expectedConversationId) {
       return { ready: false, reason: "conversation_mismatch", message: "Page is not the expected canonical conversation" };
     }
-    if (expectedConversationUrl && currentUrl !== expectedConversationUrl && !currentUrl.endsWith(`/c/${expectedConversationId}`)) {
-      return { ready: false, reason: "conversation_mismatch", message: "Page URL does not match expected conversation" };
-    }
-    // 2. Loading / Login / Error page check
-    if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
-      return { ready: false, reason: "login_or_error_page", message: "Page shows login or error state" };
-    }
-    if (document.readyState === "loading") {
-      return { ready: false, reason: "document_loading", message: "Document is still loading" };
-    }
 
-    // 3. Active generation check (never stop generation)
-    const stopButton = document.querySelector(
-      'button[data-testid="stop-button"], button[aria-label*="Stop generating"], button[data-testid="fruitjuice-stop-button"]'
-    );
-    if (stopButton) {
-      return { ready: false, reason: "active_generation", message: "ChatGPT is currently generating a response" };
-    }
-
-    // 4. Draft preservation check (never overwrite user draft)
-    const promptTextarea = document.querySelector(
-      '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"]#prompt-textarea'
-    );
-    if (promptTextarea) {
-      const rawDraftText = promptTextarea.value !== undefined ? promptTextarea.value : (promptTextarea.innerText || "");
-      if (rawDraftText.length > 0) {
-        return { ready: false, reason: "unrelated_draft_present", message: "User draft present in composer; preserving draft without overwrite" };
-      }
-    } else {
-      return { ready: false, reason: "composer_not_found", message: "Prompt composer element not found" };
-    }
-
-    // 5. Context evidence
-    const transcriptText = getRenderedTranscriptText();
-    if (!transcriptText) {
-      return { ready: false, reason: "missing_transcript", message: "No conversation transcript rendered" };
-    }
-    const accountText = getAccountContextText();
-    if (!accountText) {
-      return { ready: false, reason: "missing_account_context", message: "No account/workspace context found" };
+    if (hasActiveGeneration()) {
+      armGenerationEndWakeup();
+      return { ready: false, reason: "active_generation", message: "ChatGPT is still generating; retry when the Send control returns" };
     }
 
     return {
       ready: true,
       documentId: DOCUMENT_ID,
-      conversationId: currentConvId,
-      currentUrl,
-      transcriptText,
-      accountText,
-      accountIdentity: getAccountContextIdentity()
+      conversationId: currentConvId
     };
+  }
+
+  // Announce this document so the background registers the canonical conversation it belongs to.
+  // document_idle runs at/after tabs.onUpdated "complete", so this - not the load event - is the
+  // reliable readiness signal for a conversation tab that is opened or reloaded.
+  if (chrome.runtime?.sendMessage) {
+    try {
+      chrome.runtime.sendMessage({ action: "pageReady" }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (announceErr) {
+      // Background unavailable (e.g. context invalidated); registration is best-effort.
+    }
   }
 
   // Listen for messages from background.js
@@ -274,8 +242,7 @@
     if (request.action === "check_delivery_readiness") {
       try {
         const readiness = checkReadinessGuards(
-          request.expectedConversationId,
-          request.expectedConversationUrl
+          request.expectedConversationId
         );
         sendResponse({
           ok: readiness.ready,
@@ -294,7 +261,7 @@
         let composer = null;
         const continuationText = request?.continuationText;
         try {
-          const { attemptId, expectedDocumentId, expectedConversationId, expectedConversationUrl, expectedAccountText, expectedAccountIdentity, receiptMarker } = request;
+          const { attemptId, expectedDocumentId, expectedConversationId, receiptMarker } = request;
 
         // Document Identity Check: grant is bound to this specific document
         if (expectedDocumentId !== DOCUMENT_ID) {
@@ -321,7 +288,7 @@
         // Mark this attemptId consumed
         consumedGrantAttemptIds.add(attemptId);
         // Synchronous final readiness guard (zero asynchronous gap!)
-        const finalReadiness = checkReadinessGuards(expectedConversationId, expectedConversationUrl);
+        const finalReadiness = checkReadinessGuards(expectedConversationId);
         if (!finalReadiness.ready) {
           sendResponse({
             ok: false,
@@ -369,17 +336,16 @@
         }
 
         // Locate send button (mounted/enabled upon text input) (Finding 8)
-        const sendBtnSelector = 'button[data-testid="send-button"], button[aria-label*="Send prompt" i], button[data-testid="fruitjuice-send-button"], #composer-submit-button';
-        let sendBtn = document.querySelector(sendBtnSelector);
-        if (!isButtonEnabled(sendBtn)) {
+        let sendBtn = findEnabledSendButton();
+        if (!sendBtn) {
           for (let i = 0; i < 10; i++) {
             await new Promise((res) => setTimeout(res, 60));
-            sendBtn = document.querySelector(sendBtnSelector);
-            if (isButtonEnabled(sendBtn)) break;
+            sendBtn = findEnabledSendButton();
+            if (sendBtn) break;
           }
         }
 
-        if (!isButtonEnabled(sendBtn)) {
+        if (!sendBtn) {
           clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
@@ -390,7 +356,7 @@
           return true;
         }
 
-        // Finding 6: Immediately before click revalidate document/conversation, generation/readiness,
+        // Finding 6: Immediately before click revalidate document/conversation/readiness,
         // composer still contains exact continuation payload, and the actual button is valid and enabled
         if (expectedDocumentId !== DOCUMENT_ID) {
           clearComposer(composer, continuationText);
@@ -403,101 +369,16 @@
           return true;
         }
 
-        const currentUrl = window.location.href.split("#")[0].split("?")[0];
-        if (currentUrl !== SCRIPT_LOADED_URL) {
+        const preClickReadiness = checkReadinessGuards(expectedConversationId);
+        if (!preClickReadiness.ready) {
           clearComposer(composer, continuationText);
           sendResponse({
             ok: false,
             clicked: false,
-            reason: "navigation_invalidated",
-            message: "Document URL changed since script load"
+            reason: preClickReadiness.reason,
+            message: preClickReadiness.message
           });
           return true;
-        }
-        const currentConvId = getCanonicalConversationId();
-        if (!currentConvId || currentConvId !== expectedConversationId) {
-          clearComposer(composer, continuationText);
-          sendResponse({
-            ok: false,
-            clicked: false,
-            reason: "conversation_mismatch",
-            message: "Page is not the expected canonical conversation at click moment"
-          });
-          return true;
-        }
-
-        if (expectedConversationUrl && currentUrl !== expectedConversationUrl && !currentUrl.endsWith(`/c/${expectedConversationId}`)) {
-          clearComposer(composer, continuationText);
-          sendResponse({
-            ok: false,
-            clicked: false,
-            reason: "conversation_mismatch",
-            message: "Page URL does not match expected conversation at click moment"
-          });
-          return true;
-        }
-
-        if (document.querySelector('[data-testid="login-button"], form[action*="login"], .auth-error, [data-testid="error-banner"]')) {
-          clearComposer(composer, continuationText);
-          sendResponse({
-            ok: false,
-            clicked: false,
-            reason: "login_or_error_page",
-            message: "Page shows login or error state at click moment"
-          });
-          return true;
-        }
-
-        const stopBtn = document.querySelector(
-          'button[data-testid="stop-button"], button[aria-label*="Stop generating"], button[data-testid="fruitjuice-stop-button"]'
-        );
-        if (stopBtn) {
-          clearComposer(composer, continuationText);
-          sendResponse({
-            ok: false,
-            clicked: false,
-            reason: "active_generation",
-            message: "ChatGPT is currently generating a response at click moment"
-          });
-          return true;
-        }
-
-        // Revalidate the same account/workspace context immediately before click.
-        // Keep this synchronous: hashing here would introduce a fresh async gap after the native grant.
-        // Only account/workspace-specific semantic evidence (accessible labels) is authoritative;
-        // structural selector identifiers stay constant across an account switch and cannot
-        // authorize the click. Semantic identity tokens and the rendered-text fallback are both
-        // compared by normalized exact equality, so DOM reorder, an extra node, or a transient
-        // badge suffix (which changes only the rendered text, not the label) cannot authorize a
-        // different account/workspace and can never mask a real switch.
-        const expectedAccountTokens = Array.isArray(expectedAccountIdentity) ? expectedAccountIdentity : [];
-        if (expectedAccountTokens.length > 0) {
-          const currentAccountTokens = getAccountContextIdentity();
-          const identityMatches = expectedAccountTokens.every(expectedToken =>
-            currentAccountTokens.includes(normalizeAccountIdentity(expectedToken))
-          );
-          if (!identityMatches) {
-            clearComposer(composer, continuationText);
-            sendResponse({
-              ok: false,
-              clicked: false,
-              reason: "account_context_mismatch",
-              message: "Account/workspace identity changed after dispatch grant"
-            });
-            return true;
-          }
-        } else if (expectedAccountText) {
-          const currentAccountText = normalizeAccountIdentity(getAccountContextText());
-          if (!currentAccountText || currentAccountText !== normalizeAccountIdentity(expectedAccountText)) {
-            clearComposer(composer, continuationText);
-            sendResponse({
-              ok: false,
-              clicked: false,
-              reason: "account_context_mismatch",
-              message: "Account/workspace context changed after dispatch grant"
-            });
-            return true;
-          }
         }
 
         // Re-query the current attached composer after the async send-button wait (P2 3995737142)

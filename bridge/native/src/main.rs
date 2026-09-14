@@ -2,12 +2,14 @@ use std::env;
 use std::path::PathBuf;
 
 use hands_return_bridge::host::{
-    LocalInitOptions, NotifyOptions, SetupOptions, TargetAddOptions, TargetListOptions, TargetRemoveOptions,
-    execute_local_init, execute_notify, execute_setup, execute_target_add, execute_target_list,
-    execute_target_remove, resolve_state_dir, run_native_host,
+    LocalInitOptions, NotifyOptions, PrepareOptions, SetupOptions, TargetAddOptions,
+    TargetListOptions, TargetRemoveOptions, execute_local_init, execute_notify, execute_prepare,
+    execute_setup, execute_target_add, execute_target_list, execute_target_remove,
+    resolve_state_dir, run_native_host,
 };
 use hands_return_bridge::journal::{ExplicitNotificationStatus, Journal};
 use hands_return_bridge::protocol::TRUST_NOTICE;
+use serde_json::json;
 
 fn print_help() {
     eprintln!(
@@ -23,6 +25,7 @@ Usage:
   hands-return-bridge target list [--pairing-id <id>] [--state-dir <dir>]
   hands-return-bridge notify done [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
   hands-return-bridge notify failed --message <text> [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-return-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
@@ -40,6 +43,13 @@ Target Commands:
   target add                    Register a new git workspace target on active pairing
   target remove                 Remove a registered target from active pairing
   target list                   List registered targets on active pairing
+
+Worker Commands:
+  prepare                       Claim task/execution identity for a registered ChatGPT conversation
+                                and print the environment for a normal Orca OMP worker
+                                (no target/workspace is involved; routing follows the conversation)
+  notify done                   Record explicit terminal success for a prepared/launched task
+  notify failed                 Record explicit terminal failure for a prepared/launched task
 "#
     );
 }
@@ -658,6 +668,82 @@ fn main() {
                             "Notification recorded (receipt: {}, task: {}, execution: {}, status: {}).",
                             res.receipt_id, res.task_id, res.execution_id, res.state
                         );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "prepare" => {
+            let mut conversation_id: Option<String> = None;
+            let mut pairing_id = None;
+            let mut state_dir = None;
+            let mut as_json = false;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--conversation" if i + 1 < args.len() => {
+                        conversation_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--pairing-id" if i + 1 < args.len() => {
+                        pairing_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "--json" => as_json = true,
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let conversation_id = match conversation_id {
+                Some(c) if !c.is_empty() => c,
+                _ => {
+                    eprintln!("usage: hands-return-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]");
+                    std::process::exit(2);
+                }
+            };
+
+            let options = PrepareOptions {
+                pairing_id,
+                conversation_id,
+                state_dir,
+            };
+
+            match execute_prepare(options) {
+                Ok(worker) => {
+                    if as_json {
+                        println!(
+                            "{}",
+                            json!({
+                                "task_id": worker.task_id,
+                                "execution_id": worker.execution_id,
+                                "origin_conversation_id": worker.origin_conversation_id,
+                                "policy_revision": worker.policy_revision,
+                                "state": worker.state,
+                                "state_dir": worker.state_dir,
+                                "env": worker.env,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "Prepared worker claim (task: {}, execution: {}, conversation: {}, state: {}).",
+                            worker.task_id, worker.execution_id, worker.origin_conversation_id, worker.state
+                        );
+                        println!("Set this environment on the normal Orca OMP worker before it runs:");
+                        for (key, value) in &worker.env {
+                            println!("  $env:{}='{}'", key, value);
+                        }
                     }
                 }
                 Err(e) => {

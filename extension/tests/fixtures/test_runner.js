@@ -244,13 +244,9 @@ window.startTest = async function(config = {}) {
       logResult("recover_launch_summaries", recoverOk, recoverResp);
       results.steps.push({ step: "recover_launch_summaries", pass: recoverOk });
 
-      // Step 7f: AC1/AC6 Ensure alarms and scheduled wakeup
-      const alarmResp = await chrome.runtime.sendMessage({ action: "ensureAlarms" });
-      const alarmOk = alarmResp && alarmResp.status === "ok" && alarmResp.alarmScheduled === true;
-      logResult("ensure_recovery_alarm", alarmOk, alarmResp);
-      results.steps.push({ step: "ensure_recovery_alarm", pass: alarmOk });
-
-      // Step 7g: AC1/AC3 Drain and transport ACK over real native messaging host process
+      // Step 7f: AC1/AC3 Drain and transport ACK over real native messaging host process.
+      // Production wakeups are push-driven; this explicit drain remains a deterministic
+      // recovery/transport probe for the browser E2E fixture.
       const drainResp = await chrome.runtime.sendMessage({ action: "drain" });
       const drainOk = drainResp && drainResp.status === "ok" && Array.isArray(drainResp.summaries);
       logResult("drain_real_native_host", drainOk, drainResp);

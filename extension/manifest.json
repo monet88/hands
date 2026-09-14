@@ -8,7 +8,6 @@
     "storage",
     "tabs",
     "scripting",
-    "alarms",
     "clipboardWrite"
   ],
   "host_permissions": [

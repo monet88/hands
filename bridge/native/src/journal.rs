@@ -11,6 +11,16 @@ pub const LOCAL_PAIRING_SECRET: &str = "local";
 pub const LOCAL_PROFILE_ID: &str = "local";
 pub const LOCAL_POLICY_REVISION: &str = "v1";
 
+/// Schema placeholders for lifecycle rows owned by externally launched (normal Orca) workers.
+/// `launch_requests` requires target columns; these sentinel values fill them only so the row is
+/// well-formed. Routing, delivery, and workspace resolution never depend on target/workspace.
+pub const EXTERNAL_WORKER_TARGET_ID: &str = "external-orca";
+pub const EXTERNAL_WORKER_TARGET_PATH: &str = "external-orca://worker-lifecycle";
+/// Backward-compatible filler for legacy NOT NULL evidence columns. Direct conversation routing
+/// never authenticates or routes on transcript/account evidence.
+pub const DIRECT_ROUTE_EVIDENCE_HASH: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetRecord {
     pub target_id: String,
@@ -88,6 +98,7 @@ pub enum PairingError {
     AlreadyAttempted,
     ReceiptNotFound,
     ExecutionMismatch,
+    ConversationNotRegistered,
     AccountContextMismatch,
     DispatchFenceConflict,
     StorageError(String),
@@ -110,6 +121,7 @@ impl std::fmt::Display for PairingError {
             PairingError::AlreadyAttempted => write!(f, "already_attempted"),
             PairingError::ReceiptNotFound => write!(f, "receipt_not_found"),
             PairingError::ExecutionMismatch => write!(f, "execution_mismatch"),
+            PairingError::ConversationNotRegistered => write!(f, "conversation_not_registered"),
             PairingError::AccountContextMismatch => write!(f, "account_context_mismatch"),
             PairingError::DispatchFenceConflict => write!(f, "dispatch_fence_conflict"),
             PairingError::StorageError(e) => write!(f, "storage_error: {}", e),
@@ -193,6 +205,34 @@ pub struct LaunchClaimResult {
     pub state: String,
     pub is_replayed: bool,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRegistrationParams {
+    pub pairing_id: String,
+    pub origin_conversation_id: String,
+    pub origin_conversation_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRegistration {
+    pub pairing_id: String,
+    pub origin_conversation_id: String,
+    pub origin_conversation_url: String,
+    pub registered_at: i64,
+    pub updated_at: i64,
+    pub is_new: bool,
+}
+
+/// Claimed task/execution identity for an externally launched (normal Orca) worker.
+/// Excludes `return_token`, which stays internal to the extension launch path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalWorkerClaim {
+    pub task_id: String,
+    pub execution_id: String,
+    pub origin_conversation_id: String,
+    pub policy_revision: String,
+    pub state: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExplicitNotificationStatus {
@@ -307,9 +347,6 @@ pub struct DispatchClaimParams {
     pub payload_digest: String,
     pub receipt_marker: String,
     pub origin_conversation_id: String,
-    pub origin_conversation_url: String,
-    pub account_evidence_hash: String,
-    pub transcript_evidence_hash: String,
     pub tab_id: Option<String>,
     pub document_id: String,
 }
@@ -561,6 +598,18 @@ impl Journal {
                 FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE,
                 FOREIGN KEY (receipt_id) REFERENCES dispatch_fences(receipt_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS conversation_registrations (
+                pairing_id TEXT NOT NULL,
+                origin_conversation_id TEXT NOT NULL,
+                origin_conversation_url TEXT NOT NULL,
+                transcript_evidence_hash TEXT NOT NULL,
+                account_evidence_hash TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (pairing_id, origin_conversation_id),
+                FOREIGN KEY (pairing_id) REFERENCES pairings(pairing_id) ON DELETE CASCADE
+            );
             "#,
         )?;
         Ok(Self {
@@ -789,6 +838,32 @@ impl Journal {
             Some(s) => PairingStatus::parse(&s)
                 .ok_or_else(|| PairingError::StorageError("unknown status".into())),
             None => Err(PairingError::NotFound),
+        }
+    }
+
+    /// Fail-closed pairing revalidation inside the same write transaction that allocates or
+    /// registers lifecycle rows, closing authenticate -> revoke -> mutate races.
+    fn require_active_pairing_in_tx(
+        conn: &Connection,
+        pairing_id: &str,
+    ) -> Result<(), PairingError> {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM pairings WHERE pairing_id = ?1",
+                params![pairing_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        match status.as_deref() {
+            None => Err(PairingError::NotFound),
+            Some("active") => Ok(()),
+            Some("revoked") | Some("retired") => Err(PairingError::Retired),
+            Some("pending") => Err(PairingError::NotActive),
+            Some(other) => Err(PairingError::StorageError(format!(
+                "invalid pairing status: {other}"
+            ))),
         }
     }
 
@@ -1196,6 +1271,217 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
     Ok(canonical)
 }
 
+    /// Registers (or refreshes) one canonical ChatGPT conversation, keyed by pairing +
+    /// conversation ID only. No target/workspace/account/transcript state participates.
+    pub fn register_conversation(
+        &self,
+        params: &ConversationRegistrationParams,
+    ) -> Result<ConversationRegistration, PairingError> {
+        if params.pairing_id.trim().is_empty()
+            || params.origin_conversation_id.trim().is_empty()
+            || params.origin_conversation_url.trim().is_empty()
+        {
+            return Err(PairingError::StorageError(
+                "conversation registration requires non-empty pairing and conversation values"
+                    .to_string(),
+            ));
+        }
+
+        let now = now_epoch_secs();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Self::require_active_pairing_in_tx(&tx, &params.pairing_id)?;
+
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT registered_at FROM conversation_registrations WHERE pairing_id = ?1 AND origin_conversation_id = ?2",
+                params![&params.pairing_id, &params.origin_conversation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let (registered_at, is_new) = match existing {
+            Some(registered_at) => {
+                tx.execute(
+                    "UPDATE conversation_registrations SET origin_conversation_url = ?1, transcript_evidence_hash = ?2, account_evidence_hash = ?2, updated_at = ?3 WHERE pairing_id = ?4 AND origin_conversation_id = ?5",
+                    params![
+                        &params.origin_conversation_url,
+                        DIRECT_ROUTE_EVIDENCE_HASH,
+                        now,
+                        &params.pairing_id,
+                        &params.origin_conversation_id
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+                (registered_at, false)
+            }
+            None => {
+                tx.execute(
+                    r#"
+                    INSERT INTO conversation_registrations (
+                        pairing_id, origin_conversation_id, origin_conversation_url,
+                        transcript_evidence_hash, account_evidence_hash, registered_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                    "#,
+                    params![
+                        &params.pairing_id,
+                        &params.origin_conversation_id,
+                        &params.origin_conversation_url,
+                        DIRECT_ROUTE_EVIDENCE_HASH,
+                        DIRECT_ROUTE_EVIDENCE_HASH,
+                        now
+                    ],
+                )
+                .map_err(|e| PairingError::StorageError(e.to_string()))?;
+                (now, true)
+            }
+        };
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(ConversationRegistration {
+            pairing_id: params.pairing_id.clone(),
+            origin_conversation_id: params.origin_conversation_id.clone(),
+            origin_conversation_url: params.origin_conversation_url.clone(),
+            registered_at,
+            updated_at: now,
+            is_new,
+        })
+    }
+
+    /// Claims a task/execution for an explicitly named registered conversation so a normal
+    /// Orca OMP worker (launched outside the extension) can be given durable identity.
+    /// The conversation URL is copied from the registration. Target/evidence columns in the
+    /// legacy lifecycle schema are internal placeholders and never participate in routing.
+    pub fn prepare_external_worker_claim(
+        &self,
+        pairing_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<ExternalWorkerClaim, PairingError> {
+        let pairing_id = pairing_id.trim();
+        let origin_conversation_id = origin_conversation_id.trim();
+        if pairing_id.is_empty() || origin_conversation_id.is_empty() {
+            return Err(PairingError::ConversationNotRegistered);
+        }
+
+        let now = now_epoch_secs();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        Self::require_active_pairing_in_tx(&tx, pairing_id)?;
+
+        let registration: Option<String> = tx
+            .query_row(
+                r#"
+                SELECT origin_conversation_url
+                FROM conversation_registrations
+                WHERE pairing_id = ?1 AND origin_conversation_id = ?2
+                "#,
+                params![pairing_id, origin_conversation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        let origin_conversation_url = registration.ok_or(PairingError::ConversationNotRegistered)?;
+
+        let policy_revision: Option<String> = tx
+            .query_row(
+                "SELECT policy_revision FROM pairings WHERE pairing_id = ?1",
+                params![pairing_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        let policy_revision = policy_revision.ok_or(PairingError::NotFound)?;
+
+        let policy: Option<PolicyRecord> = tx
+            .query_row(
+                "SELECT policy_revision, tool_policy, approval_policy FROM policies WHERE pairing_id = ?1 AND policy_revision = ?2",
+                params![pairing_id, &policy_revision],
+                |r| {
+                    Ok(PolicyRecord {
+                        policy_revision: r.get(0)?,
+                        tool_policy: r.get(1)?,
+                        approval_policy: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+        let policy = policy.ok_or(PairingError::PolicyMismatch)?;
+        if !is_supported_tool_policy(&policy.tool_policy)
+            || !is_supported_approval_policy(&policy.approval_policy)
+        {
+            return Err(PairingError::PolicyUnsupported);
+        }
+
+        let task_id = generate_random_secret("task", 16)?;
+        let execution_id = generate_random_secret("exec", 16)?;
+        // Retained for schema parity with extension launches; never exposed to CLI output.
+        let return_token = generate_random_secret("ret", 24)?;
+
+        let payload_digest = compute_payload_digest(
+            origin_conversation_id,
+            &origin_conversation_url,
+            DIRECT_ROUTE_EVIDENCE_HASH,
+            DIRECT_ROUTE_EVIDENCE_HASH,
+            EXTERNAL_WORKER_TARGET_ID,
+            &policy.policy_revision,
+            "",
+        );
+
+        tx.execute(
+            r#"
+            INSERT INTO launch_requests (
+                pairing_id, launch_request_id, execution_id, return_token,
+                origin_conversation_id, origin_conversation_url,
+                transcript_evidence_hash, account_evidence_hash,
+                target_id, canonical_target_path,
+                policy_revision, effective_tool_policy, effective_approval_policy,
+                prompt_text, payload_digest, state, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'claimed', ?16, ?16
+            )
+            "#,
+            params![
+                pairing_id,
+                &task_id,
+                &execution_id,
+                &return_token,
+                origin_conversation_id,
+                &origin_conversation_url,
+                DIRECT_ROUTE_EVIDENCE_HASH,
+                DIRECT_ROUTE_EVIDENCE_HASH,
+                EXTERNAL_WORKER_TARGET_ID,
+                EXTERNAL_WORKER_TARGET_PATH,
+                &policy.policy_revision,
+                &policy.tool_policy,
+                &policy.approval_policy,
+                "",
+                &payload_digest,
+                now,
+            ],
+        )
+        .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| PairingError::StorageError(e.to_string()))?;
+
+        Ok(ExternalWorkerClaim {
+            task_id,
+            execution_id,
+            origin_conversation_id: origin_conversation_id.to_string(),
+            policy_revision: policy.policy_revision,
+            state: "claimed".to_string(),
+        })
+    }
+
     pub fn reserve_or_claim_launch(
         &self,
         params: &LaunchRequestParams,
@@ -1218,25 +1504,7 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
 
         // Revalidate the pairing while holding the same write transaction that
         // reserves/replays the launch. This closes authenticate -> revoke -> claim.
-        let pairing_status: Option<String> = tx
-            .query_row(
-                "SELECT status FROM pairings WHERE pairing_id = ?1",
-                params![&params.pairing_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| PairingError::StorageError(e.to_string()))?;
-        match pairing_status.as_deref() {
-            None => return Err(PairingError::NotFound),
-            Some("active") => {}
-            Some("revoked") | Some("retired") => return Err(PairingError::Retired),
-            Some("pending") => return Err(PairingError::NotActive),
-            Some(other) => {
-                return Err(PairingError::StorageError(format!(
-                    "invalid pairing status: {other}"
-                )))
-            }
-        }
+        Self::require_active_pairing_in_tx(&tx, &params.pairing_id)?;
 
         // 1. Check if this (pairing_id, launch_request_id) already exists in retained launch_requests
         let existing: Option<(String, String, String, String, String, String, String, String)> = tx
@@ -2071,27 +2339,17 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
             return Err(PairingError::DispatchFenceConflict);
         }
 
-        // Verify launch request exists and account evidence matches launch binding (fail-closed against account drift)
-        let launch_info: Option<(String, String)> = tx
+        // Receipt + execution + exact conversation ID are the delivery authority. The durable
+        // lifecycle URL is read internally; mutable browser evidence never enters this contract.
+        let launch_origin_url: Option<String> = tx
             .query_row(
-                "SELECT account_evidence_hash, origin_conversation_url FROM launch_requests WHERE execution_id = ?1",
+                "SELECT origin_conversation_url FROM launch_requests WHERE execution_id = ?1",
                 params![&rcpt_exec],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()
             .map_err(|e| PairingError::StorageError(e.to_string()))?;
-
-        let (expected_account_hash, expected_url) = match launch_info {
-            Some(info) => info,
-            None => return Err(PairingError::ExecutionMismatch),
-        };
-
-        if params.account_evidence_hash != expected_account_hash {
-            return Err(PairingError::AccountContextMismatch);
-        }
-        if params.origin_conversation_url != expected_url {
-            return Err(PairingError::DispatchFenceConflict);
-        }
+        let launch_origin_url = launch_origin_url.ok_or(PairingError::ExecutionMismatch)?;
 
         // 2. Check existing dispatch_fence for this receipt
         let existing_fence: Option<(
@@ -2240,9 +2498,9 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                     params![
                         &params.attempt_id,
                         params.expected_delivery_revision,
-                        &params.origin_conversation_url,
-                        &expected_account_hash,
-                        &params.transcript_evidence_hash,
+                        &launch_origin_url,
+                        DIRECT_ROUTE_EVIDENCE_HASH,
+                        DIRECT_ROUTE_EVIDENCE_HASH,
                         &params.tab_id,
                         &params.document_id,
                         now,
@@ -2355,9 +2613,9 @@ pub fn verify_git_target_identity(canonical_path_str: &str) -> Result<PathBuf, P
                 params.expected_delivery_revision,
                 &params.payload_digest,
                 &params.receipt_marker,
-                &params.origin_conversation_url,
-                &expected_account_hash,
-                &params.transcript_evidence_hash,
+                &launch_origin_url,
+                DIRECT_ROUTE_EVIDENCE_HASH,
+                DIRECT_ROUTE_EVIDENCE_HASH,
                 &params.tab_id,
                 &params.document_id,
                 now,

@@ -1,7 +1,11 @@
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -16,6 +20,33 @@ use crate::protocol::{
 
 pub const DEFAULT_HOST_NAME: &str = "com.hands.return_bridge";
 pub const DEFAULT_EXTENSION_ID: &str = "mkkajdpmlmliildflmnnmfndboldnnfa";
+const PUSH_ENDPOINT_FILE: &str = "push-endpoint.json";
+const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_PUSH_SIGNAL_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushEndpoint {
+    port: u16,
+    token: String,
+    pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushWakeSignal {
+    token: String,
+    receipt_id: String,
+    execution_id: String,
+    task_id: String,
+    state: String,
+}
+
+#[derive(Debug)]
+struct PushSubscription {
+    endpoint_path: PathBuf,
+    token: String,
+}
 
 #[derive(Debug)]
 pub enum HostError {
@@ -26,6 +57,7 @@ pub enum HostError {
     InvalidTarget(String),
     Registry(String),
     Notification(String),
+    Prepare(String),
 }
 
 impl From<std::io::Error> for HostError {
@@ -56,6 +88,7 @@ impl std::fmt::Display for HostError {
             HostError::InvalidTarget(t) => write!(f, "Invalid target path: {}", t),
             HostError::Registry(r) => write!(f, "Registry error: {}", r),
             HostError::Notification(n) => write!(f, "{}", n),
+            HostError::Prepare(p) => write!(f, "{}", p),
         }
     }
 }
@@ -786,6 +819,110 @@ pub fn register_manifest_registry(browser: &str, manifest_path: &Path) -> Result
     Ok(())
 }
 
+fn push_endpoint_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(PUSH_ENDPOINT_FILE)
+}
+
+fn write_native_message_locked(
+    stdout_lock: &Arc<Mutex<()>>,
+    value: &serde_json::Value,
+) -> Result<(), HostError> {
+    let _guard = stdout_lock.lock();
+    let mut stdout = std::io::stdout();
+    write_native_message(&mut stdout, value)?;
+    Ok(())
+}
+
+fn start_push_subscription(
+    state_dir: &Path,
+    stdout_lock: Arc<Mutex<()>>,
+) -> Result<PushSubscription, HostError> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let token = generate_random_id("push", 16)?;
+    let endpoint_path = push_endpoint_path(state_dir);
+    let endpoint = PushEndpoint {
+        port,
+        token: token.clone(),
+        pid: std::process::id(),
+    };
+    std::fs::write(&endpoint_path, serde_json::to_vec(&endpoint)?)?;
+
+    let expected_token = token.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming {
+                Ok(stream) => stream,
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(PUSH_CONNECT_TIMEOUT));
+            let mut body = String::new();
+            if std::io::Read::by_ref(&mut stream)
+                .take(MAX_PUSH_SIGNAL_BYTES)
+                .read_to_string(&mut body)
+                .is_err()
+            {
+                continue;
+            }
+            let signal: PushWakeSignal = match serde_json::from_str(&body) {
+                Ok(signal) => signal,
+                Err(_) => continue,
+            };
+            if signal.token != expected_token {
+                continue;
+            }
+            let event = json!({
+                "event": "receipt_ready",
+                "receiptId": signal.receipt_id,
+                "executionId": signal.execution_id,
+                "taskId": signal.task_id,
+                "state": signal.state,
+            });
+            if write_native_message_locked(&stdout_lock, &event).is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(PushSubscription {
+        endpoint_path,
+        token,
+    })
+}
+
+fn cleanup_push_subscription(subscription: &PushSubscription) {
+    let current = std::fs::read(&subscription.endpoint_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PushEndpoint>(&bytes).ok());
+    if current.as_ref().is_some_and(|endpoint| endpoint.token == subscription.token) {
+        let _ = std::fs::remove_file(&subscription.endpoint_path);
+    }
+}
+
+fn signal_push_receipt(state_dir: &Path, result: &ExplicitNotificationResult) -> bool {
+    let endpoint: PushEndpoint = match std::fs::read(push_endpoint_path(state_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(endpoint) => endpoint,
+        None => return false,
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], endpoint.port));
+    let mut stream = match TcpStream::connect_timeout(&addr, PUSH_CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_write_timeout(Some(PUSH_CONNECT_TIMEOUT));
+    let signal = PushWakeSignal {
+        token: endpoint.token,
+        receipt_id: result.receipt_id.clone(),
+        execution_id: result.execution_id.clone(),
+        task_id: result.task_id.clone(),
+        state: result.state.clone(),
+    };
+    serde_json::to_writer(&mut stream, &signal).is_ok() && stream.flush().is_ok()
+}
+
 
 pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Result<(), HostError> {
     let state_dir = resolve_state_dir(state_dir_opt)?;
@@ -834,13 +971,24 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
     }
 
     let mut stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout_lock = Arc::new(Mutex::new(()));
+    let mut push_subscription: Option<PushSubscription> = None;
 
     loop {
         match read_native_message(&mut stdin) {
             Ok(Some(msg)) => {
-                let resp = handle_native_message(&msg, &journal);
-                write_native_message(&mut stdout, &resp)?;
+                let resp = if msg.get("op").and_then(|v| v.as_str()) == Some("subscribe_events") {
+                    if push_subscription.is_none() {
+                        push_subscription = Some(start_push_subscription(
+                            &state_dir,
+                            Arc::clone(&stdout_lock),
+                        )?);
+                    }
+                    json!({ "status": "ok", "subscribed": true })
+                } else {
+                    handle_native_message(&msg, &journal)
+                };
+                write_native_message_locked(&stdout_lock, &resp)?;
             }
             Ok(None) => {
                 // EOF: Chrome closed the native host pipe
@@ -853,10 +1001,14 @@ pub fn run_native_host(state_dir_opt: Option<&Path>, origin: Option<&str>) -> Re
                     "code": "protocol_error",
                     "message": e.to_string()
                 });
-                let _ = write_native_message(&mut stdout, &err_resp);
+                let _ = write_native_message_locked(&stdout_lock, &err_resp);
                 break;
             }
         }
+    }
+
+    if let Some(subscription) = &push_subscription {
+        cleanup_push_subscription(subscription);
     }
 
     Ok(())
@@ -883,7 +1035,7 @@ pub struct TargetListOptions {
     pub state_dir: Option<PathBuf>,
 }
 
-fn resolve_pairing_id_for_target_cmd(
+fn resolve_pairing_id_for_cli_cmd(
     journal: &Journal,
     explicit_pairing_id: Option<&str>,
 ) -> Result<String, HostError> {
@@ -917,7 +1069,7 @@ pub fn execute_target_add(opts: &TargetAddOptions) -> Result<TargetRecord, HostE
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+    let pairing_id = resolve_pairing_id_for_cli_cmd(&journal, opts.pairing_id.as_deref())?;
 
     let raw_path = Path::new(&opts.target_path);
     let canonical_path = verify_and_canonicalize_git_target(raw_path)?;
@@ -957,7 +1109,7 @@ pub fn execute_target_remove(opts: &TargetRemoveOptions) -> Result<(), HostError
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+    let pairing_id = resolve_pairing_id_for_cli_cmd(&journal, opts.pairing_id.as_deref())?;
 
     let target_id = opts.target_id.trim();
     if target_id.is_empty() {
@@ -978,7 +1130,7 @@ pub fn execute_target_list(opts: &TargetListOptions) -> Result<Vec<TargetRecord>
     let db_path = state_dir.join("journal.sqlite");
     let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
 
-    let pairing_id = resolve_pairing_id_for_target_cmd(&journal, opts.pairing_id.as_deref())?;
+    let pairing_id = resolve_pairing_id_for_cli_cmd(&journal, opts.pairing_id.as_deref())?;
 
     let status = journal.get_pairing_status(&pairing_id).map_err(|e| HostError::Storage(e.to_string()))?;
     if status != crate::journal::PairingStatus::Active {
@@ -1027,10 +1179,155 @@ pub fn execute_notify(options: NotifyOptions) -> Result<ExplicitNotificationResu
         execution_id,
         status: options.status,
     };
-    journal.record_explicit_notification(&params).map_err(|e| match e {
+    let result = journal.record_explicit_notification(&params).map_err(|e| match e {
         crate::journal::PairingError::StorageError(s) => HostError::Storage(s),
         other => HostError::Notification(other.to_string()),
+    })?;
+
+    // Durability comes first. The push signal is only a wake-up hint for the connected
+    // extension; if it is absent/stale, the committed receipt is recovered on reconnect.
+    let _ = signal_push_receipt(&state_dir, &result);
+    Ok(result)
+}
+
+#[derive(Debug, Clone)]
+pub struct PrepareOptions {
+    pub pairing_id: Option<String>,
+    pub conversation_id: String,
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Worker identity + environment minted for one registered conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedWorker {
+    pub task_id: String,
+    pub execution_id: String,
+    pub origin_conversation_id: String,
+    pub policy_revision: String,
+    pub state: String,
+    pub state_dir: String,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Claims durable task/execution identity for a normal Orca OMP worker that the user launches
+/// outside the extension. Routing comes from the registered conversation; the worker only needs
+/// the returned environment to report terminal state with `notify`.
+pub fn execute_prepare(options: PrepareOptions) -> Result<PreparedWorker, HostError> {
+    let conversation_id = options.conversation_id.trim().to_string();
+    if conversation_id.is_empty() {
+        return Err(HostError::Prepare(
+            "prepare requires an explicit --conversation <conversation_id>".to_string(),
+        ));
+    }
+
+    let state_dir = resolve_state_dir(options.state_dir.as_deref())?;
+    std::fs::create_dir_all(&state_dir)?;
+    let db_path = state_dir.join("journal.sqlite");
+    if !db_path.exists() {
+        return Err(HostError::Storage(format!(
+            "Return Bridge journal database not found at {}",
+            db_path.display()
+        )));
+    }
+
+    let journal = Journal::open(&db_path).map_err(|e| HostError::Storage(e.to_string()))?;
+    let pairing_id = resolve_pairing_id_for_cli_cmd(&journal, options.pairing_id.as_deref())?;
+    let claim = journal
+        .prepare_external_worker_claim(&pairing_id, &conversation_id)
+        .map_err(|e| match e {
+            crate::journal::PairingError::StorageError(s) => HostError::Storage(s),
+            other => HostError::Prepare(other.to_string()),
+        })?;
+
+    let state_dir_str = state_dir.to_string_lossy().to_string();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("HANDS_TASK_ID".to_string(), claim.task_id.clone());
+    env.insert(
+        "HANDS_RETURN_BRIDGE_EXECUTION_ID".to_string(),
+        claim.execution_id.clone(),
+    );
+    env.insert(
+        "HANDS_RETURN_BRIDGE_STATE_DIR".to_string(),
+        state_dir_str.clone(),
+    );
+    // Audit-only: identity of the conversation this task will report back to.
+    env.insert(
+        "HANDS_RETURN_BRIDGE_CONVERSATION_ID".to_string(),
+        claim.origin_conversation_id.clone(),
+    );
+
+    Ok(PreparedWorker {
+        task_id: claim.task_id,
+        execution_id: claim.execution_id,
+        origin_conversation_id: claim.origin_conversation_id,
+        policy_revision: claim.policy_revision,
+        state: claim.state,
+        state_dir: state_dir_str,
+        env,
     })
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_signal_push_receipt_wakes_registered_local_endpoint() {
+        let dir = tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "push_test_token_123".to_string();
+        let endpoint = PushEndpoint {
+            port,
+            token: token.clone(),
+            pid: std::process::id(),
+        };
+        std::fs::write(
+            push_endpoint_path(dir.path()),
+            serde_json::to_vec(&endpoint).unwrap(),
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            tx.send(serde_json::from_str::<PushWakeSignal>(&body).unwrap())
+                .unwrap();
+        });
+
+        let result = ExplicitNotificationResult {
+            receipt_id: "rcpt_push_test".to_string(),
+            execution_id: "exec_push_test".to_string(),
+            task_id: "task_push_test".to_string(),
+            state: "completed".to_string(),
+            is_idempotent: false,
+        };
+        assert!(signal_push_receipt(dir.path(), &result));
+
+        let signal = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(signal.token, token);
+        assert_eq!(signal.receipt_id, result.receipt_id);
+        assert_eq!(signal.execution_id, result.execution_id);
+        assert_eq!(signal.task_id, result.task_id);
+        assert_eq!(signal.state, result.state);
+    }
+
+    #[test]
+    fn test_signal_push_receipt_without_subscriber_is_best_effort_false() {
+        let dir = tempdir().unwrap();
+        let result = ExplicitNotificationResult {
+            receipt_id: "rcpt_no_push".to_string(),
+            execution_id: "exec_no_push".to_string(),
+            task_id: "task_no_push".to_string(),
+            state: "completed".to_string(),
+            is_idempotent: false,
+        };
+        assert!(!signal_push_receipt(dir.path(), &result));
+    }
 }
 
 #[cfg(test)]

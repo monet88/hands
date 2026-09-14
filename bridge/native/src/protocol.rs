@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::host::resolve_state_dir;
 use crate::journal::{
-    Journal, LaunchRequestParams, PairingError, LOCAL_PAIRING_ID,
+    ConversationRegistrationParams, Journal, LaunchRequestParams, PairingError, LOCAL_PAIRING_ID,
     LOCAL_PAIRING_SECRET, LOCAL_PROFILE_ID,
 };
 use crate::launcher::{
@@ -228,6 +228,16 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
         "local_status" => &["op"],
         "setup" => &["op", "bootstrapToken", "profileId"],
         "connect" | "status" | "revoke" => &["op", "pairingId", "pairingSecret", "profileId"],
+        // Conversation registration is canonical conversation identity only. No target/path,
+        // workspace, account, transcript, or other mutable page-state field is accepted.
+        "register_conversation" => &[
+            "op",
+            "pairingId",
+            "pairingSecret",
+            "profileId",
+            "originConversationId",
+            "originConversationUrl",
+        ],
         "launch" => &[
             "op",
             "pairingId",
@@ -277,9 +287,6 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
             "payloadDigest",
             "receiptMarker",
             "originConversationId",
-            "originConversationUrl",
-            "accountEvidenceHash",
-            "transcriptEvidenceHash",
             "tabId",
             "documentId",
         ],
@@ -385,6 +392,66 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                     "targets": ctx.targets,
                     "policyRevision": ctx.policy_revision,
                     "policy": ctx.policy,
+                    "trustNotice": TRUST_NOTICE
+                }),
+                Err(e) => map_pairing_error(e),
+            }
+        }
+        "register_conversation" => {
+            let (pairing_id, pairing_secret, profile_id) = match extract_credentials(obj) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            };
+
+            let _ctx = match journal.authenticate_pairing(pairing_id, pairing_secret, profile_id) {
+                Ok(c) => c,
+                Err(e) => return map_pairing_error(e),
+            };
+
+            let origin_conv_id = match obj.get("originConversationId").and_then(|v| v.as_str()) {
+                Some(id) if !id.trim().is_empty() => id.trim(),
+                _ => return json!({ "status": "error", "code": "missing_origin_conversation_id", "message": "Missing or empty originConversationId" }),
+            };
+
+            let origin_conv_url = match obj.get("originConversationUrl").and_then(|v| v.as_str()) {
+                Some(u) if !u.trim().is_empty() => u.trim(),
+                _ => return json!({ "status": "error", "code": "missing_origin_conversation_url", "message": "Missing or empty originConversationUrl" }),
+            };
+
+            let canonical_id = match parse_canonical_conversation_id(origin_conv_url) {
+                Some(id) => id,
+                None => {
+                    return json!({
+                        "status": "error",
+                        "code": "invalid_conversation_boundary",
+                        "message": "Conversation URL must be a canonical existing ChatGPT conversation (e.g. https://chatgpt.com/c/<id>) without queries or fragments"
+                    });
+                }
+            };
+
+            if canonical_id != origin_conv_id {
+                return json!({
+                    "status": "error",
+                    "code": "invalid_conversation_boundary",
+                    "message": "Conversation ID does not match the canonical ID in the conversation URL"
+                });
+            }
+
+            let params = ConversationRegistrationParams {
+                pairing_id: pairing_id.to_string(),
+                origin_conversation_id: origin_conv_id.to_string(),
+                origin_conversation_url: origin_conv_url.to_string(),
+            };
+
+            match journal.register_conversation(&params) {
+                Ok(reg) => json!({
+                    "status": "ok",
+                    "pairingId": reg.pairing_id,
+                    "originConversationId": reg.origin_conversation_id,
+                    "originConversationUrl": reg.origin_conversation_url,
+                    "registeredAt": reg.registered_at,
+                    "updatedAt": reg.updated_at,
+                    "isNew": reg.is_new,
                     "trustNotice": TRUST_NOTICE
                 }),
                 Err(e) => map_pairing_error(e),
@@ -839,35 +906,6 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                 Some(c) if !c.trim().is_empty() => c.trim(),
                 _ => return json!({ "status": "error", "code": "missing_origin_conversation_id", "message": "Missing 'originConversationId'" }),
             };
-            let origin_conversation_url = match obj.get("originConversationUrl").and_then(|v| v.as_str()) {
-                Some(u) if !u.trim().is_empty() => u.trim(),
-                _ => return json!({ "status": "error", "code": "missing_origin_conversation_url", "message": "Missing 'originConversationUrl'" }),
-            };
-            let canonical_conv_id = match parse_canonical_conversation_id(origin_conversation_url) {
-                Some(id) => id,
-                None => {
-                    return json!({
-                        "status": "error",
-                        "code": "invalid_conversation_boundary",
-                        "message": "Origin conversation URL must be a canonical https://chatgpt.com/c/<id> or /g/<gizmo>/c/<id> path without query/fragment"
-                    });
-                }
-            };
-            if canonical_conv_id != origin_conversation_id {
-                return json!({
-                    "status": "error",
-                    "code": "invalid_conversation_boundary",
-                    "message": "Origin conversation ID does not match the canonical ID in the conversation URL"
-                });
-            }
-            let account_evidence_hash = match obj.get("accountEvidenceHash").and_then(|v| v.as_str()) {
-                Some(a) if !a.trim().is_empty() => a.trim(),
-                _ => return json!({ "status": "error", "code": "missing_account_evidence_hash", "message": "Missing 'accountEvidenceHash'" }),
-            };
-            let transcript_evidence_hash = match obj.get("transcriptEvidenceHash").and_then(|v| v.as_str()) {
-                Some(t) if !t.trim().is_empty() => t.trim(),
-                _ => return json!({ "status": "error", "code": "missing_transcript_evidence_hash", "message": "Missing 'transcriptEvidenceHash'" }),
-            };
             let document_id = match obj.get("documentId").and_then(|v| v.as_str()) {
                 Some(d) if !d.trim().is_empty() => d.trim(),
                 _ => return json!({ "status": "error", "code": "missing_document_id", "message": "Missing 'documentId'" }),
@@ -883,9 +921,6 @@ pub fn handle_native_message(msg: &Value, journal: &Journal) -> Value {
                 payload_digest: payload_digest.to_string(),
                 receipt_marker: receipt_marker.to_string(),
                 origin_conversation_id: origin_conversation_id.to_string(),
-                origin_conversation_url: origin_conversation_url.to_string(),
-                account_evidence_hash: account_evidence_hash.to_string(),
-                transcript_evidence_hash: transcript_evidence_hash.to_string(),
                 tab_id,
                 document_id: document_id.to_string(),
             };
@@ -1082,6 +1117,11 @@ fn map_pairing_error(err: PairingError) -> Value {
             "status": "error",
             "code": "execution_mismatch",
             "message": "Execution ID does not match the completion receipt"
+        }),
+        PairingError::ConversationNotRegistered => json!({
+            "status": "error",
+            "code": "conversation_not_registered",
+            "message": "Conversation is not registered for this pairing; register it from the paired extension first"
         }),
         PairingError::AccountContextMismatch => json!({
             "status": "error",

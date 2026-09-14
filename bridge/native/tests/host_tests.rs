@@ -909,3 +909,153 @@ fn test_notify_cli_done_and_failed_flow() {
         .unwrap();
     assert_eq!(out_unknown_opt.status.code(), Some(2));
 }
+
+#[test]
+fn test_prepare_cli_claims_registered_conversation_and_routes_notification_back() {
+    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let state_dir = tempdir().unwrap();
+    let db_path = state_dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    // A workspace target exists on the pairing, but the proactive worker path must never use it.
+    let target_dir = tempdir().unwrap();
+    init_git_repo(target_dir.path());
+    let canonical_target = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+    let setup_opts = SetupOptions {
+        browser: "chrome".to_string(),
+        profile_id: "prof_cli_prepare".to_string(),
+        target_path: canonical_target,
+        target_id: Some("target_cli_prepare".to_string()),
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+        extension_id: "test_ext_prepare".to_string(),
+        state_dir: Some(state_dir.path().to_path_buf()),
+        skip_registry: true,
+    };
+    let setup_res = execute_setup(&setup_opts).unwrap();
+    let activated = journal
+        .activate_bootstrap(&setup_res.bootstrap_token, "prof_cli_prepare")
+        .unwrap();
+
+    // 1. The paired extension registers the canonical conversation identity directly.
+    let register_resp = hands_return_bridge::protocol::handle_native_message(
+        &serde_json::json!({
+            "op": "register_conversation",
+            "pairingId": setup_res.pairing_id,
+            "pairingSecret": activated.pairing_secret,
+            "profileId": "prof_cli_prepare",
+            "originConversationId": "conv_cli_prepare",
+            "originConversationUrl": "https://chatgpt.com/c/conv_cli_prepare"
+        }),
+        &journal,
+    );
+    assert_eq!(register_resp["status"], "ok", "registration failed: {}", register_resp);
+    assert_eq!(register_resp["isNew"], true);
+    assert_eq!(register_resp["originConversationId"], "conv_cli_prepare");
+
+    // 2. CLI prepare claims task/execution for that conversation and prints the worker env.
+    let out = Command::new(bin)
+        .args([
+            "prepare",
+            "--conversation",
+            "conv_cli_prepare",
+            "--state-dir",
+            &state_dir.path().to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "prepare failed: {}", String::from_utf8_lossy(&out.stderr));
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("prepare --json must emit JSON");
+    assert_eq!(prepared["origin_conversation_id"], "conv_cli_prepare");
+    assert_eq!(prepared["state"], "claimed");
+    assert!(prepared.get("return_token").is_none(), "CLI output must not expose the return token");
+    let task_id = prepared["task_id"].as_str().unwrap().to_string();
+    let execution_id = prepared["execution_id"].as_str().unwrap().to_string();
+    assert!(task_id.starts_with("task_"), "task id: {}", task_id);
+    assert!(execution_id.starts_with("exec_"), "execution id: {}", execution_id);
+    assert_eq!(
+        prepared["env"]["HANDS_TASK_ID"].as_str().unwrap(),
+        task_id
+    );
+    assert_eq!(
+        prepared["env"]["HANDS_RETURN_BRIDGE_EXECUTION_ID"].as_str().unwrap(),
+        execution_id
+    );
+    assert_eq!(
+        prepared["env"]["HANDS_RETURN_BRIDGE_STATE_DIR"].as_str().unwrap(),
+        state_dir.path().to_string_lossy()
+    );
+    assert_eq!(
+        prepared["env"]["HANDS_RETURN_BRIDGE_CONVERSATION_ID"].as_str().unwrap(),
+        "conv_cli_prepare"
+    );
+
+    // 3. The normal Orca OMP worker reports terminal state using only the injected environment.
+    let out_done = Command::new(bin)
+        .args(["notify", "done"])
+        .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
+        .env("HANDS_TASK_ID", &task_id)
+        .env("HANDS_RETURN_BRIDGE_EXECUTION_ID", &execution_id)
+        .output()
+        .unwrap();
+    assert!(out_done.status.success(), "notify done failed: {}", String::from_utf8_lossy(&out_done.stderr));
+    let stdout_done = String::from_utf8_lossy(&out_done.stdout);
+    assert!(stdout_done.contains("status: completed"), "stdout: {}", stdout_done);
+    assert!(stdout_done.contains(&task_id) && stdout_done.contains(&execution_id));
+
+    // 4. Durable drain projects the exact conversation/task/execution.
+    let (summaries, receipts) = journal.drain_records(&setup_res.pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].task_id.as_deref(), Some(task_id.as_str()));
+    assert_eq!(receipts[0].execution_id, execution_id);
+    assert_eq!(receipts[0].origin_conversation_id, "conv_cli_prepare");
+    assert_eq!(
+        receipts[0].origin_conversation_url.as_deref(),
+        Some("https://chatgpt.com/c/conv_cli_prepare")
+    );
+    assert_eq!(receipts[0].state, "completed");
+    let summary = summaries
+        .iter()
+        .find(|s| s.execution_id == execution_id)
+        .expect("Prepared launch must be drained as a launch summary");
+    assert_eq!(summary.launch_request_id, task_id);
+    assert_eq!(summary.origin_conversation_id, "conv_cli_prepare");
+
+    // 5. An unregistered conversation cannot be prepared, and the refusal mutates nothing.
+    let out_unregistered = Command::new(bin)
+        .args([
+            "prepare",
+            "--conversation",
+            "conv_cli_absent",
+            "--state-dir",
+            &state_dir.path().to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out_unregistered.status.success());
+    let stderr_unregistered = String::from_utf8_lossy(&out_unregistered.stderr);
+    assert!(
+        stderr_unregistered.contains("conversation_not_registered"),
+        "stderr: {}",
+        stderr_unregistered
+    );
+
+    let out_missing_conversation = Command::new(bin).args(["prepare"]).output().unwrap();
+    assert_eq!(out_missing_conversation.status.code(), Some(2));
+
+    let out_unknown_opt = Command::new(bin)
+        .args(["prepare", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out_unknown_opt.status.code(), Some(2));
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let launch_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM launch_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(launch_rows, 1, "Only the successful prepare may allocate a launch row");
+}

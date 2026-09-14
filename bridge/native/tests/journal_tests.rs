@@ -3,9 +3,10 @@ use std::thread;
 use tempfile::tempdir;
 
 use hands_return_bridge::journal::{
-    compute_payload_digest, AttemptEvidence, LaunchRequestParams,
+    compute_payload_digest, AttemptEvidence, ConversationRegistrationParams, LaunchRequestParams,
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
-    ExplicitNotificationParams, ExplicitNotificationStatus,
+    ExplicitNotificationParams, ExplicitNotificationStatus, DIRECT_ROUTE_EVIDENCE_HASH,
+    EXTERNAL_WORKER_TARGET_ID,
 };
 
 fn init_git_repo(path: &std::path::Path) {
@@ -1417,9 +1418,6 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
         payload_digest: "digest_payload_stable".into(),
         receipt_marker: "marker_stable_1".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_a1".into(),
-        transcript_evidence_hash: "hash_t1".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1_alpha".into(),
     };
@@ -1456,9 +1454,6 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
         payload_digest: "digest_payload_2".into(),
         receipt_marker: "marker_stable_2".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_a2".into(),
-        transcript_evidence_hash: "hash_t2".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1_alpha".into(),
     };
@@ -1600,9 +1595,6 @@ fn test_concurrent_dual_native_hosts_competing_on_same_receipt_and_conversation(
         payload_digest: "digest_conc_stable".into(),
         receipt_marker: "marker_conc_1".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_a_conc".into(),
-        transcript_evidence_hash: "hash_t_conc".into(),
         tab_id: Some("tab_host_1".into()),
         document_id: "doc_host_1".into(),
     };
@@ -1827,9 +1819,6 @@ fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
         payload_digest: "digest_ns".into(),
         receipt_marker: "marker_ns".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_a1".into(),
-        transcript_evidence_hash: "hash_t1".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1".into(),
     };
@@ -1948,9 +1937,6 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
         payload_digest: "digest_st".into(),
         receipt_marker: "marker_st".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url,
-        account_evidence_hash: "hash_a1".into(),
-        transcript_evidence_hash: "hash_t1".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1".into(),
     };
@@ -2078,9 +2064,6 @@ fn test_acquire_dispatch_fence_rejects_revoked_pairing_in_transaction() {
         payload_digest: "digest_rr".into(),
         receipt_marker: "marker_rr".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url,
-        account_evidence_hash: "hash_a1".into(),
-        transcript_evidence_hash: "hash_t1".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1".into(),
     };
@@ -2143,9 +2126,6 @@ fn test_dispatch_fence_aged_uncertainty_cannot_acquire_new_grant() {
         payload_digest: "digest_lease".into(),
         receipt_marker: "marker_lease".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_a_lease".into(),
-        transcript_evidence_hash: "hash_t_lease".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_1".into(),
     };
@@ -2189,7 +2169,7 @@ fn test_dispatch_fence_aged_uncertainty_cannot_acquire_new_grant() {
 }
 
 #[test]
-fn test_acquire_dispatch_fence_rejects_launch_binding_drift() {
+fn test_acquire_dispatch_fence_routes_by_conversation_id_only() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("journal.sqlite");
     let journal = Journal::open(&db_path).unwrap();
@@ -2234,7 +2214,8 @@ fn test_acquire_dispatch_fence_rejects_launch_binding_drift() {
         ).unwrap();
     }
 
-    // 1. Attempt dispatch fence with drifted account hash -> MUST fail closed with AccountContextMismatch
+    // Account evidence and URL are deliberately different from launch-time values. They are not
+    // routing authority; exact conversation ID is.
     let drifted_params = hands_return_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
@@ -2244,53 +2225,35 @@ fn test_acquire_dispatch_fence_rejects_launch_binding_drift() {
         payload_digest: "digest_drift".into(),
         receipt_marker: "marker_drift".into(),
         origin_conversation_id: conv_id.into(),
-        origin_conversation_url: conv_url.clone(),
-        account_evidence_hash: "hash_account_DRIFTED_bad".into(),
-        transcript_evidence_hash: "hash_t_drift".into(),
         tab_id: Some("tab_1".into()),
         document_id: "doc_drift_1".into(),
     };
 
-    let err = journal.acquire_dispatch_fence(&drifted_params);
-    assert_eq!(
-        err.unwrap_err(),
-        PairingError::AccountContextMismatch,
-        "Drifted account evidence must fail closed with AccountContextMismatch"
-    );
-
-    // Verify ZERO side effects in dispatch_fences and conversation_delivery_slots
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let fence_count: i64 = conn.query_row("SELECT COUNT(*) FROM dispatch_fences", [], |r| r.get(0)).unwrap();
-        assert_eq!(fence_count, 0, "No fence row must be created on account drift failure");
-        let slot_count: i64 = conn.query_row("SELECT COUNT(*) FROM conversation_delivery_slots", [], |r| r.get(0)).unwrap();
-        assert_eq!(slot_count, 0, "No slot row must be created on account drift failure");
-    }
-
-    // 2. Matching account evidence but a different canonical route for the same conversation ID must fail closed.
-    let mut valid_params = drifted_params;
-    valid_params.account_evidence_hash = original_acct_hash.into();
-    valid_params.origin_conversation_url = format!("https://chatgpt.com/g/project/c/{}", conv_id);
-    let err = journal.acquire_dispatch_fence(&valid_params);
+    // 1. Wrong conversation ID still fails closed with zero fence/slot side effects.
+    let mut wrong_conversation = drifted_params.clone();
+    wrong_conversation.origin_conversation_id = "conv_wrong_destination".into();
+    let err = journal.acquire_dispatch_fence(&wrong_conversation);
     assert_eq!(
         err.unwrap_err(),
         PairingError::DispatchFenceConflict,
-        "Origin conversation URL must remain bound to the exact launch route"
+        "A different conversation ID must never acquire the receipt fence"
     );
 
+    // Verify ZERO side effects for the wrong conversation ID.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let fence_count: i64 = conn.query_row("SELECT COUNT(*) FROM dispatch_fences", [], |r| r.get(0)).unwrap();
-        assert_eq!(fence_count, 0, "No fence row must be created on origin URL drift failure");
+        assert_eq!(fence_count, 0, "No fence row must be created for the wrong conversation ID");
         let slot_count: i64 = conn.query_row("SELECT COUNT(*) FROM conversation_delivery_slots", [], |r| r.get(0)).unwrap();
-        assert_eq!(slot_count, 0, "No slot row must be created on origin URL drift failure");
+        assert_eq!(slot_count, 0, "No slot row must be created for the wrong conversation ID");
     }
 
-    // 3. Exact launch binding -> MUST succeed.
-    valid_params.origin_conversation_url = conv_url;
+    // 2. Same conversation ID succeeds even when account evidence and canonical route changed.
+    let valid_params = drifted_params;
     let grant = journal.acquire_dispatch_fence(&valid_params).unwrap();
-    assert!(grant.granted, "Valid account evidence matching launch binding must be granted");
+    assert!(grant.granted, "Exact conversation ID must be sufficient routing authority");
     assert_eq!(grant.state, "dispatching/uncertain");
+    assert_eq!(grant.origin_conversation_id, conv_id);
 }
 
 fn setup_test_journal_with_launch() -> (tempfile::TempDir, tempfile::TempDir, Journal, String, String, String) {
@@ -2610,4 +2573,267 @@ fn test_completion_receipt_projection_includes_task_id() {
         .expect("Summary must exist");
     let summary_rcpt = summary.completion_receipt.as_ref().expect("Receipt in summary");
     assert_eq!(summary_rcpt.task_id.as_deref(), Some(task_id.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Direct conversation registration -> prepare/claim -> notify -> durable drain
+// ---------------------------------------------------------------------------
+
+/// Pairing with NO registered workspace target: proactive worker identity must come from the
+/// registered conversation alone, never from a target/workspace.
+fn setup_pairing_without_targets() -> (tempfile::TempDir, Journal, String, String) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pairing_conv_registry";
+    let bootstrap_token = "tok_conv_registry";
+    let profile_id = "prof_conv_registry";
+
+    let policy = PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &[], &policy)
+        .unwrap();
+    let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+
+    (temp_dir, journal, pairing_id.to_string(), activated.pairing_secret)
+}
+
+fn register_conversation(
+    journal: &Journal,
+    pairing_id: &str,
+    conv_id: &str,
+) {
+    journal
+        .register_conversation(&ConversationRegistrationParams {
+            pairing_id: pairing_id.to_string(),
+            origin_conversation_id: conv_id.to_string(),
+            origin_conversation_url: format!("https://chatgpt.com/c/{}", conv_id),
+        })
+        .expect("Conversation registration must succeed");
+}
+
+#[test]
+fn test_registered_conversation_prepare_notify_drain_projects_exact_identity() {
+    let (dir, journal, pairing_id, _secret) = setup_pairing_without_targets();
+    register_conversation(&journal, &pairing_id, "conv_alpha");
+
+    let claim = journal
+        .prepare_external_worker_claim(&pairing_id, "conv_alpha")
+        .expect("Prepare must claim identity for a registered conversation");
+    assert!(claim.task_id.starts_with("task_"));
+    assert!(claim.execution_id.starts_with("exec_"));
+    assert_eq!(claim.origin_conversation_id, "conv_alpha");
+    assert_eq!(claim.policy_revision, "v1");
+    assert_eq!(claim.state, "claimed");
+
+    // The target columns are internal placeholders only; routing is the conversation.
+    let summary = journal
+        .get_launch_request_by_id(&pairing_id, &claim.task_id)
+        .unwrap()
+        .expect("Claimed launch request must be durable");
+    assert_eq!(summary.target_id, EXTERNAL_WORKER_TARGET_ID);
+    assert_eq!(summary.origin_conversation_id, "conv_alpha");
+    assert_eq!(summary.origin_conversation_url, "https://chatgpt.com/c/conv_alpha");
+    assert_eq!(summary.state, "claimed");
+
+    // Worker reports terminal state with only the injected task identity (env binding).
+    let notified = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(claim.task_id.clone()),
+            execution_id: None,
+            status: ExplicitNotificationStatus::Done,
+        })
+        .expect("Prepared worker notify done must succeed");
+    assert_eq!(notified.execution_id, claim.execution_id);
+    assert_eq!(notified.task_id, claim.task_id);
+    assert_eq!(notified.state, "completed");
+
+    let (summaries, receipts) = journal.drain_records(&pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.task_id.as_deref(), Some(claim.task_id.as_str()));
+    assert_eq!(receipt.execution_id, claim.execution_id);
+    assert_eq!(receipt.origin_conversation_id, "conv_alpha");
+    assert_eq!(receipt.origin_conversation_url.as_deref(), Some("https://chatgpt.com/c/conv_alpha"));
+    assert_eq!(receipt.state, "completed");
+
+    let drained = summaries
+        .iter()
+        .find(|s| s.execution_id == claim.execution_id)
+        .expect("Prepared launch must appear in drain summaries");
+    assert_eq!(drained.launch_request_id, claim.task_id);
+    assert_eq!(drained.origin_conversation_id, "conv_alpha");
+    assert!(drained.completion_receipt.is_some(), "Drain must project the terminal receipt");
+
+    let db_path = dir.path().join("journal.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (stored_account_hash, stored_transcript_hash): (String, String) = conn
+        .query_row(
+            "SELECT account_evidence_hash, transcript_evidence_hash FROM launch_requests WHERE launch_request_id = ?1",
+            rusqlite::params![claim.task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_account_hash, DIRECT_ROUTE_EVIDENCE_HASH);
+    assert_eq!(stored_transcript_hash, DIRECT_ROUTE_EVIDENCE_HASH);
+}
+
+#[test]
+fn test_multiple_registered_conversations_prepare_and_route_without_ambiguity() {
+    let (_dir, journal, pairing_id, _secret) = setup_pairing_without_targets();
+    register_conversation(&journal, &pairing_id, "conv_one");
+    register_conversation(&journal, &pairing_id, "conv_two");
+
+    let claim_one = journal.prepare_external_worker_claim(&pairing_id, "conv_one").unwrap();
+    let claim_two = journal.prepare_external_worker_claim(&pairing_id, "conv_two").unwrap();
+    assert_ne!(claim_one.task_id, claim_two.task_id);
+    assert_ne!(claim_one.execution_id, claim_two.execution_id);
+
+    // Cross-pairing of task/execution between the two claims must fail closed, not route.
+    let cross = journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(claim_one.task_id.clone()),
+            execution_id: Some(claim_two.execution_id.clone()),
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap_err();
+    assert_eq!(cross, PairingError::ExecutionMismatch);
+
+    // Terminal state for conversation one only.
+    journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: Some(claim_one.task_id.clone()),
+            execution_id: None,
+            status: ExplicitNotificationStatus::Done,
+        })
+        .unwrap();
+
+    let (summaries, receipts) = journal.drain_records(&pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 1, "Only conversation one may have a receipt");
+    assert_eq!(receipts[0].origin_conversation_id, "conv_one");
+    assert_eq!(receipts[0].task_id.as_deref(), Some(claim_one.task_id.as_str()));
+
+    let untouched = summaries
+        .iter()
+        .find(|s| s.execution_id == claim_two.execution_id)
+        .expect("Second prepared claim must remain visible");
+    assert_eq!(untouched.origin_conversation_id, "conv_two");
+    assert_eq!(untouched.state, "claimed");
+    assert!(untouched.completion_receipt.is_none());
+
+    // Terminal failure for conversation two via execution identity only.
+    journal
+        .record_explicit_notification(&ExplicitNotificationParams {
+            task_id: None,
+            execution_id: Some(claim_two.execution_id.clone()),
+            status: ExplicitNotificationStatus::Failed {
+                message: "worker aborted".into(),
+            },
+        })
+        .unwrap();
+
+    let (_summaries, receipts) = journal.drain_records(&pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 2);
+    let receipt_one = receipts
+        .iter()
+        .find(|r| r.origin_conversation_id == "conv_one")
+        .expect("Conversation one receipt");
+    let receipt_two = receipts
+        .iter()
+        .find(|r| r.origin_conversation_id == "conv_two")
+        .expect("Conversation two receipt");
+    assert_eq!(receipt_one.task_id.as_deref(), Some(claim_one.task_id.as_str()));
+    assert_eq!(receipt_one.origin_conversation_url.as_deref(), Some("https://chatgpt.com/c/conv_one"));
+    assert_eq!(receipt_one.state, "completed");
+    assert_eq!(receipt_two.task_id.as_deref(), Some(claim_two.task_id.as_str()));
+    assert_eq!(receipt_two.origin_conversation_url.as_deref(), Some("https://chatgpt.com/c/conv_two"));
+    assert_eq!(receipt_two.state, "failed");
+    assert_eq!(receipt_two.assistant_text, "worker aborted");
+}
+
+#[test]
+fn test_prepare_requires_registered_conversation_and_mutates_nothing_on_refusal() {
+    let (dir, journal, pairing_id, _secret) = setup_pairing_without_targets();
+    register_conversation(&journal, &pairing_id, "conv_registered");
+
+    let err = journal
+        .prepare_external_worker_claim(&pairing_id, "conv_unregistered")
+        .unwrap_err();
+    assert_eq!(err, PairingError::ConversationNotRegistered);
+
+    let unknown = journal
+        .prepare_external_worker_claim("pairing_unknown", "conv_registered")
+        .unwrap_err();
+    assert_eq!(unknown, PairingError::NotFound);
+
+    let db_path = dir.path().join("journal.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let launch_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM launch_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(launch_rows, 0, "Refused prepares must not allocate launch rows");
+}
+
+#[test]
+fn test_register_conversation_is_idempotent_by_conversation_id() {
+    let (dir, journal, pairing_id, _secret) = setup_pairing_without_targets();
+
+    let first = journal
+        .register_conversation(&ConversationRegistrationParams {
+            pairing_id: pairing_id.clone(),
+            origin_conversation_id: "conv_drift".to_string(),
+            origin_conversation_url: "https://chatgpt.com/c/conv_drift".to_string(),
+        })
+        .unwrap();
+    assert!(first.is_new);
+
+    let refreshed = journal
+        .register_conversation(&ConversationRegistrationParams {
+            pairing_id: pairing_id.clone(),
+            origin_conversation_id: "conv_drift".to_string(),
+            origin_conversation_url: "https://chatgpt.com/g/project/c/conv_drift".to_string(),
+        })
+        .unwrap();
+    assert!(!refreshed.is_new, "Re-registration must refresh the same conversation identity");
+    assert_eq!(refreshed.registered_at, first.registered_at);
+    assert_eq!(refreshed.origin_conversation_url, "https://chatgpt.com/g/project/c/conv_drift");
+
+    let claim = journal.prepare_external_worker_claim(&pairing_id, "conv_drift").unwrap();
+    let db_path = dir.path().join("journal.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stored_transcript_hash: String = conn
+        .query_row(
+            "SELECT transcript_evidence_hash FROM launch_requests WHERE launch_request_id = ?1",
+            rusqlite::params![claim.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_transcript_hash, DIRECT_ROUTE_EVIDENCE_HASH);
+}
+
+#[test]
+fn test_register_and_prepare_fail_closed_once_pairing_is_revoked() {
+    let (_dir, journal, pairing_id, secret) = setup_pairing_without_targets();
+    register_conversation(&journal, &pairing_id, "conv_revoked");
+    journal.revoke_pairing(&pairing_id, &secret, "prof_conv_registry").unwrap();
+
+    let err = journal
+        .prepare_external_worker_claim(&pairing_id, "conv_revoked")
+        .unwrap_err();
+    assert_eq!(err, PairingError::Retired);
+
+    let register_err = journal
+        .register_conversation(&ConversationRegistrationParams {
+            pairing_id: pairing_id.clone(),
+            origin_conversation_id: "conv_other".to_string(),
+            origin_conversation_url: "https://chatgpt.com/c/conv_other".to_string(),
+        })
+        .unwrap_err();
+    assert_eq!(register_err, PairingError::Retired);
 }
