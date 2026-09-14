@@ -1216,3 +1216,32 @@ fn test_worker_shorthand_done_and_failed_need_no_identity() {
     assert_eq!(worker_receipt.origin_conversation_id, "conv_other");
     assert_eq!(worker_receipt.state, "completed");
 }
+
+#[test]
+fn test_help_is_discoverable_on_stdout() {
+    let bin = env!("CARGO_BIN_EXE_hands-bridge");
+
+    // A caller can pipe the usage: --help writes to stdout and exits 0.
+    let top = Command::new(bin).arg("--help").output().unwrap();
+    assert!(top.status.success());
+    let stdout = String::from_utf8_lossy(&top.stdout);
+    assert!(stdout.contains("Worker Commands"), "stdout: {}", stdout);
+    assert!(stdout.contains("hands-bridge done --conversation"), "stdout: {}", stdout);
+    assert!(String::from_utf8_lossy(&top.stderr).is_empty());
+
+    // Per-command help works too instead of being rejected as an unknown option.
+    for args in [["done", "--help"], ["failed", "--help"], ["notify", "--help"]] {
+        let out = Command::new(bin).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?} help failed");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Worker Commands"),
+            "{args:?} help must print usage on stdout"
+        );
+    }
+
+    // Errors keep the error stream: usage goes to stderr, stdout stays empty.
+    let bad = Command::new(bin).arg("bogus-command").output().unwrap();
+    assert!(!bad.status.success());
+    assert!(bad.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("Unknown command"));
+}

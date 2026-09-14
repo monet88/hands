@@ -19,9 +19,7 @@ fn env_var(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn print_help() {
-    eprintln!(
-        r#"Hands Return Bridge Companion CLI
+const HELP: &str = r#"Hands Return Bridge Companion CLI
 Usage:
   hands-bridge native-host [--state-dir <dir>]
   hands-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
@@ -64,8 +62,21 @@ Worker Commands:
                                 (no target/workspace is involved; routing follows the conversation)
   notify done                   Record explicit terminal success for a prepared/launched task
   notify failed                 Record explicit terminal failure for a prepared/launched task
-"#
-    );
+
+  Examples:
+    hands-bridge done --conversation 6aa7f156-6ef4-83ec-9be6-ebd9260b79ac
+    hands-bridge failed --conversation <id> --message "cargo test failed"
+    hands-bridge prepare --conversation <id> --json
+"#;
+
+/// Help is a request: it prints to stdout so a caller can pipe it.
+fn print_help() {
+    println!("{HELP}");
+}
+
+/// Usage text that accompanies an error keeps the error stream.
+fn print_help_err() {
+    eprintln!("{HELP}");
 }
 
 fn main() {
@@ -222,7 +233,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("Unknown option: {}", other);
-                        print_help();
+                        print_help_err();
                         std::process::exit(1);
                     }
                 }
@@ -378,7 +389,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("Unknown option for revoke: {}", other);
-                        print_help();
+                        print_help_err();
                         std::process::exit(1);
                     }
                 }
@@ -426,7 +437,7 @@ fn main() {
         "target" => {
             if args.len() < 3 {
                 eprintln!("Error: target requires a subcommand: add, remove, or list");
-                print_help();
+                print_help_err();
                 std::process::exit(1);
             }
             match args[2].as_str() {
@@ -460,7 +471,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target add: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -517,7 +528,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target remove: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -565,7 +576,7 @@ fn main() {
                             }
                             other => {
                                 eprintln!("Unknown option for target list: {}", other);
-                                print_help();
+                                print_help_err();
                                 std::process::exit(1);
                             }
                         }
@@ -596,7 +607,7 @@ fn main() {
                 }
                 other => {
                     eprintln!("Unknown target subcommand: {}", other);
-                    print_help();
+                    print_help_err();
                     std::process::exit(1);
                 }
             }
@@ -621,6 +632,10 @@ fn main() {
                     "--state-dir" if i + 1 < args.len() => {
                         state_dir = Some(PathBuf::from(&args[i + 1]));
                         i += 1;
+                    }
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
                     }
                     other => {
                         eprintln!("error: unknown option '{}'", other);
@@ -742,6 +757,10 @@ fn main() {
                 eprintln!("Usage: hands-bridge notify done [--task <task_id>] | failed --message <text> [--task <task_id>]");
                 std::process::exit(2);
             }
+            if matches!(args[2].as_str(), "--help" | "-h") {
+                print_help();
+                return;
+            }
             let sub = args[2].as_str();
             let mut task_id = None;
             let mut execution_id = None;
@@ -766,6 +785,10 @@ fn main() {
                     "--state-dir" if i + 1 < args.len() => {
                         state_dir = Some(PathBuf::from(&args[i + 1]));
                         i += 1;
+                    }
+                    "--help" | "-h" => {
+                        print_help();
+                        return;
                     }
                     other => {
                         eprintln!("error: unknown option '{}'", other);
@@ -907,7 +930,7 @@ fn main() {
         }
         other => {
             eprintln!("Unknown command: {}", other);
-            print_help();
+            print_help_err();
             std::process::exit(1);
         }
     }
