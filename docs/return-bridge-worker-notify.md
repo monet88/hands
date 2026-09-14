@@ -2,7 +2,15 @@
 
 > **Scope:** how a local worker (an Orca OMP session, a CLI run, or any process holding the prepared environment) tells a bound ChatGPT conversation that its task finished, what the bridge does with that notification, and how to verify or unblock it. Use this when the task is to deliver a worker-completion message into ChatGPT. Delivery is request-native: the bridge talks to the ChatGPT backend from the open tab, never through the composer, send button, or DOM.
 
-The flow lives entirely in the companion `hands-bridge` binary (crate `bridge/native`), installed under `%LOCALAPPDATA%\Hands\return-bridge\` and registered as the browser's native messaging host. The `hands` runtime neither embeds nor depends on it, so building or changing this flow never rebuilds `hands.exe`.
+The flow lives entirely in the companion `hands-bridge` binary (crate `bridge/native`), installed as `%LOCALAPPDATA%\Hands\return-bridge\hands-bridge.exe` and registered as the browser's native messaging host. The `hands` runtime neither embeds nor depends on it, so building or changing this flow never rebuilds `hands.exe`.
+
+Build, install, and register it from the repository (Windows):
+
+```powershell
+powershell -File bridge\install-return-bridge.ps1 -ExtensionId <extension-id>
+```
+
+That script builds `bridge\native\target\debug\hands-bridge.exe`, copies it into `%LOCALAPPDATA%\Hands\return-bridge\`, adds the directory to the user `PATH`, runs `local-init` to write the native messaging manifest, and registers the workspace target. Names outside the worker contract keep their historical spelling on purpose, so no live pairing is disturbed by a binary rename: the messaging host stays `com.hands.return_bridge`, the environment variables stay `HANDS_RETURN_BRIDGE_*`, and the state directory (with its journal and delivery slots) stays `%LOCALAPPDATA%\Hands\return-bridge\`. Reload the extension once after replacing the binary.
 
 ## Prerequisites
 
