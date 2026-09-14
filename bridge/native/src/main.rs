@@ -1,31 +1,41 @@
 use std::env;
 use std::path::PathBuf;
 
-use hands_return_bridge::host::{
+use hands_bridge::host::{
     LocalInitOptions, NotifyOptions, PrepareOptions, SetupOptions, TargetAddOptions,
     TargetListOptions, TargetRemoveOptions, execute_local_init, execute_notify, execute_prepare,
     execute_setup, execute_target_add, execute_target_list, execute_target_remove,
     resolve_state_dir, run_native_host,
 };
-use hands_return_bridge::journal::{ExplicitNotificationStatus, Journal};
-use hands_return_bridge::protocol::TRUST_NOTICE;
+use hands_bridge::journal::{ExplicitNotificationStatus, Journal};
+use hands_bridge::protocol::TRUST_NOTICE;
 use serde_json::json;
+
+/// Non-empty, trimmed environment variable used by the one-command worker flow.
+fn env_var(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 fn print_help() {
     eprintln!(
         r#"Hands Return Bridge Companion CLI
 Usage:
-  hands-return-bridge native-host [--state-dir <dir>]
-  hands-return-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
-  hands-return-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
-  hands-return-bridge status [--state-dir <dir>]
-  hands-return-bridge revoke --pairing-id <id> [--state-dir <dir>]
-  hands-return-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
-  hands-return-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
-  hands-return-bridge target list [--pairing-id <id>] [--state-dir <dir>]
-  hands-return-bridge notify done [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
-  hands-return-bridge notify failed --message <text> [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
-  hands-return-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]
+  hands-bridge native-host [--state-dir <dir>]
+  hands-bridge local-init --extension-id <id> [--browser <chrome|edge>] [--state-dir <dir>] [--skip-registry]
+  hands-bridge setup --target <path> --profile <profile_id> --extension-id <id> --policy-revision <rev> --tool-policy <policy> --approval-policy <policy> [options]
+  hands-bridge status [--state-dir <dir>]
+  hands-bridge revoke --pairing-id <id> [--state-dir <dir>]
+  hands-bridge target add --target <path> [--target-id <id>] [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge target remove --target-id <id> [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge target list [--pairing-id <id>] [--state-dir <dir>]
+  hands-bridge done [--conversation <conversation_id>] [--state-dir <dir>]
+  hands-bridge failed --message <text> [--conversation <conversation_id>] [--state-dir <dir>]
+  hands-bridge notify done [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-bridge notify failed --message <text> [--task <task_id>] [--execution-id <execution_id>] [--state-dir <dir>]
+  hands-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]
 
 Setup Options:
   --browser <chrome|edge>       Target browser (default: chrome)
@@ -45,6 +55,10 @@ Target Commands:
   target list                   List registered targets on active pairing
 
 Worker Commands:
+  done                          One-command completion: reuse the execution this worker was
+                                launched with, or claim a new one for --conversation, then
+                                record the receipt. No identity arguments are needed.
+  failed                        Same one-command flow for a failed run; --message is required.
   prepare                       Claim task/execution identity for a registered ChatGPT conversation
                                 and print the environment for a normal Orca OMP worker
                                 (no target/workspace is involved; routing follows the conversation)
@@ -58,7 +72,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     // Chrome/Edge Native Messaging calls the binary with the extension origin as the first arg:
-    // e.g., "hands-return-bridge.exe chrome-extension://<id>/"
+    // e.g., "hands-bridge.exe chrome-extension://<id>/"
     let caller_origin = if args.len() >= 2 && args[1].starts_with("chrome-extension://") {
         Some(args[1].as_str())
     } else {
@@ -587,9 +601,145 @@ fn main() {
                 }
             }
         }
+        "done" | "failed" => {
+            let sub = args[1].as_str();
+            let mut conversation_id: Option<String> = None;
+            let mut message = None;
+            let mut state_dir = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--conversation" if i + 1 < args.len() => {
+                        conversation_id = Some(args[i + 1].trim().to_string());
+                        i += 1;
+                    }
+                    "--message" if i + 1 < args.len() => {
+                        message = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                    "--state-dir" if i + 1 < args.len() => {
+                        state_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("error: unknown option '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+
+            let status = match sub {
+                "done" => {
+                    if message.is_some() {
+                        eprintln!("error: --message is not supported for 'done'");
+                        std::process::exit(2);
+                    }
+                    ExplicitNotificationStatus::Done
+                }
+                _ => match message {
+                    Some(m) if !m.trim().is_empty() => {
+                        ExplicitNotificationStatus::Failed { message: m }
+                    }
+                    _ => {
+                        eprintln!("error: --message is required for 'failed'");
+                        std::process::exit(2);
+                    }
+                },
+            };
+
+            // A worker launched by the extension already owns an execution; anything else
+            // mints one here so the caller never has to pass identity around.
+            let (task_id, execution_id, notify_state_dir, conversation_id) =
+                match (env_var("HANDS_TASK_ID"), env_var("HANDS_RETURN_BRIDGE_EXECUTION_ID")) {
+                    (Some(task_id), Some(execution_id)) => {
+                        let worker_conversation = env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID");
+                        if let (Some(requested), Some(bound)) =
+                            (conversation_id.as_deref(), worker_conversation.as_deref())
+                        {
+                            if requested != bound {
+                                eprintln!(
+                                    "error: --conversation {} does not match the conversation bound to this worker execution ({})",
+                                    requested, bound
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        (
+                            task_id,
+                            execution_id,
+                            state_dir
+                                .clone()
+                                .or_else(|| env_var("HANDS_RETURN_BRIDGE_STATE_DIR").map(PathBuf::from)),
+                            conversation_id.or(worker_conversation).unwrap_or_default(),
+                        )
+                    }
+                    _ => {
+                        let conversation_id = match conversation_id
+                            .or_else(|| env_var("HANDS_RETURN_BRIDGE_CONVERSATION_ID"))
+                        {
+                            Some(value) if !value.is_empty() => value,
+                            _ => {
+                                let message_flag = if sub == "failed" { " --message <text>" } else { "" };
+                                eprintln!(
+                                    "usage: hands-bridge {} [--conversation <conversation_id>] [--state-dir <dir>]{}",
+                                    sub, message_flag
+                                );
+                                std::process::exit(2);
+                            }
+                        };
+                        let options = PrepareOptions {
+                            pairing_id: None,
+                            conversation_id,
+                            state_dir: state_dir.clone(),
+                        };
+                        match execute_prepare(options) {
+                            Ok(worker) => (
+                                worker.task_id,
+                                worker.execution_id,
+                                Some(PathBuf::from(worker.state_dir)),
+                                worker.origin_conversation_id,
+                            ),
+                            Err(e) => {
+                                eprintln!("error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+
+            let options = NotifyOptions {
+                task_id: Some(task_id),
+                execution_id: Some(execution_id),
+                status,
+                state_dir: notify_state_dir,
+            };
+
+            match execute_notify(options) {
+                Ok(res) => {
+                    let verb = if res.is_idempotent { "already recorded" } else { "recorded" };
+                    if conversation_id.is_empty() {
+                        println!(
+                            "Notification {} (receipt: {}, status: {}).",
+                            verb, res.receipt_id, res.state
+                        );
+                    } else {
+                        println!(
+                            "Notification {} (receipt: {}, conversation: {}, status: {}).",
+                            verb, res.receipt_id, conversation_id, res.state
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         "notify" => {
             if args.len() < 3 {
-                eprintln!("Usage: hands-return-bridge notify done [--task <task_id>] | failed --message <text> [--task <task_id>]");
+                eprintln!("Usage: hands-bridge notify done [--task <task_id>] | failed --message <text> [--task <task_id>]");
                 std::process::exit(2);
             }
             let sub = args[2].as_str();
@@ -709,7 +859,7 @@ fn main() {
             let conversation_id = match conversation_id {
                 Some(c) if !c.is_empty() => c,
                 _ => {
-                    eprintln!("usage: hands-return-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]");
+                    eprintln!("usage: hands-bridge prepare --conversation <conversation_id> [--pairing-id <id>] [--state-dir <dir>] [--json]");
                     std::process::exit(2);
                 }
             };

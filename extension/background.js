@@ -358,7 +358,7 @@ function sendNative(msg) {
 }
 
 function buildContinuationPayload(rcpt) {
-  const receiptMarker = `[hands-return-bridge:receipt=${rcpt.receiptId}]`;
+  const receiptMarker = `[hands-bridge:receipt=${rcpt.receiptId}]`;
   const taskId = rcpt.taskId || rcpt.task_id || rcpt.executionId;
   const executionId = rcpt.executionId || rcpt.execution_id;
   const terminalStatus = rcpt.state || "completed";
@@ -1980,7 +1980,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               status: "error",
               code: "missing_target_id",
               message: availableTargets.length === 0
-                ? "No workspace targets registered. Add a target via hands-return-bridge target add."
+                ? "No workspace targets registered. Add a target via hands-bridge target add."
                 : "Target ID is required. Select a workspace target for this conversation."
             });
             return;

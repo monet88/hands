@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
 
-use hands_return_bridge::journal::{
+use hands_bridge::journal::{
     compute_payload_digest, AttemptEvidence, ConversationRegistrationParams, LaunchRequestParams,
     Journal, PairingError, PairingStatus, PolicyRecord, TargetRecord,
     ExplicitNotificationParams, ExplicitNotificationStatus, DIRECT_ROUTE_EVIDENCE_HASH,
@@ -926,7 +926,7 @@ fn test_unsupported_registered_policy_fails_closed_without_allocating_claim_or_t
     // Simulate an existing accepted launch request in DB
     let original_exec_id = "exec_pre_accepted_99";
     let original_ret_token = "ret_token_99";
-    let payload_digest = hands_return_bridge::journal::compute_payload_digest(
+    let payload_digest = hands_bridge::journal::compute_payload_digest(
         &params.origin_conversation_id,
         &params.origin_conversation_url,
         &params.transcript_evidence_hash,
@@ -1409,7 +1409,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     }
 
     // 1. Initial Grant Acquisition for receipt 1
-    let claim_params_1 = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params_1 = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt1_id.into(),
         execution_id: claim1.execution_id.clone(),
@@ -1445,7 +1445,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     assert_eq!(competing_grant.owner_document_id, "doc_1_alpha", "Owner document remains doc_1_alpha");
 
     // 4. Conversation Slot Contention: Receipt 2 in SAME conversation is BLOCKED by active conversation slot!
-    let claim_params_2 = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params_2 = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt2_id.into(),
         execution_id: claim2.execution_id.clone(),
@@ -1461,7 +1461,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     assert!(!grant2.granted, "Receipt 2 must be denied grant because conversation slot is held by receipt 1");
 
     // 5. Inconclusive settlement ("uncertain") leaves attempt dispatching/uncertain and RETAINS slot
-    let uncertain_settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let uncertain_settle = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt1_id.into(),
         execution_id: claim1.execution_id.clone(),
@@ -1480,7 +1480,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     assert!(!grant2_after_uncertain.granted, "Slot must remain held after uncertain settlement");
 
     // 6. Stale or mismatched CAS settlement attempt fails closed
-    let stale_settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let stale_settle = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt1_id.into(),
         execution_id: claim1.execution_id.clone(),
@@ -1494,7 +1494,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     assert!(stale_settle.is_err(), "Stale CAS attempt mismatch must fail closed");
 
     // 7. Conclusive settlement ("submitted-observed") requires message ID, settles fence, and releases slot
-    let missing_msg_id = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let missing_msg_id = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt1_id.into(),
         execution_id: claim1.execution_id.clone(),
@@ -1507,7 +1507,7 @@ fn test_dispatch_fence_acquisition_contention_and_cas_settlement() {
     });
     assert!(missing_msg_id.is_err(), "submitted-observed requires non-empty observed_message_id");
 
-    let valid_submitted = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let valid_submitted = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt1_id.into(),
         execution_id: claim1.execution_id.clone(),
@@ -1586,7 +1586,7 @@ fn test_concurrent_dual_native_hosts_competing_on_same_receipt_and_conversation(
     let host_1 = Arc::new(Journal::open(&db_path).unwrap());
     let host_2 = Arc::new(Journal::open(&db_path).unwrap());
 
-    let claim_params_1 = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params_1 = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1810,7 +1810,7 @@ fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
     }
 
     // 1. Initial attempt at revision 1
-    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1828,7 +1828,7 @@ fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
     assert_eq!(grant1.delivery_revision, 1);
 
     // 2. Settle as not-sent
-    let settle = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let settle = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1857,7 +1857,7 @@ fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
     assert_eq!(receipts[0].delivery_status.as_deref(), Some("not-sent"));
 
     // 4. Stale retry with expected_delivery_revision: 1 is denied and reports durable revision 1
-    let retry_stale_params = hands_return_bridge::journal::DispatchClaimParams {
+    let retry_stale_params = hands_bridge::journal::DispatchClaimParams {
         attempt_id: "att_rev_1_stale".into(),
         expected_delivery_revision: 1,
         ..claim_params.clone()
@@ -1868,7 +1868,7 @@ fn test_dispatch_fence_reconciles_not_sent_and_allows_incremented_revision() {
     assert_eq!(grant_stale.state, "not-sent");
 
     // 5. Valid retry at incremented revision (2) succeeds
-    let retry_valid_params = hands_return_bridge::journal::DispatchClaimParams {
+    let retry_valid_params = hands_bridge::journal::DispatchClaimParams {
         attempt_id: "att_rev_2".into(),
         expected_delivery_revision: 2,
         ..claim_params
@@ -1928,7 +1928,7 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
         ).unwrap();
     }
 
-    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1944,7 +1944,7 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
     journal.acquire_dispatch_fence(&claim_params).unwrap();
 
     // Settle as not-sent
-    let settle1 = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let settle1 = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1959,7 +1959,7 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
     assert!(settle1.slot_released);
 
     // Stale uncertain after not-sent MUST be rejected with DispatchFenceConflict (Finding 2)
-    let err_uncertain = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let err_uncertain = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1973,7 +1973,7 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
     assert_eq!(err_uncertain.unwrap_err(), PairingError::DispatchFenceConflict);
 
     // Replay of same not-sent is an idempotent success
-    let replay_not_sent = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let replay_not_sent = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -1988,7 +1988,7 @@ fn test_settle_dispatch_fence_rejects_stale_uncertain_after_not_sent() {
     assert!(replay_not_sent.slot_released);
 
     // Stale submitted-observed after not-sent is rejected
-    let err_submitted = journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    let err_submitted = journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -2055,7 +2055,7 @@ fn test_acquire_dispatch_fence_rejects_revoked_pairing_in_transaction() {
     journal.revoke_pairing(pairing_id, &activated.pairing_secret, profile_id).unwrap();
 
     // Attempting acquire_dispatch_fence inside transaction must fail with Retired (Finding 5)
-    let claim_params = hands_return_bridge::journal::DispatchClaimParams {
+    let claim_params = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -2117,7 +2117,7 @@ fn test_dispatch_fence_aged_uncertainty_cannot_acquire_new_grant() {
         ).unwrap();
     }
 
-    let mut claim_params = hands_return_bridge::journal::DispatchClaimParams {
+    let mut claim_params = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -2142,7 +2142,7 @@ fn test_dispatch_fence_aged_uncertainty_cannot_acquire_new_grant() {
     assert!(!grant2.granted, "Competing attempt must be denied");
 
     // 3. Settle as uncertain to leave state='dispatching/uncertain' and age the fence significantly
-    journal.settle_dispatch_fence(&hands_return_bridge::journal::DispatchSettlementParams {
+    journal.settle_dispatch_fence(&hands_bridge::journal::DispatchSettlementParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),
@@ -2216,7 +2216,7 @@ fn test_acquire_dispatch_fence_routes_by_conversation_id_only() {
 
     // Account evidence and URL are deliberately different from launch-time values. They are not
     // routing authority; exact conversation ID is.
-    let drifted_params = hands_return_bridge::journal::DispatchClaimParams {
+    let drifted_params = hands_bridge::journal::DispatchClaimParams {
         pairing_id: pairing_id.into(),
         receipt_id: rcpt_id.into(),
         execution_id: claim.execution_id.clone(),

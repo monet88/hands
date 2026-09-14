@@ -1943,7 +1943,7 @@ async function runTests() {
         assert.equal(typeof details.func, "function");
         assert.equal(details.args[0], "c_request_native_123");
         assert.match(details.args[1], /rcpt_request_native_1/);
-        assert.equal(details.args[2], "[hands-return-bridge:receipt=rcpt_request_native_1]");
+        assert.equal(details.args[2], "[hands-bridge:receipt=rcpt_request_native_1]");
         const messageId = details.args[3];
         assert.ok(messageId, "Request-native dispatch must preallocate a user message id");
         return [{
@@ -4854,7 +4854,7 @@ async function runTests() {
     assert.ok(payloadDone.continuationText.includes("receipt: rcpt_done_1"));
     assert.ok(payloadDone.continuationText.includes("status: completed"));
     assert.ok(payloadDone.continuationText.includes("[Hands Return Bridge] Local agent execution completed"));
-    assert.equal(payloadDone.receiptMarker, "[hands-return-bridge:receipt=rcpt_done_1]");
+    assert.equal(payloadDone.receiptMarker, "[hands-bridge:receipt=rcpt_done_1]");
 
     // Failed status with message includes failure details
     const payloadFailed = harness.context.buildContinuationPayload({
@@ -4870,7 +4870,7 @@ async function runTests() {
     assert.ok(payloadFailed.continuationText.includes("status: failed"));
     assert.ok(payloadFailed.continuationText.includes("Fatal: out of memory on build"));
     assert.ok(payloadFailed.continuationText.includes("[Hands Return Bridge] Local agent execution failed"));
-    assert.equal(payloadFailed.receiptMarker, "[hands-return-bridge:receipt=rcpt_fail_1]");
+    assert.equal(payloadFailed.receiptMarker, "[hands-bridge:receipt=rcpt_fail_1]");
 
     // Drain reconciles task_id into storage record
     const trustedSender = { id: harness.extensionId, url: `chrome-extension://${harness.extensionId}/options.html` };

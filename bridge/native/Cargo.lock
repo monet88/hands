@@ -130,7 +130,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hands-return-bridge"
+name = "hands-bridge"
 version = "0.1.0"
 dependencies = [
  "getrandom",

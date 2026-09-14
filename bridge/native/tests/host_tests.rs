@@ -2,12 +2,12 @@ use std::process::Command;
 use tempfile::tempdir;
 
 
-use hands_return_bridge::host::{
+use hands_bridge::host::{
     HostError, LocalInitOptions, SetupOptions, execute_local_init, execute_setup, resolve_state_dir,
     run_native_host,
 };
-use hands_return_bridge::journal::{Journal, PairingStatus, LOCAL_PAIRING_ID};
-use hands_return_bridge::protocol::TRUST_NOTICE;
+use hands_bridge::journal::{Journal, PairingStatus, LOCAL_PAIRING_ID};
+use hands_bridge::protocol::TRUST_NOTICE;
 
 fn init_git_repo(path: &std::path::Path) {
     let output = Command::new("git")
@@ -232,7 +232,7 @@ fn test_run_native_host_exact_origin_authority() {
     let forged_manifest = serde_json::json!({
         "name": "com.hands.return_bridge",
         "description": "Forged manifest",
-        "path": "hands-return-bridge.exe",
+        "path": "hands-bridge.exe",
         "type": "stdio",
         "allowed_origins": ["chrome-extension://forged_attacker_ext_id/"]
     });
@@ -384,7 +384,7 @@ fn test_manifest_replacement_leaves_no_partial_temp_files() {
 
 #[test]
 fn test_revoke_cli_rejects_unknown_and_missing_option_values() {
-    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let bin = env!("CARGO_BIN_EXE_hands-bridge");
 
     let unknown = Command::new(bin)
         .args(["revoke", "--pairing-id", "pair_x", "--bogus"])
@@ -667,7 +667,7 @@ fn test_host_target_add_remove_list_flow() {
     init_git_repo(target2_dir.path());
     let target2_path = target2_dir.path().to_str().unwrap().to_string();
 
-    use hands_return_bridge::host::{
+    use hands_bridge::host::{
         TargetAddOptions, TargetListOptions, TargetRemoveOptions,
         execute_target_add, execute_target_list, execute_target_remove,
     };
@@ -783,10 +783,10 @@ fn test_host_target_add_remove_list_flow() {
 
 #[test]
 fn test_notify_cli_done_and_failed_flow() {
-    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let bin = env!("CARGO_BIN_EXE_hands-bridge");
     let state_dir = tempdir().unwrap();
     let db_path = state_dir.path().join("journal.sqlite");
-    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+    let journal = hands_bridge::journal::Journal::open(&db_path).unwrap();
 
     let target_dir = tempdir().unwrap();
     let output = Command::new("git")
@@ -812,7 +812,7 @@ fn test_notify_cli_done_and_failed_flow() {
     journal.activate_bootstrap(&setup_res.bootstrap_token, "prof_cli_notify").unwrap();
 
     let task_id_1 = "task_cli_1";
-    let launch_params_1 = hands_return_bridge::journal::LaunchRequestParams {
+    let launch_params_1 = hands_bridge::journal::LaunchRequestParams {
         pairing_id: setup_res.pairing_id.clone(),
         launch_request_id: task_id_1.to_string(),
         origin_conversation_id: "conv_cli_1".to_string(),
@@ -863,7 +863,7 @@ fn test_notify_cli_done_and_failed_flow() {
 
     // 4. Fresh launch for notify failed with explicit --task and --execution-id flags
     let task_id_2 = "task_cli_2";
-    let launch_params_2 = hands_return_bridge::journal::LaunchRequestParams {
+    let launch_params_2 = hands_bridge::journal::LaunchRequestParams {
         pairing_id: setup_res.pairing_id.clone(),
         launch_request_id: task_id_2.to_string(),
         origin_conversation_id: "conv_cli_2".to_string(),
@@ -912,7 +912,7 @@ fn test_notify_cli_done_and_failed_flow() {
 
 #[test]
 fn test_prepare_cli_claims_registered_conversation_and_routes_notification_back() {
-    let bin = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let bin = env!("CARGO_BIN_EXE_hands-bridge");
     let state_dir = tempdir().unwrap();
     let db_path = state_dir.path().join("journal.sqlite");
     let journal = Journal::open(&db_path).unwrap();
@@ -940,7 +940,7 @@ fn test_prepare_cli_claims_registered_conversation_and_routes_notification_back(
         .unwrap();
 
     // 1. The paired extension registers the canonical conversation identity directly.
-    let register_resp = hands_return_bridge::protocol::handle_native_message(
+    let register_resp = hands_bridge::protocol::handle_native_message(
         &serde_json::json!({
             "op": "register_conversation",
             "pairingId": setup_res.pairing_id,
@@ -1058,4 +1058,161 @@ fn test_prepare_cli_claims_registered_conversation_and_routes_notification_back(
         .query_row("SELECT COUNT(*) FROM launch_requests", [], |r| r.get(0))
         .unwrap();
     assert_eq!(launch_rows, 1, "Only the successful prepare may allocate a launch row");
+}
+
+#[test]
+fn test_worker_shorthand_done_and_failed_need_no_identity() {
+    let bin = env!("CARGO_BIN_EXE_hands-bridge");
+    let state_dir = tempdir().unwrap();
+    let db_path = state_dir.path().join("journal.sqlite");
+    let journal = Journal::open(&db_path).unwrap();
+
+    let pairing_id = "pairing_shorthand";
+    let bootstrap_token = "tok_shorthand";
+    let profile_id = "prof_shorthand";
+    let policy = hands_bridge::journal::PolicyRecord {
+        policy_revision: "v1".to_string(),
+        tool_policy: "standard".to_string(),
+        approval_policy: "prompt".to_string(),
+    };
+    journal
+        .create_bootstrap(pairing_id, bootstrap_token, "chrome", profile_id, &[], &policy)
+        .unwrap();
+    journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
+    for conversation in ["conv_shorthand", "conv_other"] {
+        journal
+            .register_conversation(&hands_bridge::journal::ConversationRegistrationParams {
+                pairing_id: pairing_id.to_string(),
+                origin_conversation_id: conversation.to_string(),
+                origin_conversation_url: format!("https://chatgpt.com/c/{}", conversation),
+            })
+            .unwrap();
+    }
+
+    let shorthand = |status: &str, conversation: Option<&str>, message: Option<&str>| {
+        let mut command = Command::new(bin);
+        command.arg(status).arg("--state-dir").arg(state_dir.path());
+        if let Some(conversation) = conversation {
+            command.args(["--conversation", conversation]);
+        }
+        if let Some(message) = message {
+            command.args(["--message", message]);
+        }
+        for key in [
+            "HANDS_TASK_ID",
+            "HANDS_RETURN_BRIDGE_EXECUTION_ID",
+            "HANDS_RETURN_BRIDGE_STATE_DIR",
+            "HANDS_RETURN_BRIDGE_CONVERSATION_ID",
+        ] {
+            command.env_remove(key);
+        }
+        command.output().unwrap()
+    };
+
+    // 1. One command, no identity: the CLI claims the execution itself and records the receipt.
+    let out_done = shorthand("done", Some("conv_shorthand"), None);
+    assert!(out_done.status.success(), "done failed: {}", String::from_utf8_lossy(&out_done.stderr));
+    let stdout_done = String::from_utf8_lossy(&out_done.stdout);
+    assert!(stdout_done.contains("Notification recorded"), "stdout: {}", stdout_done);
+    assert!(stdout_done.contains("conversation: conv_shorthand"), "stdout: {}", stdout_done);
+    assert!(stdout_done.contains("status: completed"), "stdout: {}", stdout_done);
+
+    // 2. The conversation, not a caller-supplied identity, is what the receipt routes by.
+    let (summaries, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 1, "one command must record exactly one receipt");
+    assert_eq!(receipts[0].origin_conversation_id, "conv_shorthand");
+    assert_eq!(receipts[0].state, "completed");
+    assert!(receipts[0].task_id.as_deref().unwrap().starts_with("task_"));
+    let summary = summaries
+        .iter()
+        .find(|s| s.origin_conversation_id == "conv_shorthand")
+        .expect("the shorthand must leave a launch summary for the conversation");
+    assert_eq!(summary.launch_request_id, receipts[0].task_id.as_deref().unwrap());
+
+    // 3. The failure variant takes the message straight from the command line.
+    let out_failed = shorthand("failed", Some("conv_shorthand"), Some("cargo test failed"));
+    assert!(out_failed.status.success(), "failed: {}", String::from_utf8_lossy(&out_failed.stderr));
+    let stdout_failed = String::from_utf8_lossy(&out_failed.stdout);
+    assert!(stdout_failed.contains("status: failed"), "stdout: {}", stdout_failed);
+    let (_, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 2);
+    let failed_receipt = receipts
+        .iter()
+        .find(|r| r.state == "failed")
+        .expect("the failed run must be recorded as failed");
+    assert_eq!(failed_receipt.assistant_text, "cargo test failed");
+
+    // 4. Without a conversation and without worker environment, the shorthand fails closed.
+    let out_no_conversation = shorthand("done", None, None);
+    assert_eq!(out_no_conversation.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out_no_conversation.stderr).contains("usage:"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_no_conversation.stderr)
+    );
+    let (_, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 2, "a refused shorthand must not record anything");
+
+    // 5. A worker execution bound to one conversation refuses to report for another.
+    let prepared = Command::new(bin)
+        .args([
+            "prepare",
+            "--conversation",
+            "conv_other",
+            "--state-dir",
+            &state_dir.path().to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(prepared.status.success(), "prepare failed: {}", String::from_utf8_lossy(&prepared.stderr));
+    let prepared: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    let out_mismatch = Command::new(bin)
+        .args([
+            "done",
+            "--conversation",
+            "conv_shorthand",
+            "--state-dir",
+            &state_dir.path().to_string_lossy(),
+        ])
+        .env("HANDS_TASK_ID", prepared["task_id"].as_str().unwrap())
+        .env(
+            "HANDS_RETURN_BRIDGE_EXECUTION_ID",
+            prepared["execution_id"].as_str().unwrap(),
+        )
+        .env("HANDS_RETURN_BRIDGE_CONVERSATION_ID", "conv_other")
+        .output()
+        .unwrap();
+    assert_eq!(out_mismatch.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out_mismatch.stderr).contains("does not match the conversation bound to this worker execution"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_mismatch.stderr)
+    );
+    let (_, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 2, "a mismatched shorthand must not record anything");
+
+    // 6. A worker launched by the extension reports with no arguments at all.
+    let out_worker = Command::new(bin)
+        .args(["done", "--state-dir", &state_dir.path().to_string_lossy()])
+        .env("HANDS_TASK_ID", prepared["task_id"].as_str().unwrap())
+        .env(
+            "HANDS_RETURN_BRIDGE_EXECUTION_ID",
+            prepared["execution_id"].as_str().unwrap(),
+        )
+        .env("HANDS_RETURN_BRIDGE_STATE_DIR", state_dir.path())
+        .env("HANDS_RETURN_BRIDGE_CONVERSATION_ID", "conv_other")
+        .output()
+        .unwrap();
+    assert!(out_worker.status.success(), "worker done failed: {}", String::from_utf8_lossy(&out_worker.stderr));
+    let stdout_worker = String::from_utf8_lossy(&out_worker.stdout);
+    assert!(stdout_worker.contains("conversation: conv_other"), "stdout: {}", stdout_worker);
+    let (_, receipts) = journal.drain_records(pairing_id, None).unwrap();
+    assert_eq!(receipts.len(), 3);
+    let worker_receipt = receipts
+        .iter()
+        .find(|r| r.execution_id == prepared["execution_id"].as_str().unwrap())
+        .expect("the launched worker execution must own the receipt");
+    assert_eq!(worker_receipt.origin_conversation_id, "conv_other");
+    assert_eq!(worker_receipt.state, "completed");
 }

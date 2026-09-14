@@ -2,25 +2,57 @@
 
 > **Scope:** how a local worker (an Orca OMP session, a CLI run, or any process holding the prepared environment) tells a bound ChatGPT conversation that its task finished, what the bridge does with that notification, and how to verify or unblock it. Use this when the task is to deliver a worker-completion message into ChatGPT. Delivery is request-native: the bridge talks to the ChatGPT backend from the open tab, never through the composer, send button, or DOM.
 
+The flow lives entirely in the companion `hands-bridge` binary (crate `bridge/native`), installed under `%LOCALAPPDATA%\Hands\return-bridge\` and registered as the browser's native messaging host. The `hands` runtime neither embeds nor depends on it, so building or changing this flow never rebuilds `hands.exe`.
+
 ## Prerequisites
 
 Verify these before notifying:
 
-- The **Hands Return Bridge** extension is loaded, paired, and in local mode (`hands-return-bridge local-init`, then pair from the extension).
+- The **Hands Return Bridge** extension is loaded, paired, and in local mode (`hands-bridge local-init`, then pair from the extension).
 - The native messaging host is registered for the browser profile that runs the extension (`com.hands.return_bridge`).
 - A `chatgpt.com` tab for the **target conversation** is open and signed in. Conversation registration is automatic: the content script announces readiness on load, and the background worker registers the canonical conversation ID on tab updates. Routing is conversation-first — no target, workspace, or target-id is involved.
 - The target conversation is not holding a delivery slot for an unresolved attempt (see [Terminal states and recovery](#terminal-states-and-recovery)).
 - The state directory defaults to `%LOCALAPPDATA%\Hands\return-bridge` and can be overridden with `--state-dir`.
 
-An Orca OMP worker launched by the extension already receives the three environment variables and can skip step 1.
+An Orca OMP worker launched by the extension already receives the three environment variables, so it needs no arguments at all.
 
 ## Send the notification
 
-1. Claim worker identity for the conversation:
+The worker contract is one command:
 
 ```bash
-hands-return-bridge prepare --conversation <conversation_id> --json
+hands-bridge done --conversation <conversation_id>
+# → Notification recorded (receipt: rcpt_f6ac3810e32ec9127e99682e4fb0d1c5, conversation: 6aa7f156-6ef4-83ec-9be6-ebd9260b79ac, status: completed).
+
+hands-bridge failed --conversation <conversation_id> --message "cargo test failed"
 ```
+
+`done`/`failed` run both internal steps:
+
+```text
+resolve the conversation
+-> reuse the execution this worker was launched with, or claim a new one
+-> record the completion receipt
+-> exit 0
+```
+
+The worker never handles task IDs, execution IDs, state directories, or the return token. A worker that the extension launched inherits `HANDS_TASK_ID`, `HANDS_RETURN_BRIDGE_EXECUTION_ID`, and `HANDS_RETURN_BRIDGE_CONVERSATION_ID`, so it needs no arguments at all:
+
+```bash
+hands-bridge done
+```
+
+Contract rules:
+
+- `--conversation` is required unless the worker environment already names the conversation; otherwise the command exits 2 without touching the journal.
+- A worker execution bound to one conversation refuses to report for another conversation (`--conversation` mismatch) and exits 1.
+- Each call records its own receipt: two `done` calls produce two messages in ChatGPT.
+
+### Underlying steps (implementation detail)
+
+Drive the steps separately only when you must inject identity into a process you launch yourself:
+
+1. `hands-bridge prepare --conversation <conversation_id> --json` claims identity and prints it:
 
 ```json
 {
@@ -36,17 +68,7 @@ hands-return-bridge prepare --conversation <conversation_id> --json
 
 `prepare` never prints the `return_token`; it stays in the native journal.
 
-2. Record the terminal state:
-
-```bash
-HANDS_TASK_ID=task_… \
-HANDS_RETURN_BRIDGE_EXECUTION_ID=exec_… \
-HANDS_RETURN_BRIDGE_STATE_DIR='C:\Users\monet\AppData\Local\Hands\return-bridge' \
-hands-return-bridge notify done
-# → Notification recorded (receipt: rcpt_199309bccd80f89cb300051c0c987039, task: task_…, execution: exec_…, status: completed)
-```
-
-Use `notify failed --message "<reason>"` for a failed run. `--task`, `--execution-id`, and `--state-dir` are accepted flags if the environment variables are not set, but at least one identity source is required; a notification without identity fails closed with `execution_mismatch`.
+2. `hands-bridge notify done` (or `notify failed --message "<reason>"`) with that environment, or with `--task`/`--execution-id`/`--state-dir`. The low-level `notify` requires at least one identity source and fails closed with `execution_mismatch` without one.
 
 ## What happens after `notify`
 
@@ -101,7 +123,9 @@ Extension-side diagnostic: the popup shows the last dispatch result, and the sam
 
 | Symptom | Cause | Action |
 | --- | --- | --- |
-| `execution_mismatch` | No identity supplied | Run `prepare` first, or pass `--task`/`--execution-id`/`--state-dir` |
+| `execution_mismatch` | Low-level `notify` called with no identity | Use `hands-bridge done --conversation <id>`, or run `prepare` first |
+| Exit 2 with a `usage:` line | `done`/`failed` called with no conversation and no worker environment | Pass `--conversation`, or run it from the launched worker |
+| Exit 1 `does not match the conversation bound to this worker execution` | `--conversation` disagrees with the execution's conversation | Drop the flag, or pass the conversation this worker was launched for |
 | `no_bound_conversation` | Conversation never registered | Open a `chatgpt.com` tab for that conversation |
 | `ambiguous_target_binding` | Several live bindings | Close stale conversation tabs |
 | `slot_busy` | Another receipt holds the conversation slot | See [Terminal states and recovery](#terminal-states-and-recovery) |

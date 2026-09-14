@@ -5,16 +5,16 @@ fn live_launcher_tests_enabled() -> bool {
     std::env::var("HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS").as_deref() == Ok("1")
 }
 
-use hands_return_bridge::journal::{
+use hands_bridge::journal::{
     Journal, LaunchRequestParams, PolicyRecord, TargetRecord, DIRECT_ROUTE_EVIDENCE_HASH,
 };
-use hands_return_bridge::launcher::{
+use hands_bridge::launcher::{
     build_omp_startup_command_with_env, build_omp_startup_command_with_env_and_bin,
     ensure_adapter_file, is_supported_omp_version, split_prompt_for_orca,
     COMPANION_ADAPTER_REVISION, ORCA_PROMPT_CHUNK_MAX_BYTES, SUPPORTED_OMP_CLI_SHAPE,
     SUPPORTED_OMP_REVISION,
 };
-use hands_return_bridge::protocol::{
+use hands_bridge::protocol::{
     handle_native_message, read_native_message, write_native_message,
 };
 use serde_json::json;
@@ -524,7 +524,7 @@ fn test_protocol_launch_and_recover_operations() {
 
 #[test]
 fn test_canonical_conversation_url_parser_strictness() {
-    use hands_return_bridge::protocol::parse_canonical_conversation_id;
+    use hands_bridge::protocol::parse_canonical_conversation_id;
 
     // Valid canonical forms
     assert_eq!(parse_canonical_conversation_id("https://chatgpt.com/c/c_12345"), Some("c_12345".to_string()));
@@ -550,7 +550,7 @@ fn test_canonical_conversation_url_parser_strictness() {
 #[test]
 fn test_omp_startup_command_shape() {
     use std::path::Path;
-    use hands_return_bridge::launcher::build_omp_startup_command;
+    use hands_bridge::launcher::build_omp_startup_command;
 
     let adapter_path = Path::new("C:/portable test/adapter.ts");
 
@@ -569,7 +569,7 @@ fn test_omp_startup_command_shape() {
 
 #[test]
 fn test_uncertainty_and_recovery_semantics() {
-    use hands_return_bridge::journal::{AttemptEvidence, LaunchRequestParams};
+    use hands_bridge::journal::{AttemptEvidence, LaunchRequestParams};
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("journal.sqlite");
@@ -756,7 +756,7 @@ fn test_claimed_replay_is_not_reported_as_started_or_ok() {
 
 #[test]
 fn test_adapter_pinning_and_deterministic_content() {
-    use hands_return_bridge::launcher::{
+    use hands_bridge::launcher::{
         ensure_adapter_file, ADAPTER_TS_CONTENT, COMPANION_ADAPTER_REVISION,
     };
     let dir = tempdir().unwrap();
@@ -862,7 +862,7 @@ fn test_literal_prompt_delivery_contract() {
 fn test_multi_process_native_host_convergence() {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
-    use hands_return_bridge::host::{execute_setup, SetupOptions};
+    use hands_bridge::host::{execute_setup, SetupOptions};
 
     let dir = tempdir().unwrap();
     let state_dir = dir.path().to_path_buf();
@@ -895,7 +895,7 @@ fn test_multi_process_native_host_convergence() {
     let pairing_secret = activated.pairing_secret;
     drop(journal);
 
-    let binary_path = env!("CARGO_BIN_EXE_hands-return-bridge");
+    let binary_path = env!("CARGO_BIN_EXE_hands-bridge");
     let caller_origin = format!("chrome-extension://{}/", extension_id);
 
     // Spawn Host Process 1
@@ -993,7 +993,7 @@ fn test_multi_process_native_host_convergence() {
 
 #[test]
 fn test_launch_preflight_check() {
-    use hands_return_bridge::launcher::verify_launch_preflight;
+    use hands_bridge::launcher::verify_launch_preflight;
 
     if !live_launcher_tests_enabled() {
         eprintln!("SKIP live launcher preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
@@ -1013,7 +1013,7 @@ fn test_launch_preflight_check() {
 
 #[test]
 fn test_resolve_omp_binary_shapes() {
-    use hands_return_bridge::launcher::{
+    use hands_bridge::launcher::{
         ensure_adapter_file, launch_orca_terminal,
         verify_launch_preflight, wait_orca_terminal_idle,
     };
@@ -1089,7 +1089,7 @@ fn test_resolve_omp_binary_shapes() {
 
     // 6. Security guard: browser messages must NEVER be able to provide or override executable/bin
     let db_path = dir.path().join("journal.sqlite");
-    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+    let journal = hands_bridge::journal::Journal::open(&db_path).unwrap();
     let browser_override_msg = json!({
         "op": "launch",
         "pairingId": "pair_test",
@@ -1127,7 +1127,7 @@ fn test_large_prompt_chunking_preserves_utf8_exactly() {
 fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("journal.sqlite");
-    let journal = hands_return_bridge::journal::Journal::open(&db_path).unwrap();
+    let journal = hands_bridge::journal::Journal::open(&db_path).unwrap();
 
     let pairing_id = "pair_unsupported_policy";
     let bootstrap_token = "boot_unsupp_policy";
@@ -1136,13 +1136,13 @@ fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     let target_dir = tempdir().unwrap();
     init_git_repo(target_dir.path());
     let target_canonical = target_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
-    let targets = vec![hands_return_bridge::journal::TargetRecord {
+    let targets = vec![hands_bridge::journal::TargetRecord {
         target_id: "hands".to_string(),
         canonical_path: target_canonical,
         name: "hands".to_string(),
     }];
     // Unsupported tool_policy: "unrestricted"
-    let policy = hands_return_bridge::journal::PolicyRecord {
+    let policy = hands_bridge::journal::PolicyRecord {
         policy_revision: "v1".to_string(),
         tool_policy: "unrestricted".to_string(),
         approval_policy: "prompt".to_string(),
@@ -1199,7 +1199,7 @@ fn test_unsupported_registered_policy_fails_closed_before_claim_or_terminal() {
     // 3. Preserve replay semantics: insert an already accepted request with original execution
     let accepted_exec_id = "exec_pre_accepted_42";
     let accepted_ret_token = "ret_token_42";
-    let payload_digest = hands_return_bridge::journal::compute_payload_digest(
+    let payload_digest = hands_bridge::journal::compute_payload_digest(
         "c_unsupp_new",
         "https://chatgpt.com/c/c_unsupp_new",
         "hash_t",
@@ -1284,7 +1284,7 @@ fn test_recover_includes_completion_receipt_after_owned_turn() {
     let activated = journal.activate_bootstrap(bootstrap_token, profile_id).unwrap();
     let pairing_secret = &activated.pairing_secret;
 
-    let launch_params = hands_return_bridge::journal::LaunchRequestParams {
+    let launch_params = hands_bridge::journal::LaunchRequestParams {
         pairing_id: pairing_id.to_string(),
         launch_request_id: "req_rcpt_proto_1".to_string(),
         origin_conversation_id: "conv_proto_1".to_string(),
@@ -1372,7 +1372,7 @@ fn test_adapter_v3_generation_and_revision() {
 
 #[test]
 fn test_launch_preflight_supported_omp_revision_pin() {
-    use hands_return_bridge::launcher::verify_launch_preflight;
+    use hands_bridge::launcher::verify_launch_preflight;
     assert_eq!(SUPPORTED_OMP_REVISION, ">=18.1.16");
     assert_eq!(SUPPORTED_OMP_CLI_SHAPE, "omp/>=18.1.16");
     if !live_launcher_tests_enabled() {
@@ -1444,7 +1444,7 @@ fn test_exact_supported_omp_version_matching() {
 #[test]
 #[cfg(windows)]
 fn test_launch_preflight_adversarial_lookalike_rejection() {
-    use hands_return_bridge::launcher::verify_launch_preflight;
+    use hands_bridge::launcher::verify_launch_preflight;
     if !live_launcher_tests_enabled() {
         eprintln!("SKIP live adversarial preflight (set HANDS_RETURN_BRIDGE_RUN_LIVE_LAUNCHER_TESTS=1)");
         return;

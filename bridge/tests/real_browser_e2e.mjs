@@ -268,9 +268,9 @@ async function main() {
     "--manifest-path", path.join(REPO_ROOT, "bridge", "native", "Cargo.toml"),
     "--target-dir", bridgeTargetDir
   ], { cwd: REPO_ROOT, stdio: "inherit" });
-  const exePath = path.join(bridgeTargetDir, "debug", "hands-return-bridge.exe");
+  const exePath = path.join(bridgeTargetDir, "debug", "hands-bridge.exe");
   if (!fs.existsSync(exePath)) {
-    throw new Error(`Isolated hands-return-bridge.exe not found at ${exePath}`);
+    throw new Error(`Isolated hands-bridge.exe not found at ${exePath}`);
   }
 
   // 2. Prepare the isolated test extension fixture.
